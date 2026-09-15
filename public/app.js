@@ -947,10 +947,29 @@ document.addEventListener("click", async (event) => {
   if (projectButton) { clearPendingAttachments(); selectedProjectId = projectButton.dataset.project; const first = state.tasks.find((task) => task.project_id === selectedProjectId); selectedTaskId = first?.id || null; syncTaskUrl(); await refresh(); }
 });
 
+// The fixed domain list (DOMAINS in src/devteam/store.mjs). Checkboxes rather than a free field: an
+// unknown domain is rejected by the server, and a wrong one delivers the wrong checklist.
+const DOMAIN_CHOICES = ["web", "backend", "mobile", "desktop", "game", "ml", "data", "devops", "docs"];
+for (const picker of document.querySelectorAll("[data-domain-picker]")) {
+  for (const domain of DOMAIN_CHOICES) {
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox"; box.name = "domains"; box.value = domain;
+    label.append(box, document.createTextNode(domain));
+    picker.append(label);
+  }
+}
+const taskDomains = (task) => {
+  if (Array.isArray(task?.domains)) return task.domains;
+  try { return JSON.parse(task?.domains || "[]"); } catch { return []; }
+};
+
 $("#task-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
-    const values = Object.fromEntries(new FormData(event.target)); values.requiredApprovals = Number(values.requiredApprovals);
+    const formData = new FormData(event.target);
+    const values = Object.fromEntries(formData); values.requiredApprovals = Number(values.requiredApprovals);
+    values.domains = formData.getAll("domains");
     const task = await api("/api/tasks", { method: "POST", body: JSON.stringify(values) });
     selectedTaskId = task.id; selectedProjectId = task.project_id; event.target.reset(); event.target.closest("dialog").close(); await refresh(); toast("Task created — use Invite agent to start its room");
   } catch (error) { toast(error.message); }
@@ -981,6 +1000,8 @@ function openTaskEditor() {
   form.elements.description.value = task.description;
   form.elements.requiredApprovals.value = String(task.required_approvals);
   form.elements.sessionPolicy.value = task.session_policy || "manual";
+  const selected = new Set(taskDomains(task));
+  for (const box of form.querySelectorAll('input[name="domains"]')) box.checked = selected.has(box.value);
   $("#task-edit-dialog").showModal();
 }
 
@@ -995,9 +1016,10 @@ $("#task-edit-form").addEventListener("submit", async (event) => {
   const form = event.target;
   const taskId = form.dataset.taskId;
   if (!taskId) return;
-  const values = Object.fromEntries(new FormData(form));
+  const formData = new FormData(form);
+  const values = Object.fromEntries(formData);
   try {
-    await api(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify({ title: values.title, description: values.description, requiredApprovals: Number(values.requiredApprovals), sessionPolicy: values.sessionPolicy }) });
+    await api(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify({ title: values.title, description: values.description, requiredApprovals: Number(values.requiredApprovals), sessionPolicy: values.sessionPolicy, domains: formData.getAll("domains") }) });
     form.closest("dialog").close(); await refresh(); toast("Task updated");
   } catch (error) { toast(error.message); }
 });

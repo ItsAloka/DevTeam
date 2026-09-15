@@ -13,6 +13,11 @@
 // #private: a mixin and its class cannot share one.
 import { randomUUID } from "node:crypto";
 import { fromJson, json, now } from "./util.mjs";
+// A cycle (store.mjs imports this mixin), which is safe: reconnectGraceCutoff is only called at run
+// time, long after both modules have finished evaluating.
+import { reconnectGraceCutoff } from "./store.mjs";
+import { redact } from "./knowledge.mjs";
+import { CHECKLIST_RULE_MAX, checklistMethods } from "./store-checklists.mjs";
 
 // Whether an assignment reads the work rather than changing it — and therefore waits for pending
 // writers, earns the right to approve, and puts its task in review — is a column on the row,
@@ -27,6 +32,10 @@ const VERIFIES = "verifies = 1";
 export const PROPOSAL_KINDS = ["role", "handoff", "plan", "decision"];
 
 export const consensusMethods = {
+  // The checklist lifecycle is fed only by requestChanges below, so it is composed onto the store
+  // through this mixin rather than registered separately (store-checklists.mjs).
+  ...checklistMethods,
+
   // Did this assignment read the work rather than change it? Asked of the assignment row rather than
   // of the role name recorded on the event, so a project that renamed its reviewing role still earns
   // approval standing, and a role renamed *after* the fact cannot retroactively grant it.
@@ -203,7 +212,7 @@ export const consensusMethods = {
         INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
       `).run(assignmentId, proposal.task_id, title, description, String(details.role).trim(), details.requiresWrite ? 1 : 0, details.targetAgentName?.trim() || null, stamp);
-      const adoptedChecklist = this._resolveChecklist(details.role, details.checklist);
+      const adoptedChecklist = this._resolveChecklist(this.getTask(proposal.task_id).project_id, details.role, details.checklist);
       this._storeChecklist(assignmentId, adoptedChecklist);
       if (details.requiresWrite && Array.isArray(details.paths) && details.paths.length) {
         const writePaths = [...new Set(details.paths.map((p) => String(p).trim()).filter(Boolean))].slice(0, 50);
@@ -295,7 +304,11 @@ export const consensusMethods = {
       const metadata = fromJson(event.metadata, {});
       return metadata.version === version && Array.isArray(metadata.changedFiles) && metadata.changedFiles.length > 0;
     });
-    const ids = new Set(authors.map((author) => author.agent_id));
+    return this._widenParticipantSessions(authors.map((author) => author.agent_id));
+  },
+
+  _widenParticipantSessions(authorIds) {
+    const ids = new Set(authorIds.filter(Boolean));
     if (!ids.size) return ids;
     const placeholders = [...ids].map(() => "?").join(",");
     const sessions = this.db.prepare(`
@@ -307,6 +320,13 @@ export const consensusMethods = {
     `).all(...ids);
     for (const session of sessions) ids.add(session.id);
     return ids;
+  },
+
+  _reviewAuthors(assignment) {
+    if (!assignment.review_subject_assignment_id) return this._currentVersionAuthors(assignment.task_id, assignment.task_version);
+    const subject = this.db.prepare("SELECT task_id, agent_id, status FROM assignments WHERE id = ?").get(assignment.review_subject_assignment_id);
+    if (!subject || subject.task_id !== assignment.task_id || subject.status !== "done") return this._currentVersionAuthors(assignment.task_id, assignment.task_version);
+    return this._widenParticipantSessions([subject.agent_id]);
   },
 
   _approvers(taskId, version) {
@@ -330,7 +350,7 @@ export const consensusMethods = {
   // connected, the author still gets the work and the acceptance is labeled selfReviewed rather than
   // the assignment sitting claimable-by-nobody.
   _verifierIsAuthor(agentId, assignment) {
-    const authors = this._currentVersionAuthors(assignment.task_id, assignment.task_version);
+    const authors = this._reviewAuthors(assignment);
     if (!authors.has(agentId)) return false;
     return this._independentClaimantExists(assignment, authors, agentId);
   },
@@ -358,7 +378,23 @@ export const consensusMethods = {
       if (authors.has(member.agent_id)) continue;
       if (this.whyNotClaimable(assignment.id, member.agent_id, { refreshLiveness: false }).claimable) return true;
     }
-    return false;
+    // A teammate whose transport dropped moments ago is most likely reconnecting as a new session.
+    // Handing the author its own review inside that gap is exactly how self-review slipped past an
+    // assigned independent reviewer, so wait out the grace window — unless that teammate is already
+    // back under a live session, in which case the loop above has given its real answer.
+    const reconnecting = this.db.prepare(`
+      SELECT agent.name FROM task_members tm
+      JOIN agents agent ON agent.id = tm.agent_id
+      WHERE tm.task_id = ? AND tm.role = 'contributor' AND agent.id != ?
+        AND agent.status = 'disconnected' AND agent.disconnect_kind = 'transport' AND agent.disconnected_at >= ?
+        AND NOT EXISTS (
+          SELECT 1 FROM agents live WHERE lower(live.name) = lower(agent.name) AND live.status != 'disconnected'
+        )
+    `).all(assignment.task_id, excludeAgentId, reconnectGraceCutoff());
+    // An author's own earlier session reconnecting is not an independent reviewer on the way back.
+    const nameOf = this.db.prepare("SELECT lower(name) AS name FROM agents WHERE id = ?");
+    const authorNames = new Set([...authors].map((id) => nameOf.get(id)?.name).filter(Boolean));
+    return reconnecting.some((row) => !authorNames.has(row.name.toLowerCase()));
   },
 
   // No dead-ends: configured consensus cannot exceed the independent teammates who could
@@ -492,6 +528,9 @@ export const consensusMethods = {
       return {
         detail: String((isObject ? item.detail : item) ?? "").trim().slice(0, 2000),
         path: isObject && item.path ? String(item.path).trim().slice(0, 500) : null,
+        // Optional restatement as a general checklist rule; redacted and capped when it is stored.
+        rule: isObject && item.rule ? String(item.rule).trim().slice(0, CHECKLIST_RULE_MAX) : null,
+        section: isObject && item.section ? String(item.section).trim().slice(0, 40) : null,
       };
     }).filter((item) => item.detail);
     const authorName = assignment.agent_id
@@ -511,12 +550,17 @@ export const consensusMethods = {
             rework_count = ?, rework_requested_at = ?, rework_summary = ?
         WHERE id = ?
       `).run(authorName, reworkCount, stamp, cleanSummary, assignmentId);
-      for (const finding of cleanFindings) {
+      const storedFindings = cleanFindings.map((finding) => {
+        const id = randomUUID();
+        const rule = finding.rule ? redact(finding.rule) : null;
         this.db.prepare(`
-          INSERT INTO assignment_findings (id, assignment_id, task_id, requested_by_agent_id, requested_by_name, task_version, detail, path, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(randomUUID(), assignmentId, taskId, agentId, agent?.name || "the human", Number(task.version), finding.detail, finding.path, stamp);
-      }
+          INSERT INTO assignment_findings (id, assignment_id, task_id, requested_by_agent_id, requested_by_name, task_version, detail, path, created_at, rule, section)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(id, assignmentId, taskId, agentId, agent?.name || "the human", Number(task.version), finding.detail, finding.path, stamp, rule, finding.section);
+        return { ...finding, id, rule };
+      });
+      // Findings on a task with domains grow those domains' checklists. No domains, no capture.
+      this._captureChecklistCandidates(task, storedFindings);
       // The version under review was just judged not good enough, so approvals built on it no longer
       // describe a settled state. Clearing them is the same principle as version-invalidates-
       // approvals: if the rework changes files the version bumps and they would have gone anyway,

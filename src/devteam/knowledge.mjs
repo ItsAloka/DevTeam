@@ -54,7 +54,9 @@ const MAX_NOTE_BODY = 24_000;
 // thorough, whereas the same objection raised on separate work is a rule the project has and has
 // never written down.
 const CONVENTION_MIN_FINDINGS = 3;
-const CONVENTION_MIN_TASKS = 2;
+// Also the recurrence bar for promoting a domain checklist item (store-checklists.mjs): both features
+// answer "is this the same objection on separate work", so one constant decides it for both.
+export const CONVENTION_MIN_TASKS = 2;
 const CONVENTION_SIGNATURE_WORDS = 6;
 const CONVENTION_MIN_SIGNATURE_WORDS = 3;
 // Words that carry no subject matter. Kept small on purpose: an aggressive list starts deciding what
@@ -516,6 +518,7 @@ export class KnowledgeVault {
   initializeProject(projectId) {
     if (!this.enabled) return null;
     this.db.prepare("INSERT OR IGNORE INTO knowledge_state (project_id, last_event_id) VALUES (?, 0)").run(projectId);
+    this.#restoreMissingEventIndex(projectId);
     this.#importLegacy(projectId);
     this.#syncProjectEvents(projectId);
     this.#syncConventions(projectId);
@@ -529,10 +532,38 @@ export class KnowledgeVault {
     `).get(taskId);
     if (!task) return null;
     this.db.prepare("INSERT OR IGNORE INTO knowledge_state (project_id, last_event_id) VALUES (?, 0)").run(task.project_id);
+    this.#restoreMissingEventIndex(task.project_id);
     this.#importLegacy(task.project_id);
     this.#syncProjectEvents(task.project_id);
     this.#syncConventions(task.project_id);
     return this.exportProject(task.project_id);
+  }
+
+  // The markdown vault is derived from the event history, but it deliberately survives a local
+  // database reset. A cursor without its corresponding notes then says every old event has already
+  // been ingested, leaving a populated vault and an empty DB index (and therefore an empty brief).
+  // Resetting the cursor is safe only when the index is completely empty: replaying events restores
+  // the canonical rows and their generated files without overwriting any live indexed knowledge.
+  //
+  // At most once per database: a project whose history legitimately produces no notes would
+  // otherwise look "empty" on every sync and replay its whole event log each time. The marker lives
+  // in this database, so a genuine reset clears it along with the index it is protecting.
+  #restoreMissingEventIndex(projectId) {
+    const markerKey = `knowledge_index_restored:${projectId}`;
+    if (this.db.prepare("SELECT 1 FROM metadata WHERE key = ?").get(markerKey)) return false;
+    const state = this.db.prepare("SELECT last_event_id FROM knowledge_state WHERE project_id = ?").get(projectId);
+    if (!state || Number(state.last_event_id) <= 0) return false;
+    const notes = Number(this.db.prepare("SELECT COUNT(*) AS count FROM knowledge_notes WHERE project_id = ?").get(projectId)?.count || 0);
+    if (notes > 0) return false;
+    const hasEvents = this.db.prepare(`
+      SELECT 1 FROM events event
+      JOIN tasks task ON task.id = event.task_id
+      WHERE task.project_id = ? LIMIT 1
+    `).get(projectId);
+    if (!hasEvents) return false;
+    this.db.prepare("UPDATE knowledge_state SET last_event_id = 0 WHERE project_id = ?").run(projectId);
+    this.db.prepare("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)").run(markerKey, new Date().toISOString());
+    return true;
   }
 
   // Recompute the whole project's recurring-finding conventions. Cheap enough to redo wholesale

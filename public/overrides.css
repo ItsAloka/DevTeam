@@ -1729,3 +1729,10 @@ nav.projects-collapsed #project-list,
 nav.tasks-collapsed #task-list { display: none; }
 nav.projects-collapsed #project-current,
 nav.tasks-collapsed #task-current { display: block; }
+
+/* Domain picker on the task dialogs: a compact wrap of checkboxes. */
+.domain-picker { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 4px 0 12px; padding: 10px 12px; border: 1px solid var(--line, rgba(127,127,127,.3)); border-radius: 10px; }
+.domain-picker legend { padding: 0 6px; font-size: 13px; }
+.domain-picker legend .hint { display: inline; margin: 0 0 0 6px; }
+.domain-picker label { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-weight: 500; }
+.domain-picker input { width: auto; margin: 0; }

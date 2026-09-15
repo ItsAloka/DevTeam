@@ -45,6 +45,37 @@ const BLOCK_KINDS = ["needs-human", "over-my-head", "misrouted", "external"];
 const BLOCK_KINDS_NEEDING_OPEN_WORK = BLOCK_KINDS.filter((kind) => kind !== "needs-human");
 // How far the candidate scan will look past lease-blocked and runtime-gated work before giving up.
 // Generous for a local single-user server, and bounded so a pathological board cannot stall a claim.
+// How long a teammate whose MCP transport dropped still counts as present for routing. Some hosts
+// open a fresh session every turn, which leaves a gap of a few seconds with nobody by that name
+// connected; without this, work targeted at that teammate — or the independence that keeps an
+// author off its own review — leaked to whoever polled inside the gap. A deliberate leave gets no
+// grace: the teammate said it was going.
+// The fixed domain vocabulary checklists are grown under. Extended by code change only: a free-form
+// domain would split one team's lessons across near-synonyms ("web", "frontend") and starve both.
+export const DOMAINS = Object.freeze(["web", "backend", "mobile", "desktop", "game", "ml", "data", "devops", "docs"]);
+
+// Validate and normalise a domains list. undefined/null stays undefined so callers can tell "not
+// given" (inherit or keep) from an explicit empty list.
+export function normalizeDomains(value) {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) throw new Error("domains must be an array.");
+  const cleaned = [...new Set(value.map((domain) => String(domain).trim().toLowerCase()).filter(Boolean))];
+  const unknown = cleaned.filter((domain) => !DOMAINS.includes(domain));
+  if (unknown.length) throw new Error(`Unknown domain(s): ${unknown.join(", ")}. Valid domains: ${DOMAINS.join(", ")}.`);
+  return DOMAINS.filter((domain) => cleaned.includes(domain));
+}
+
+export const TARGET_RECONNECT_GRACE_MS = 90_000;
+
+// SQL for "an agent named like the bound parameter is here, or is reconnecting". Binds (name, cutoff).
+export const PRESENT_BY_NAME_SQL = `
+  lower(present.name) = lower(?) AND (
+    present.status != 'disconnected'
+    OR (present.disconnect_kind = 'transport' AND present.disconnected_at >= ?)
+  )`;
+
+export const reconnectGraceCutoff = (atMs = Date.now()) => new Date(atMs - TARGET_RECONNECT_GRACE_MS).toISOString();
+
 const CANDIDATE_PAGE_SIZE = 20;
 const CANDIDATE_SCAN_CEILING = 500;
 // How many read-only assignments one agent may hold at once, on top of its single write claim. A
@@ -705,9 +736,10 @@ export class DevTeamStore extends EventEmitter {
     return this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
   }
 
-  createTask({ projectId, title, description, requiredApprovals = 2, sessionPolicy = "per_task" }) {
+  createTask({ projectId, title, description, requiredApprovals = 2, sessionPolicy = "per_task", domains = undefined }) {
     const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
     if (!project) throw new Error("Project not found.");
+    const taskDomains = normalizeDomains(domains) || [];
     const taskId = randomUUID();
     const plannerAssignmentId = randomUUID();
     const stamp = now();
@@ -716,16 +748,16 @@ export class DevTeamStore extends EventEmitter {
     this._transaction(() => {
       this.db.prepare(`
         INSERT INTO tasks (id, project_id, title, description, status, version, required_approvals,
-          session_policy, session_policy_version, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'planning', 1, ?, ?, 1, ?, ?)
+          session_policy, session_policy_version, created_at, updated_at, domains)
+        VALUES (?, ?, ?, ?, 'planning', 1, ?, ?, 1, ?, ?, ?)
       `).run(taskId, projectId, title.trim(), description.trim(), approvals,
         ["manual", "per_task", "adaptive", "per_assignment"].includes(sessionPolicy) ? sessionPolicy : "per_task",
-        stamp, stamp);
+        stamp, stamp, json(taskDomains));
       this.db.prepare(`
-        INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at, plans)
-        VALUES (?, ?, ?, ?, ?, 0, 'queued', ?, 1)
-      `).run(plannerAssignmentId, taskId, "Create the implementation plan", "Inspect the project, propose a concrete plan, then assign implementation and review work to the team.", planningRoleName, stamp);
-      this._event(taskId, null, "task.created", `Task created: ${title.trim()}`, { projectId, requiredApprovals: approvals });
+        INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at, plans, domains)
+        VALUES (?, ?, ?, ?, ?, 0, 'queued', ?, 1, ?)
+      `).run(plannerAssignmentId, taskId, "Create the implementation plan", "Inspect the project, propose a concrete plan, then assign implementation and review work to the team.", planningRoleName, stamp, json(taskDomains));
+      this._event(taskId, null, "task.created", `Task created: ${title.trim()}`, { projectId, requiredApprovals: approvals, ...(taskDomains.length ? { domains: taskDomains } : {}) });
     });
     this.assignmentAssessment({ assignmentId: plannerAssignmentId });
     this._changed("task.created", taskId);
@@ -733,11 +765,12 @@ export class DevTeamStore extends EventEmitter {
   }
 
   getTask(taskId) {
-    return this.db.prepare(`
+    const task = this.db.prepare(`
       SELECT t.*, p.name AS project_name, p.root AS project_root
       FROM tasks t JOIN projects p ON p.id = t.project_id
       WHERE t.id = ?
     `).get(taskId);
+    return task ? { ...task, domains: fromJson(task.domains, []) } : task;
   }
 
   listTasks(projectId = null) {
@@ -756,7 +789,7 @@ export class DevTeamStore extends EventEmitter {
           FROM tasks t JOIN projects p ON p.id = t.project_id
           ORDER BY t.updated_at DESC
         `).all();
-    return rows;
+    return rows.map((row) => ({ ...row, domains: fromJson(row.domains, []) }));
   }
 
   workspaceSearch(query, { projectId = null, limit = 40 } = {}) {
@@ -809,7 +842,7 @@ export class DevTeamStore extends EventEmitter {
   // after creation, so a typo or a sharpened spec no longer means deleting and recreating the room.
   // This is metadata only: it does not touch the version, existing approvals, assignments, or the
   // timeline of work — it just records that the human revised the brief. At least one field changes.
-  updateTask(taskId, { title = undefined, description = undefined, requiredApprovals = undefined, sessionPolicy = undefined } = {}) {
+  updateTask(taskId, { title = undefined, description = undefined, requiredApprovals = undefined, sessionPolicy = undefined, domains = undefined } = {}) {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     if (task.status === "cancelled") throw new Error("A cancelled task cannot be edited.");
@@ -822,8 +855,12 @@ export class DevTeamStore extends EventEmitter {
       : Math.max(1, Math.min(8, Number(requiredApprovals) || task.required_approvals));
     const nextPolicy = sessionPolicy === undefined ? task.session_policy : String(sessionPolicy);
     if (!["manual", "per_task", "adaptive", "per_assignment"].includes(nextPolicy)) throw new Error("Invalid session policy.");
+    // Changing a task's domains affects only assignments created afterwards; work already queued keeps
+    // the domains it was created under, the same rule its checklist follows.
+    const nextDomains = normalizeDomains(domains) ?? task.domains;
+    const domainsChanged = json(nextDomains) !== json(task.domains);
     if (nextTitle === task.title && nextDescription === task.description && nextApprovals === task.required_approvals
-      && nextPolicy === task.session_policy) {
+      && nextPolicy === task.session_policy && !domainsChanged) {
       return this.getTask(taskId);
     }
     const changed = [
@@ -831,13 +868,14 @@ export class DevTeamStore extends EventEmitter {
       nextDescription !== task.description ? "description" : null,
       nextApprovals !== task.required_approvals ? "approvals" : null,
       nextPolicy !== task.session_policy ? "session policy" : null,
+      domainsChanged ? "domains" : null,
     ].filter(Boolean);
     const stamp = now();
     this._transaction(() => {
       this.db.prepare(`UPDATE tasks SET title = ?, description = ?, required_approvals = ?, session_policy = ?,
-        session_policy_version = session_policy_version + ?, updated_at = ? WHERE id = ?`)
-        .run(nextTitle, nextDescription, nextApprovals, nextPolicy, nextPolicy === task.session_policy ? 0 : 1, stamp, taskId);
-      this._event(taskId, null, "task.updated", `Task details edited (${changed.join(", ")}).`, { changed, requiredApprovals: nextApprovals, sessionPolicy: nextPolicy });
+        session_policy_version = session_policy_version + ?, domains = ?, updated_at = ? WHERE id = ?`)
+        .run(nextTitle, nextDescription, nextApprovals, nextPolicy, nextPolicy === task.session_policy ? 0 : 1, json(nextDomains), stamp, taskId);
+      this._event(taskId, null, "task.updated", `Task details edited (${changed.join(", ")}).`, { changed, requiredApprovals: nextApprovals, sessionPolicy: nextPolicy, domains: nextDomains });
     });
     this._changed("task.updated", taskId);
     return this.getTask(taskId);
@@ -1026,9 +1064,11 @@ export class DevTeamStore extends EventEmitter {
     return { released: true, assignmentId, taskId: assignment.task_id, requiresWrite: Boolean(assignment.requires_write) };
   }
 
-  createAssignment({ agentId = null, taskId, title, description, role = "implementer", requiresWrite = false, targetAgentName = null, checklist = undefined, paths = undefined, dependsOn = undefined }) {
+  createAssignment({ agentId = null, taskId, title, description, role = "implementer", requiresWrite = false, targetAgentName = null, checklist = undefined, paths = undefined, dependsOn = undefined, reviewSubjectAssignmentId = null, domains = undefined }) {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
+    // An assignment inherits its task's domains unless the planner narrows or overrides them.
+    const assignmentDomains = normalizeDomains(domains) ?? task.domains;
     if (["accepted", "blocked", "cancelled"].includes(task.status)) throw new Error(this.closedTaskError(task, "create an assignment on it"));
     if (agentId) { this.getAgent(agentId); this.assertMembership(agentId, taskId); }
     const assignment = {
@@ -1039,6 +1079,39 @@ export class DevTeamStore extends EventEmitter {
     // on the row. Doing it at creation rather than at scan time means editing a project's role config
     // never silently re-classifies work that is already queued or in flight.
     const behaviour = this.roleBehaviour(task.project_id, assignment.role);
+    const reviewSubjectId = reviewSubjectAssignmentId ? String(reviewSubjectAssignmentId).trim() : null;
+    if (reviewSubjectId) {
+      if (!behaviour.verifies) throw new Error("A review subject is only valid for verifying assignments.");
+      const subject = this.db.prepare("SELECT task_id FROM assignments WHERE id = ?").get(reviewSubjectId);
+      if (!subject || subject.task_id !== taskId) throw new Error("A review subject must reference an assignment in the same task.");
+    }
+    // A second reviewer of the same kind does not add independent evidence; it adds two agents
+    // racing to approve the same version. Keep one open review per role, title and subject, while
+    // leaving ordinary implementation work alone so non-overlapping writers can still run concurrently.
+    // No task-version condition: an open review always examines whatever version is current when it
+    // is claimed, so an older open one already covers the newer version. A request naming a different
+    // reviewer is not a duplicate — the planner wants that specific independent teammate.
+    if (behaviour.verifies) {
+      const existing = this.db.prepare(`
+        SELECT * FROM assignments
+        WHERE task_id = ? AND verifies = 1 AND lower(role) = lower(?) AND lower(title) = lower(?)
+          AND COALESCE(review_subject_assignment_id, '') = COALESCE(?, '')
+          AND (? IS NULL OR lower(COALESCE(target_agent_name, '')) = lower(?))
+          AND status IN ('queued', 'claimed', 'verifying')
+        ORDER BY created_at ASC LIMIT 1
+      `).get(taskId, assignment.role, assignment.title, reviewSubjectId, assignment.targetAgentName, assignment.targetAgentName);
+      if (existing) {
+        return {
+          ...existing,
+          checklist: this._checklistFor(existing.id),
+          writePaths: this._writeScopeFor(existing.id),
+          dependsOn: this._dependenciesFor(existing.id).map((dependency) => dependency.id),
+          duplicateOf: existing.id,
+          created: false,
+          message: `An open ${existing.role} assignment with this title and subject already exists; reusing “${existing.title}”. Its own description and checklist apply, not the ones in this request.`,
+        };
+      }
+    }
     const resolvedChecklist = this._resolveChecklist(task.project_id, assignment.role, checklist);
     // A write assignment may declare the paths it will touch, enabling non-overlapping writers
     // to run in parallel; omitting them keeps the conservative whole-project lease.
@@ -1056,10 +1129,10 @@ export class DevTeamStore extends EventEmitter {
     }
     this._transaction(() => {
       this.db.prepare(`
-        INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at, verifies, plans)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
-      `).run(assignment.id, taskId, assignment.title, assignment.description, assignment.role, assignment.requiresWrite, assignment.targetAgentName, assignment.createdAt,
-        behaviour.verifies ? 1 : 0, behaviour.plans ? 1 : 0);
+        INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, review_subject_assignment_id, status, created_at, verifies, plans, domains)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+      `).run(assignment.id, taskId, assignment.title, assignment.description, assignment.role, assignment.requiresWrite, assignment.targetAgentName, reviewSubjectId, assignment.createdAt,
+        behaviour.verifies ? 1 : 0, behaviour.plans ? 1 : 0, json(assignmentDomains));
       this._storeChecklist(assignment.id, resolvedChecklist);
       if (writePaths.length) this.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)").run(assignment.id, json(writePaths));
       for (const dependencyId of dependencyIds) {
@@ -1073,14 +1146,16 @@ export class DevTeamStore extends EventEmitter {
         verifies: behaviour.verifies,
         requiresWrite: Boolean(assignment.requiresWrite),
         targetAgentName: assignment.targetAgentName,
+        reviewSubjectAssignmentId: reviewSubjectId,
         checklist: resolvedChecklist || [],
         writePaths,
         dependsOn: dependencyIds,
+        ...(assignmentDomains.length ? { domains: assignmentDomains } : {}),
       });
     });
     this.assignmentAssessment({ assignmentId: assignment.id });
     this._changed("assignment.created", taskId);
-    return { ...this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignment.id), checklist: resolvedChecklist || [], writePaths, dependsOn: dependencyIds };
+    return { ...this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignment.id), checklist: resolvedChecklist || [], writePaths, dependsOn: dependencyIds, domains: assignmentDomains };
   }
 
   // The candidate scan used to be one 55-line SELECT carrying membership, targeting, dependencies
@@ -1129,17 +1204,21 @@ export class DevTeamStore extends EventEmitter {
         // Targeting routes work to a teammate by name; it must not outlive that teammate. A target
         // that is still connected keeps its exclusive hold (and its ORDER BY priority), but once
         // nobody by that name is present the item returns to the general queue instead of sitting
-        // claimable-by-nobody and blocking every verifier behind it.
+        // claimable-by-nobody and blocking every verifier behind it. A target whose transport just
+        // dropped is still "present" for TARGET_RECONNECT_GRACE_MS, so a reconnect is not a handoff.
         code: "targeted_elsewhere",
         sql: `(
             a.target_agent_name IS NULL
             OR lower(a.target_agent_name) = lower(?)
             OR NOT EXISTS (
               SELECT 1 FROM agents present
-              WHERE lower(present.name) = lower(a.target_agent_name) AND present.status != 'disconnected'
+              WHERE lower(present.name) = lower(a.target_agent_name) AND (
+                present.status != 'disconnected'
+                OR (present.disconnect_kind = 'transport' AND present.disconnected_at >= ?)
+              )
             )
           )`,
-        params: [agentName],
+        params: [agentName, reconnectGraceCutoff()],
       },
       {
         code: "room_invitation_only",
@@ -1597,9 +1676,9 @@ export class DevTeamStore extends EventEmitter {
       add("task_closed", `Its task is ${assignment.task_status}; a closed task hands out no work.`, { taskStatus: assignment.task_status });
     }
     if (failed.has("targeted_elsewhere")) {
-      add("targeted_elsewhere", `Targeted at “${targetName}”, who is connected and holds it exclusively.`, { targetAgentName: targetName });
+      add("targeted_elsewhere", `Targeted at “${targetName}”, who is connected (or reconnecting) and holds it exclusively.`, { targetAgentName: targetName });
     }
-    if (targetName && !this.db.prepare("SELECT 1 FROM agents WHERE lower(name) = lower(?) AND status != 'disconnected' LIMIT 1").get(targetName)) {
+    if (targetName && !this.db.prepare(`SELECT 1 FROM agents present WHERE ${PRESENT_BY_NAME_SQL} LIMIT 1`).get(targetName, reconnectGraceCutoff())) {
       // Not a blocker: an absent target returns the item to the general queue rather than letting it
       // sit claimable-by-nobody. Reported anyway, because "nobody named X is here" explains a lot.
       add("target_absent", `Targeted at “${targetName}”, who is not connected; any member of the room may claim it.`, { targetAgentName: targetName }, false);
@@ -1632,7 +1711,7 @@ export class DevTeamStore extends EventEmitter {
         // very next second, and calling it blocked would put the explanation at odds with a scan
         // that is about to hand it over. Both branches read the same two author sets the scan
         // reads, so the item can never be skipped for a reason this cannot name.
-        const authors = this._currentVersionAuthors(assignment.task_id, assignment.task_version);
+        const authors = this._reviewAuthors(assignment);
         const connected = this._connectedParticipants(assignment.task_id);
         const excluded = [...connected].filter((agentId) => authors.has(agentId));
         if (excluded.length && this._independentClaimantExists(assignment, authors, null)) {

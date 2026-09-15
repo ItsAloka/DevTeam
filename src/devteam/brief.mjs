@@ -11,7 +11,23 @@ export const DEFAULT_BRIEF_BUDGET = Object.freeze({
   knowledgeBytes: 8_192,
   codeContextBytes: 5_120,
   activityBytes: 4_096,
+  // Domain checklist items ride in the mandatory core beside the role base checklist, so they get
+  // their own fixed ceiling rather than competing with the optional sections.
+  domainChecklistItems: 15,
+  domainChecklistBytes: 3_584,
 });
+
+// Admit ranked checklist items in order until the item or byte cap is reached. Never reorders and
+// never partially admits an item, so what is delivered is always a prefix of the ranking.
+export function capDomainChecklist(items, { maxItems = DEFAULT_BRIEF_BUDGET.domainChecklistItems, maxBytes = DEFAULT_BRIEF_BUDGET.domainChecklistBytes } = {}) {
+  const admitted = [];
+  for (const item of items) {
+    if (admitted.length >= maxItems) break;
+    if (jsonBytes([...admitted, item]) > maxBytes) break;
+    admitted.push(item);
+  }
+  return { items: admitted, omitted: items.length - admitted.length };
+}
 
 export const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value), "utf8");
 

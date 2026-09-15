@@ -53,6 +53,7 @@ export function applySchema(db) {
       role TEXT NOT NULL,
       requires_write INTEGER NOT NULL DEFAULT 0,
       target_agent_name TEXT,
+      review_subject_assignment_id TEXT REFERENCES assignments(id),
       agent_id TEXT REFERENCES agents(id),
       status TEXT NOT NULL,
       created_at TEXT NOT NULL,
@@ -226,6 +227,50 @@ export function applySchema(db) {
 
     CREATE INDEX IF NOT EXISTS idx_assignment_findings ON assignment_findings(assignment_id, created_at);
 
+    -- Self-growing domain checklists (SKILLS_PLAN.md §5). An item is a short general rule; its
+    -- evidence is never copied here — it is the assignment_findings rows whose checklist_item_id
+    -- points at it, so an item can never drift from the findings that justify it.
+    -- scope 'shared' items apply to every project in their domain (project_id NULL); 'project'
+    -- items belong to one project only and must never be delivered or exported elsewhere.
+    CREATE TABLE IF NOT EXISTS checklist_items (
+      id TEXT PRIMARY KEY,
+      scope TEXT NOT NULL CHECK (scope IN ('shared', 'project')),
+      project_id TEXT NULL,
+      domain TEXT NOT NULL,
+      section TEXT NOT NULL,
+      rule TEXT NOT NULL,
+      signature TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('candidate', 'active', 'expired', 'merged', 'rejected')),
+      promoted_by TEXT NULL,
+      expired_reason TEXT NULL,
+      expiry_pending_at TEXT NULL,
+      last_violated_at TEXT NULL,
+      pinned INTEGER NOT NULL DEFAULT 0,
+      merged_into TEXT NULL REFERENCES checklist_items(id),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      status_changed_at TEXT NOT NULL
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_checklist_items_key
+      ON checklist_items(scope, COALESCE(project_id, ''), domain, signature);
+    CREATE INDEX IF NOT EXISTS idx_checklist_items_status ON checklist_items(domain, status);
+
+    -- One row per time an item was put in front of an assignment, and what the checker said about it.
+    -- Expiry reads only these: "learned" and "not applicable" are claims about deliveries, not about
+    -- how old an item is.
+    CREATE TABLE IF NOT EXISTS checklist_deliveries (
+      item_id TEXT NOT NULL REFERENCES checklist_items(id),
+      assignment_id TEXT NOT NULL,
+      delivered_at TEXT NOT NULL,
+      mark TEXT NULL CHECK (mark IN ('checked', 'violated', 'not-applicable')),
+      marked_by_agent_id TEXT NULL,
+      marked_at TEXT NULL,
+      PRIMARY KEY (item_id, assignment_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_checklist_deliveries_item ON checklist_deliveries(item_id, delivered_at);
+
     -- What each verified check last did, per task. Keyed by the *command* rather than the label,
     -- because a label is agent-written prose and the argv is the pinned allowlist entry — two
     -- agents describing the same suite differently must still compare against the same baseline.
@@ -355,6 +400,20 @@ export function applySchema(db) {
     ["assignments", "priority", "INTEGER NOT NULL DEFAULT 0"],
     ["assignments", "cancel_requested_at", "TEXT"],
     ["assignments", "cancel_reason", "TEXT"],
+    ["assignments", "review_subject_assignment_id", "TEXT REFERENCES assignments(id)"],
+    // How a session ended: 'leave' for a deliberate disconnect, 'transport' for a dropped MCP
+    // connection. Some hosts open a fresh session every turn, so a transport drop is usually a
+    // teammate about to come straight back — the scheduler gives those a short grace window.
+    ["agents", "disconnect_kind", "TEXT"],
+    // Domains a task (and, by inheritance, its assignments) belongs to, as a JSON array drawn from
+    // DOMAINS in store.mjs. '[]' means undeclared, which must schedule and brief exactly as before.
+    ["tasks", "domains", "TEXT NOT NULL DEFAULT '[]'"],
+    ["assignments", "domains", "TEXT NOT NULL DEFAULT '[]'"],
+    // A reviewer may restate a finding as a short general rule (≤200 chars) under a section; the
+    // detail stays task-specific. checklist_item_id links the finding to the item it is evidence for.
+    ["assignment_findings", "rule", "TEXT"],
+    ["assignment_findings", "section", "TEXT"],
+    ["assignment_findings", "checklist_item_id", "TEXT"],
   ]) {
     try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
   }

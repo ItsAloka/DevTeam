@@ -68,11 +68,15 @@ const MUTANTS = [
             OR lower(a.target_agent_name) = lower(?)
             OR NOT EXISTS (
               SELECT 1 FROM agents present
-              WHERE lower(present.name) = lower(a.target_agent_name) AND present.status != 'disconnected'
+              WHERE lower(present.name) = lower(a.target_agent_name) AND (
+                present.status != 'disconnected'
+                OR (present.disconnect_kind = 'transport' AND present.disconnected_at >= ?)
+              )
             )
           )\`,`,
+    // Two placeholders on both sides: the predicate binds (agentName, reconnect-grace cutoff).
     to: `        code: "targeted_elsewhere",
-        sql: \`(? IS NOT NULL)\`,`,
+        sql: \`(? IS NOT NULL AND ? IS NOT NULL)\`,`,
   },
   {
     name: "M6  candidate window shrunk to 1 (no paging)",
@@ -102,10 +106,14 @@ const MUTANTS = [
     name: "M10 F9 revert (absent-target fallback)",
     from: `            OR NOT EXISTS (
               SELECT 1 FROM agents present
-              WHERE lower(present.name) = lower(a.target_agent_name) AND present.status != 'disconnected'
+              WHERE lower(present.name) = lower(a.target_agent_name) AND (
+                present.status != 'disconnected'
+                OR (present.disconnect_kind = 'transport' AND present.disconnected_at >= ?)
+              )
             )
 `,
-    to: "",
+    // Keeps the grace cutoff's placeholder bound, so the mutant fails on behaviour, not on arity.
+    to: "            OR (0 AND ? IS NOT NULL)\n",
   },
   {
     name: "M11 deadlock fix revert (unready writers gate again)",

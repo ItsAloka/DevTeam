@@ -11,7 +11,7 @@ import { fromJson, json, now } from "./util.mjs";
 import { hashToken } from "./access.mjs";
 
 export const agentMethods = {
-  _releaseAgentClaims(agent, stamp, reason) {
+  _releaseAgentClaims(agent, stamp, reason, kind = "leave") {
     const taskIds = this.db.prepare(`
       SELECT DISTINCT task_id FROM assignments WHERE agent_id = ? AND status = 'claimed'
     `).all(agent.id).map((row) => row.task_id);
@@ -21,9 +21,9 @@ export const agentMethods = {
     `).run(agent.id).changes;
     this.db.prepare(`
       UPDATE agents
-      SET status = 'disconnected', current_task_id = NULL, last_seen = ?, disconnected_at = ?
+      SET status = 'disconnected', current_task_id = NULL, last_seen = ?, disconnected_at = ?, disconnect_kind = ?
       WHERE id = ?
-    `).run(stamp, stamp, agent.id);
+    `).run(stamp, stamp, kind, agent.id);
     for (const taskId of taskIds) {
       this._event(taskId, agent.id, "agent.disconnected", `${agent.name} disconnected and released unfinished work.`, {
         reason,
@@ -376,10 +376,10 @@ export const agentMethods = {
     return this.getAgent(agentId);
   },
 
-  disconnectAgent(agentId, summary = "") {
+  disconnectAgent(agentId, summary = "", { kind = "leave" } = {}) {
     const agent = this.getAgent(agentId);
     const stamp = now();
-    const affectedTaskIds = this._transaction(() => this._releaseAgentClaims(agent, stamp, summary || "Agent disconnected normally."));
+    const affectedTaskIds = this._transaction(() => this._releaseAgentClaims(agent, stamp, summary || "Agent disconnected normally.", kind));
     this._changed("agent.disconnected", agent.current_task_id);
     for (const taskId of affectedTaskIds) this._changed("assignment.released", taskId);
     return { disconnected: true, agentId, summary };
@@ -392,7 +392,7 @@ export const agentMethods = {
     let agent;
     try { agent = this.getAgent(agentId); } catch { return { disconnected: false }; }
     if (agent.status === "disconnected") return { disconnected: false };
-    return this.disconnectAgent(agentId, "MCP transport closed.");
+    return this.disconnectAgent(agentId, "MCP transport closed.", { kind: "transport" });
   },
 
   // Human-driven removal of an agent that has left for good. A currently connected agent

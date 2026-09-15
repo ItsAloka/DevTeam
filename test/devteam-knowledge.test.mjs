@@ -138,6 +138,50 @@ test("an agent can record what it learned, and it comes back through ordinary re
   assert.equal(finding.author_name, "Scout");
 });
 
+test("an empty knowledge index replays its event history instead of reporting an empty vault", async (t) => {
+  const { store, project, task, agent } = await vaultFixture(t);
+  store.knowledgeWrite({
+    agentId: agent.id, taskId: task.id, category: "pitfalls",
+    title: "Recover the event-backed vault index", body: "The durable event history can rebuild generated knowledge.",
+  });
+  const lastEventId = store.db.prepare("SELECT MAX(id) AS id FROM events").get().id;
+  store.db.prepare("DELETE FROM knowledge_notes WHERE project_id = ?").run(project.id);
+  store.db.prepare("UPDATE knowledge_state SET last_event_id = ? WHERE project_id = ?").run(lastEventId, project.id);
+
+  store.knowledge.initializeProject(project.id);
+
+  for (let index = 0; index < 30; index += 1) {
+    store.knowledgeWrite({
+      agentId: agent.id, taskId: task.id, category: "pitfalls",
+      title: `Count every restored vault note ${index}`, body: "The state count must not be limited by the dashboard preview.",
+    });
+  }
+  const detail = store.taskDetail(task.id);
+  assert.equal(detail.knowledgeVault.noteCount, 31, "the state reports the full restored project total, not the 30-note display slice");
+  assert.equal(detail.knowledge.length, 30, "the dashboard preview remains bounded independently of the total");
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM knowledge_notes WHERE project_id = ? AND source_event_id = ?")
+    .get(project.id, lastEventId).count, 1, "the historical event was replayed into the restored index");
+});
+
+test("the index restore runs at most once, so a project with no notes does not replay on every sync", async (t) => {
+  const { store, project, task, agent } = await vaultFixture(t);
+  store.knowledgeWrite({ agentId: agent.id, taskId: task.id, category: "pitfalls", title: "Replay witness", body: "Proves whether history was replayed." });
+  const noteCount = () => Number(store.db.prepare("SELECT COUNT(*) AS count FROM knowledge_notes WHERE project_id = ?").get(project.id).count);
+  const emptyIndexAtHead = () => {
+    store.db.prepare("DELETE FROM knowledge_notes WHERE project_id = ?").run(project.id);
+    const head = Number(store.db.prepare("SELECT MAX(id) AS id FROM events").get().id);
+    store.db.prepare("UPDATE knowledge_state SET last_event_id = ? WHERE project_id = ?").run(head, project.id);
+  };
+
+  emptyIndexAtHead();
+  store.knowledge.syncTask(task.id);
+  assert.ok(noteCount() > 0, "the first empty index is rebuilt by replaying history");
+
+  emptyIndexAtHead();
+  store.knowledge.syncTask(task.id);
+  assert.equal(noteCount(), 0, "a second empty index in the same database is not replayed again");
+});
+
 test("a written note is redacted and validated exactly like a derived one", async (t) => {
   const { store, task, agent } = await vaultFixture(t);
   const written = store.knowledgeWrite({
