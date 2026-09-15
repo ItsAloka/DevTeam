@@ -56,6 +56,21 @@ test("a change that can alter a list schedules a sync, and close() cancels timer
   instance.syncChecklists(); // a late call after close is a no-op rather than a use-after-close
 });
 
+test("the domains API lists, adds and removes domains, and refuses synonyms", async (t) => {
+  const { instance } = await server(t);
+  const call = (url, init = {}) => fetch(`${instance.url}${url}`, { ...init, headers: { "Content-Type": "application/json", Authorization: `Bearer ${instance.store.token}` } });
+  const listed = await (await call("/api/domains")).json();
+  assert.ok(listed.some((domain) => domain.name === "security" && domain.builtin));
+  const created = await call("/api/domains", { method: "POST", body: JSON.stringify({ name: "quantum" }) });
+  assert.equal(created.status, 201);
+  assert.equal((await created.json()).name, "quantum");
+  const synonym = await call("/api/domains", { method: "POST", body: JSON.stringify({ name: "infra" }) });
+  assert.equal(synonym.status, 400);
+  assert.match((await synonym.json()).error, /devops/);
+  assert.equal((await call("/api/domains/quantum", { method: "DELETE" })).status, 200);
+  assert.equal((await call("/api/domains/web", { method: "DELETE" })).status, 400);
+});
+
 test("PATCH /api/tasks forwards domains; an unknown domain is a 400", async (t) => {
   const { instance } = await server(t);
   const project = instance.store.listProjects()[0];

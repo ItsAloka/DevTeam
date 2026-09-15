@@ -15,9 +15,31 @@ async function fixture(t) {
   return { store, project: store.ensureProject("Domains", projectRoot) };
 }
 
-test("the domain enum is the fixed v1 list", () => {
-  assert.deepEqual([...DOMAINS], ["web", "backend", "mobile", "desktop", "game", "ml", "data", "devops", "docs"]);
+test("the built-in domains are the common IT set and cannot be mutated", () => {
+  assert.deepEqual([...DOMAINS], ["web", "backend", "mobile", "desktop", "game", "ml", "data", "devops", "docs", "embedded", "security"]);
   assert.throws(() => { DOMAINS.push("frontend"); });
+});
+
+test("the owner can add a domain, use it, and remove it only while unused", async (t) => {
+  const { store, project } = await fixture(t);
+  assert.deepEqual(store.domainNames(), [...DOMAINS], "built-ins are seeded");
+  const added = store.addDomain(" Blockchain ");
+  assert.deepEqual({ name: added.name, builtin: added.builtin }, { name: "blockchain", builtin: false });
+  assert.equal(store.domainNames().at(-1), "blockchain");
+
+  assert.throws(() => store.addDomain("blockchain"), /already exists/);
+  assert.throws(() => store.addDomain("frontend"), /covered by the "web" domain/);
+  assert.throws(() => store.addDomain("AI"), /covered by the "ml" domain/);
+  assert.throws(() => store.addDomain("../etc"), /lowercase letters/, "names become file names, so no path characters");
+  assert.throws(() => store.addDomain("x"), /2–30 characters/);
+  assert.equal(store.addDomain("ar vr").name, "ar-vr", "spaces become hyphens");
+
+  const task = store.createTask({ projectId: project.id, title: "Chain", description: "d", domains: ["blockchain", "web"] });
+  assert.deepEqual(task.domains, ["web", "blockchain"], "ordered as the domain list is");
+  assert.throws(() => store.removeDomain("blockchain"), /in use by 1 task/);
+  assert.throws(() => store.removeDomain("web"), /Built-in domains cannot be removed/);
+  assert.deepEqual(store.removeDomain("ar-vr"), { removed: "ar-vr" });
+  assert.throws(() => store.createTask({ projectId: project.id, title: "Gone", description: "d", domains: ["ar-vr"] }), /Unknown domain/);
 });
 
 test("normalizeDomains validates, dedupes, lowercases and orders; undefined stays undefined", () => {

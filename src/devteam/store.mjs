@@ -4,6 +4,12 @@ import { mkdirSync, statSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { applySchema } from "./schema.mjs";
+import { DEFAULT_DOMAINS, normalizeDomains, validateNewDomainName } from "./domains.mjs";
+
+// The built-in domains, kept under their original export name. The live list (built-ins plus any the
+// owner added) is store.domainNames().
+export const DOMAINS = DEFAULT_DOMAINS;
+export { normalizeDomains };
 import { fromJson, json, now } from "./util.mjs";
 import { checksMethods } from "./store-checks.mjs";
 import { knowledgeMethods } from "./store-knowledge.mjs";
@@ -50,21 +56,6 @@ const BLOCK_KINDS_NEEDING_OPEN_WORK = BLOCK_KINDS.filter((kind) => kind !== "nee
 // connected; without this, work targeted at that teammate — or the independence that keeps an
 // author off its own review — leaked to whoever polled inside the gap. A deliberate leave gets no
 // grace: the teammate said it was going.
-// The fixed domain vocabulary checklists are grown under. Extended by code change only: a free-form
-// domain would split one team's lessons across near-synonyms ("web", "frontend") and starve both.
-export const DOMAINS = Object.freeze(["web", "backend", "mobile", "desktop", "game", "ml", "data", "devops", "docs"]);
-
-// Validate and normalise a domains list. undefined/null stays undefined so callers can tell "not
-// given" (inherit or keep) from an explicit empty list.
-export function normalizeDomains(value) {
-  if (value === undefined || value === null) return undefined;
-  if (!Array.isArray(value)) throw new Error("domains must be an array.");
-  const cleaned = [...new Set(value.map((domain) => String(domain).trim().toLowerCase()).filter(Boolean))];
-  const unknown = cleaned.filter((domain) => !DOMAINS.includes(domain));
-  if (unknown.length) throw new Error(`Unknown domain(s): ${unknown.join(", ")}. Valid domains: ${DOMAINS.join(", ")}.`);
-  return DOMAINS.filter((domain) => cleaned.includes(domain));
-}
-
 export const TARGET_RECONNECT_GRACE_MS = 90_000;
 
 // SQL for "an agent named like the bound parameter is here, or is reconnecting". Binds (name, cutoff).
@@ -736,10 +727,43 @@ export class DevTeamStore extends EventEmitter {
     return this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
   }
 
+  // ---- Domains: built-ins plus owner-added, shared by every project like the checklists ----
+
+  listDomains() {
+    return this.db.prepare(`
+      SELECT d.name, d.builtin, d.created_at,
+        (SELECT COUNT(*) FROM tasks t, json_each(t.domains) j WHERE j.value = d.name) AS task_count,
+        (SELECT COUNT(*) FROM checklist_items i WHERE i.domain = d.name) AS item_count
+      FROM domains d ORDER BY d.builtin DESC, d.rowid ASC
+    `).all().map((row) => ({ name: row.name, builtin: Boolean(row.builtin), createdAt: row.created_at, tasks: row.task_count, checklistItems: row.item_count }));
+  }
+
+  domainNames() {
+    return this.db.prepare("SELECT name FROM domains ORDER BY builtin DESC, rowid ASC").all().map((row) => row.name);
+  }
+
+  addDomain(rawName) {
+    const name = validateNewDomainName(rawName, this.domainNames());
+    this.db.prepare("INSERT INTO domains (name, builtin, created_at) VALUES (?, 0, ?)").run(name, now());
+    this._changed("domain.added");
+    return this.listDomains().find((domain) => domain.name === name);
+  }
+
+  // Only an unused custom domain can go: removing one a task or checklist item names would orphan it.
+  removeDomain(name) {
+    const domain = this.listDomains().find((entry) => entry.name === String(name));
+    if (!domain) throw new Error("Domain not found.");
+    if (domain.builtin) throw new Error("Built-in domains cannot be removed.");
+    if (domain.tasks || domain.checklistItems) throw new Error(`"${domain.name}" is in use by ${domain.tasks} task(s) and ${domain.checklistItems} checklist item(s).`);
+    this.db.prepare("DELETE FROM domains WHERE name = ? AND builtin = 0").run(domain.name);
+    this._changed("domain.removed");
+    return { removed: domain.name };
+  }
+
   createTask({ projectId, title, description, requiredApprovals = 2, sessionPolicy = "per_task", domains = undefined }) {
     const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
     if (!project) throw new Error("Project not found.");
-    const taskDomains = normalizeDomains(domains) || [];
+    const taskDomains = normalizeDomains(domains, this.domainNames()) || [];
     const taskId = randomUUID();
     const plannerAssignmentId = randomUUID();
     const stamp = now();
@@ -857,7 +881,7 @@ export class DevTeamStore extends EventEmitter {
     if (!["manual", "per_task", "adaptive", "per_assignment"].includes(nextPolicy)) throw new Error("Invalid session policy.");
     // Changing a task's domains affects only assignments created afterwards; work already queued keeps
     // the domains it was created under, the same rule its checklist follows.
-    const nextDomains = normalizeDomains(domains) ?? task.domains;
+    const nextDomains = normalizeDomains(domains, this.domainNames()) ?? task.domains;
     const domainsChanged = json(nextDomains) !== json(task.domains);
     if (nextTitle === task.title && nextDescription === task.description && nextApprovals === task.required_approvals
       && nextPolicy === task.session_policy && !domainsChanged) {
@@ -1068,7 +1092,7 @@ export class DevTeamStore extends EventEmitter {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     // An assignment inherits its task's domains unless the planner narrows or overrides them.
-    const assignmentDomains = normalizeDomains(domains) ?? task.domains;
+    const assignmentDomains = normalizeDomains(domains, this.domainNames()) ?? task.domains;
     if (["accepted", "blocked", "cancelled"].includes(task.status)) throw new Error(this.closedTaskError(task, "create an assignment on it"));
     if (agentId) { this.getAgent(agentId); this.assertMembership(agentId, taskId); }
     const assignment = {

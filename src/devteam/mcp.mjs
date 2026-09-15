@@ -301,7 +301,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       checklist: z.array(z.string().max(300)).max(40).optional().describe("Points the assignee must address; overrides the role's default checklist, and an empty array omits it"),
       paths: z.array(z.string().max(500)).max(50).optional().describe("For write work: the paths this will modify (e.g. src/ocean/**). Declaring them lets non-overlapping writers run in parallel; omit for an exclusive whole-project lease."),
       dependsOn: z.array(z.string().uuid()).max(50).optional().describe("Same-task assignment IDs that must finish first. Empty means it can run now."),
-      domains: z.array(z.enum(DOMAINS)).max(DOMAINS.length).optional().describe("The domains this work belongs to, which choose the domain checklist it carries. Omit to inherit the task's domains; an empty array means none."),
+      domains: z.array(z.string().max(30)).max(20).optional().describe(`The domains this work belongs to, which choose the domain checklist it carries. Built-in: ${DOMAINS.join(", ")}; the owner may have added more, and an unknown name is refused with the current list. Omit to inherit the task's domains; an empty array means none.`),
       agree: z.boolean().default(false).describe("Put this to the team as a proposal instead of creating it"),
       kind: z.enum(["role", "handoff", "plan", "decision"]).default("role").describe("agree=true only: role asks that an agent take a role, handoff moves an existing assignment, plan/decision records a shared decision"),
       assignmentId: z.string().uuid().optional().describe("agree=true with kind=handoff: the assignment to move"),

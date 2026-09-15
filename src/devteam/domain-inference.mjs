@@ -5,10 +5,11 @@
 // So every marker must be specific to its domain. Generic folder names (`models/`, `server/`,
 // `data/` alone) and loose file types (any `.swift`, any `.csv`) are not evidence: an MVC backend
 // has models, a SwiftPM server has Swift, and every test suite has fixture CSVs.
-import { DOMAINS } from "./store.mjs";
+import { DEFAULT_DOMAINS } from "./domains.mjs";
 
-// Kept as the historical export name; it is the canonical enum, not a second copy of it.
-export const DOMAIN_ORDER = DOMAINS;
+// Kept as the historical export name; it is the canonical built-in list, not a second copy of it.
+// Owner-added domains have no file markers, so they are never suggested.
+export const DOMAIN_ORDER = DEFAULT_DOMAINS;
 
 // How many example paths are returned per domain. The count of all matches is returned alongside,
 // so the result stays small enough for a brief however large the project is.

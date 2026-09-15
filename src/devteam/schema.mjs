@@ -7,6 +7,8 @@
 //
 // Every statement is idempotent: CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS, and
 // ALTER TABLE ADD COLUMN guarded by try/catch. It runs on every open, not just on a fresh one.
+import { DEFAULT_DOMAINS } from "./domains.mjs";
+
 export function applySchema(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS metadata (
@@ -232,6 +234,13 @@ export function applySchema(db) {
     -- points at it, so an item can never drift from the findings that justify it.
     -- scope 'shared' items apply to every project in their domain (project_id NULL); 'project'
     -- items belong to one project only and must never be delivered or exported elsewhere.
+    -- The domain vocabulary: built-ins seeded below, plus names the owner adds. Shared by all projects.
+    CREATE TABLE IF NOT EXISTS domains (
+      name TEXT PRIMARY KEY,
+      builtin INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS checklist_items (
       id TEXT PRIMARY KEY,
       scope TEXT NOT NULL CHECK (scope IN ('shared', 'project')),
@@ -406,7 +415,7 @@ export function applySchema(db) {
     // teammate about to come straight back — the scheduler gives those a short grace window.
     ["agents", "disconnect_kind", "TEXT"],
     // Domains a task (and, by inheritance, its assignments) belongs to, as a JSON array drawn from
-    // DOMAINS in store.mjs. '[]' means undeclared, which must schedule and brief exactly as before.
+    // the domains table (see domains.mjs). '[]' means undeclared, which must schedule and brief exactly as before.
     ["tasks", "domains", "TEXT NOT NULL DEFAULT '[]'"],
     ["assignments", "domains", "TEXT NOT NULL DEFAULT '[]'"],
     // A reviewer may restate a finding as a short general rule (≤200 chars) under a section; the
@@ -416,6 +425,10 @@ export function applySchema(db) {
     ["assignment_findings", "checklist_item_id", "TEXT"],
   ]) {
     try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
+  }
+  // Seed built-in domains on every open, so a release that adds one reaches existing databases too.
+  for (const name of DEFAULT_DOMAINS) {
+    db.prepare("INSERT OR IGNORE INTO domains (name, builtin, created_at) VALUES (?, 1, ?)").run(name, new Date().toISOString());
   }
   // Rows written before role behaviour was a column carry the software role names that used to be
   // hardcoded. Backfill them from exactly those names, once, so an existing database schedules

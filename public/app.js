@@ -947,18 +947,53 @@ document.addEventListener("click", async (event) => {
   if (projectButton) { clearPendingAttachments(); selectedProjectId = projectButton.dataset.project; const first = state.tasks.find((task) => task.project_id === selectedProjectId); selectedTaskId = first?.id || null; syncTaskUrl(); await refresh(); }
 });
 
-// The fixed domain list (DOMAINS in src/devteam/store.mjs). Checkboxes rather than a free field: an
-// unknown domain is rejected by the server, and a wrong one delivers the wrong checklist.
-const DOMAIN_CHOICES = ["web", "backend", "mobile", "desktop", "game", "ml", "data", "devops", "docs"];
-for (const picker of document.querySelectorAll("[data-domain-picker]")) {
-  for (const domain of DOMAIN_CHOICES) {
-    const label = document.createElement("label");
-    const box = document.createElement("input");
-    box.type = "checkbox"; box.name = "domains"; box.value = domain;
-    label.append(box, document.createTextNode(domain));
-    picker.append(label);
+// Domain checkboxes come from the server's live list: the built-ins plus any the owner added. New ones
+// are added through "+ Add domain", which the server validates (slug names, no synonyms of a built-in).
+let domainChoices = ["web", "backend", "mobile", "desktop", "game", "ml", "data", "devops", "docs", "embedded", "security"];
+function renderDomainPickers() {
+  for (const picker of document.querySelectorAll("[data-domain-picker]")) {
+    const checked = new Set([...picker.querySelectorAll('input[name="domains"]:checked')].map((box) => box.value));
+    picker.querySelectorAll(".domain-choice, .domain-add").forEach((node) => node.remove());
+    for (const domain of domainChoices) {
+      const label = document.createElement("label");
+      label.className = "domain-choice";
+      const box = document.createElement("input");
+      box.type = "checkbox"; box.name = "domains"; box.value = domain; box.checked = checked.has(domain);
+      label.append(box, document.createTextNode(domain));
+      picker.append(label);
+    }
+    const add = document.createElement("span");
+    add.className = "domain-add";
+    const input = document.createElement("input");
+    input.type = "text"; input.maxLength = 30; input.placeholder = "new domain"; input.setAttribute("aria-label", "New domain name");
+    const button = document.createElement("button");
+    button.type = "button"; button.className = "secondary"; button.textContent = "+ Add domain";
+    const submit = async () => {
+      const name = input.value.trim();
+      if (!name) { input.focus(); return; }
+      try {
+        const created = await api("/api/domains", { method: "POST", body: JSON.stringify({ name }) });
+        await loadDomainChoices();
+        const box = picker.querySelector(`input[name="domains"][value="${CSS.escape(created.name)}"]`);
+        if (box) box.checked = true;
+        toast(`Domain “${created.name}” added`);
+      } catch (error) { toast(error.message); }
+    };
+    button.addEventListener("click", submit);
+    input.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); submit(); } });
+    add.append(input, button);
+    picker.append(add);
   }
 }
+async function loadDomainChoices() {
+  try {
+    const domains = await api("/api/domains");
+    if (Array.isArray(domains) && domains.length) domainChoices = domains.map((domain) => domain.name);
+  } catch { /* an older server has no domain list; keep the built-ins */ }
+  renderDomainPickers();
+}
+renderDomainPickers();
+loadDomainChoices();
 const taskDomains = (task) => {
   if (Array.isArray(task?.domains)) return task.domains;
   try { return JSON.parse(task?.domains || "[]"); } catch { return []; }

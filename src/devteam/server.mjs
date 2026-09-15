@@ -236,6 +236,16 @@ export async function startDevTeamServer({
     if (!detail) return res.status(404).json({ error: "Task not found." });
     res.json(detail);
   });
+  app.get("/api/domains", (req, res) => {
+    res.json(store.listDomains());
+  });
+  app.post("/api/domains", (req, res) => {
+    requireFields(req.body, ["name"]);
+    res.status(201).json(store.addDomain(req.body.name));
+  });
+  app.delete("/api/domains/:name", (req, res) => {
+    res.json(store.removeDomain(req.params.name));
+  });
   app.post("/api/projects", (req, res) => {
     requireFields(req.body, ["name", "root"]);
     res.status(201).json(store.ensureProject(req.body.name, requireDirectory(req.body.root)));
