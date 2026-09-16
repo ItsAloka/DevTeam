@@ -78,12 +78,13 @@ kept so you can fix it. A check without a command is recorded as your assertion.
 
 ## Checklists
 
-Verifying assignments carry the role's base `checklist`, and — when the task's selected domains have a list — a
+Verifying assignments carry the role's base `checklist`, and — when the assignment's selected domains have a list — a
 `domainChecklist` and `checklistFiles`. These are checklists **the owner wrote by hand**: hard-won
 rules for that kind of software, at `<DevTeam launch directory>/checklists/<domain>.md`.
 Only selected domains are delivered: if no domain is selected, there is no extra domain checklist.
 Use `applies_to` in a checklist's frontmatter only when the owner deliberately wants it limited to
-specific reviewing roles; otherwise the selected list reaches every verifying role.
+specific verifying roles; otherwise the selected list reaches every verifying role. An assignment
+inherits its task's selected domains unless a planner narrows or overrides them.
 
 - `domainChecklist` holds only the **critical** lines, inlined because missing one means a breach, a
   bill or an outage. It is not the whole list.
@@ -94,10 +95,12 @@ specific reviewing roles; otherwise the selected list reaches every verifying ro
 - **Never edit these files.** They are the owner's. If you think a line is missing, say so in your
   report or as a `rule` on a finding; the owner decides.
 
-The domains that exist are exactly the files the owner has written in `checklists/` — nothing is
-built in, so do not assume `web` or `mobile` exists. `devteam_plan` lists the current ones and
-refuses an unknown name with that list. A planner sets them with `domains` (omit to inherit the
-task's, `[]` for none). A wrong domain is worse than none: it hands the reviewer the wrong list.
+The live domains are the files the owner has written in `checklists/` — nothing is built in, so do
+not assume `web` or `mobile` exists. Names already carried by existing tasks stay valid after a file
+is renamed or deleted, so those tasks remain editable; they simply have no checklist until a matching
+file exists again. `devteam_plan` lists the current names and refuses an unknown new name. A planner
+sets them with `domains` (omit to inherit the task's, `[]` for none). A wrong domain is worse than
+none: it hands the reviewer the wrong list.
 
 ## Checking each other
 
