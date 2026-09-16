@@ -10,65 +10,38 @@
 // A mixin on DevTeamStore.prototype, for the reasons in store-checks.mjs.
 import path from "node:path";
 import { fromJson, now } from "./util.mjs";
-import { buildBudgetedBrief, capDomainChecklist, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
+import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
+import { checklistBrief, DEFAULT_CHECKLIST_DIRNAME } from "./checklists.mjs";
+
+// The checklist every assignment gets, whatever its domains. Security is not a domain you opt into.
+const ALWAYS_CHECKLIST_DOMAIN = "security";
 
 export const viewMethods = {
-  // Where the Markdown checklists for these domains live. Shared lists sit under the directory
-  // DevTeam was launched from (the owner's choice, so they travel with the checkout that runs
-  // `npm start`); a project's own list sits in its root. Resolved here so no agent guesses.
-  _checklistFiles(projectRoot, domains) {
-    const sharedDir = this.checklistDir || path.join(process.cwd(), "checklists");
-    return {
-      shared: Object.fromEntries(domains.map((domain) => [domain, path.join(sharedDir, `${domain}.md`)])),
-      project: path.join(projectRoot, ".devteam", "checklist.md"),
-    };
-  },
-
-  // The domain checklist an assignment carries: active items for its domains (shared, plus this
-  // project's own), best-confirmed first, then most recently seen, capped by count and bytes.
+  // The domain checklist an assignment carries, read from the owner's Markdown under
+  // `<checklist dir>/<domain>.md` (see checklists.mjs). Nothing is recorded: the files are the
+  // source of truth and DevTeam never writes to them, so a brief is a pure read that reflects the
+  // files as they stand when the work is claimed.
   //
-  // The one write in this file, deliberately: the first brief of an assignment *is* the delivery, and
-  // recording it fixes the snapshot. Every later brief of the same assignment — a re-read, a rework
-  // re-claim — returns exactly the items first delivered, in their current wording, even if the list
-  // has since grown, so changes to a list never alter work in flight. Expired items stay in the
-  // snapshot because they were what this work was asked to check.
-  _domainChecklistFor(assignment, projectId) {
-    const domains = fromJson(assignment.domains, Array.isArray(assignment.domains) ? assignment.domains : []);
-    if (!Array.isArray(domains) || !domains.length) return null;
-    const shape = (row) => ({
-      id: row.id,
-      domain: row.domain,
-      section: row.section,
-      rule: clipUtf8(row.rule, 220).value,
-      confirmations: Number(row.confirmations),
+  // Only critical `(*)` lines are inlined. The rest stay in the files, whose paths ride along — a
+  // useful checklist is far longer than a brief can hold, and a reviewer can open a file.
+  // `security.md` is pulled in on every assignment regardless of domain.
+  _domainChecklistFor(assignment) {
+    const dir = this.checklistDir || path.join(process.cwd(), DEFAULT_CHECKLIST_DIRNAME);
+    const declared = fromJson(assignment.domains, Array.isArray(assignment.domains) ? assignment.domains : []);
+    const domains = Array.isArray(declared) ? declared : [];
+    const brief = checklistBrief(dir, domains, assignment.role, {
+      always: [ALWAYS_CHECKLIST_DOMAIN],
+      maxItems: DEFAULT_BRIEF_BUDGET.domainChecklistItems,
+      maxBytes: DEFAULT_BRIEF_BUDGET.domainChecklistBytes,
     });
-    const delivered = this.db.prepare(`
-      SELECT i.*, d.delivered_at,
-        (SELECT COUNT(*) FROM assignment_findings f WHERE f.checklist_item_id = i.id) AS confirmations
-      FROM checklist_deliveries d JOIN checklist_items i ON i.id = d.item_id
-      WHERE d.assignment_id = ?
-      ORDER BY d.rowid ASC
-    `).all(assignment.id);
-    if (delivered.length) return { items: delivered.map(shape), omitted: 0, domains };
-    const placeholders = domains.map(() => "?").join(", ");
-    const ranked = this.db.prepare(`
-      SELECT i.*,
-        (SELECT COUNT(*) FROM assignment_findings f WHERE f.checklist_item_id = i.id) AS confirmations,
-        (SELECT MAX(f.created_at) FROM assignment_findings f WHERE f.checklist_item_id = i.id) AS last_seen
-      FROM checklist_items i
-      WHERE i.status = 'active' AND i.domain IN (${placeholders})
-        AND (i.scope = 'shared' OR (i.scope = 'project' AND i.project_id = ?))
-      ORDER BY confirmations DESC, COALESCE(last_seen, i.updated_at) DESC, i.id ASC
-    `).all(...domains, projectId);
-    // One rule shared by several domains is one line to read, not one per domain.
-    const seen = new Set();
-    const unique = ranked.filter((row) => (seen.has(row.signature) ? false : seen.add(row.signature)));
-    const capped = capDomainChecklist(unique.map(shape));
-    const stamp = now();
-    this._transaction(() => {
-      for (const item of capped.items) this._recordChecklistDelivery(item.id, assignment.id, stamp);
-    });
-    return { ...capped, domains };
+    if (!brief) return null;
+    return {
+      items: brief.critical.map((item) => ({ ...item, rule: clipUtf8(item.rule, 220).value })),
+      omitted: brief.omitted,
+      domains,
+      files: brief.files,
+      totalItems: brief.totalItems,
+    };
   },
 
   // T4.3 — replay a task as a narrative.
@@ -484,7 +457,7 @@ export const viewMethods = {
         : [];
       mandatoryOmitted.currentAssignmentChecklist = Math.max(0, checklist.length - 12);
       // Domain items come after the role base checklist, which is never displaced by them.
-      const domainChecklist = this._domainChecklistFor(currentSource, task.project_id);
+      const domainChecklist = this._domainChecklistFor(currentSource);
       if (domainChecklist) mandatoryOmitted.currentAssignmentDomainChecklist = domainChecklist.omitted;
       mandatoryOmitted.currentAssignmentWriteScope = Math.max(0, writeScope.length - 12);
       mandatoryOmitted.currentAssignmentDependencies = dependencies.omitted;
@@ -503,10 +476,12 @@ export const viewMethods = {
         agent: currentSource.agent_name ? clip(currentSource.agent_name, 200, "currentAssignmentAgent") : null,
         claimed_at: currentSource.claimed_at || null,
         checklist: checklist.slice(0, 12).map((item) => clip(item, 180, "currentAssignmentChecklistItems")),
-        // Only assignments with domains carry these keys, so a project without domains briefs as before.
+        // Only assignments whose domains have a checklist file carry these keys, so a project
+        // without any briefs exactly as before.
         ...(domainChecklist ? {
           domainChecklist: domainChecklist.items,
-          checklistFiles: this._checklistFiles(currentSource.project_root || task.project_root, domainChecklist.domains),
+          checklistFiles: domainChecklist.files,
+          checklistInstruction: `Open each file in checklistFiles and walk the sections your change actually touches. ${domainChecklist.totalItems} items across ${domainChecklist.files.length} file(s); the ${domainChecklist.items.length} critical ones are inlined above. Name the sections you walked in your report.`,
         } : {}),
         writeScope: writeScope.slice(0, 12).map((item) => clip(item, 300, "currentAssignmentWriteScopeItems")),
         dependsOn: dependencies.dependsOn,

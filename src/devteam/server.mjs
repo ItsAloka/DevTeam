@@ -9,7 +9,6 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { DevTeamStore } from "./store.mjs";
 import { createDevTeamMcpServer } from "./mcp.mjs";
-import { syncChecklistFiles } from "./checklist-files.mjs";
 import {
   checkExposureRequirements,
   decideApiAccess,
@@ -52,10 +51,9 @@ export async function startDevTeamServer({
   liveness = {},
   knowledge = { enabled: true },
   codegraph = { enabled: true },
-  // Shared domain checklists live beside the checkout DevTeam is launched from (the owner's choice),
-  // so `npm start` in the repo keeps them in `<repo>/checklists/`.
+  // The owner's domain checklists live beside the checkout DevTeam is launched from, so `npm start`
+  // in the repo reads them from `<repo>/checklists/`. DevTeam only ever reads this directory.
   checklistDir = path.join(process.cwd(), "checklists"),
-  checklistSyncMs = 60 * 60 * 1000,
 } = {}) {
   if (!dataDir) throw new Error("dataDir is required.");
   // T4.1 — the one place DevTeam declines to start. A server reachable from the network whose
@@ -474,32 +472,6 @@ export async function startDevTeamServer({
   }, 30_000);
   reaper.unref?.();
 
-  // Keep the checklist lifecycle and its Markdown files current: sweep expiry, read back the owner's
-  // hand edits, regenerate. Runs at start, hourly, and shortly after anything that can change a list.
-  // A failure is logged and retried next time — it must never take the coordination server down.
-  let checklistDebounce = null;
-  let closed = false;
-  const syncChecklists = () => {
-    if (closed) return;
-    try {
-      store.evaluateChecklistExpiry();
-      syncChecklistFiles(store, { sharedDir: store.checklistDir, projects: store.listProjects() });
-    } catch (error) {
-      console.error(`DevTeam checklist sync failed: ${error.message}`);
-    }
-  };
-  const checklistChanges = new Set(["checklist.updated", "assignment.changes_requested", "assignment.completed"]);
-  const onChecklistChange = (event) => {
-    if (!checklistChanges.has(event?.type) || closed) return;
-    clearTimeout(checklistDebounce);
-    checklistDebounce = setTimeout(syncChecklists, 2_000);
-    checklistDebounce.unref?.();
-  };
-  store.on("change", onChecklistChange);
-  syncChecklists();
-  const checklistTimer = setInterval(syncChecklists, checklistSyncMs);
-  checklistTimer.unref?.();
-
   return {
     app,
     server: httpServer,
@@ -508,13 +480,8 @@ export async function startDevTeamServer({
     accessMode: mode,
     mcpUrl: `${url}/mcp`,
     checklistDir: store.checklistDir,
-    syncChecklists,
     async close() {
       clearInterval(reaper);
-      closed = true;
-      clearInterval(checklistTimer);
-      clearTimeout(checklistDebounce);
-      store.off("change", onChecklistChange);
       await Promise.allSettled([...transports.values()].map((transport) => transport.close()));
       await new Promise((resolve, reject) => httpServer.close((error) => error ? reject(error) : resolve()));
       store.close();

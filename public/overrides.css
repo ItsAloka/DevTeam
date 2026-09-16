@@ -1739,3 +1739,9 @@ nav.tasks-collapsed #task-current { display: block; }
 .domain-picker .domain-add { display: inline-flex; align-items: center; gap: 6px; flex-basis: 100%; margin-top: 4px; }
 .domain-picker .domain-add input { width: 150px; padding: 5px 8px; }
 .domain-picker .domain-add button { padding: 5px 10px; }
+
+/* Domain picker: each choice shows how many lines its checklists/<domain>.md holds, so tagging a
+   task says what reviewers will actually be handed. A domain with no file is still selectable. */
+.domain-picker .domain-count { font: 10px ui-monospace, monospace; color: var(--green2); }
+.domain-picker .domain-choice-empty { opacity: .62; }
+.domain-picker .domain-choice-empty .domain-count { color: var(--muted); }

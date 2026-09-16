@@ -229,56 +229,15 @@ export function applySchema(db) {
 
     CREATE INDEX IF NOT EXISTS idx_assignment_findings ON assignment_findings(assignment_id, created_at);
 
-    -- Self-growing domain checklists (SKILLS_PLAN.md §5). An item is a short general rule; its
-    -- evidence is never copied here — it is the assignment_findings rows whose checklist_item_id
-    -- points at it, so an item can never drift from the findings that justify it.
-    -- scope 'shared' items apply to every project in their domain (project_id NULL); 'project'
-    -- items belong to one project only and must never be delivered or exported elsewhere.
-    -- The domain vocabulary: built-ins seeded below, plus names the owner adds. Shared by all projects.
+    -- The domain vocabulary: built-ins seeded below, plus names the owner adds. Shared by all
+    -- projects. A domain chooses which of the owner's Markdown checklists (checklists/<domain>.md,
+    -- see checklists.mjs) a verifying role is handed. The checklist content itself is never stored
+    -- here: the files are the source of truth and DevTeam only reads them.
     CREATE TABLE IF NOT EXISTS domains (
       name TEXT PRIMARY KEY,
       builtin INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
-
-    CREATE TABLE IF NOT EXISTS checklist_items (
-      id TEXT PRIMARY KEY,
-      scope TEXT NOT NULL CHECK (scope IN ('shared', 'project')),
-      project_id TEXT NULL,
-      domain TEXT NOT NULL,
-      section TEXT NOT NULL,
-      rule TEXT NOT NULL,
-      signature TEXT NOT NULL,
-      status TEXT NOT NULL CHECK (status IN ('candidate', 'active', 'expired', 'merged', 'rejected')),
-      promoted_by TEXT NULL,
-      expired_reason TEXT NULL,
-      expiry_pending_at TEXT NULL,
-      last_violated_at TEXT NULL,
-      pinned INTEGER NOT NULL DEFAULT 0,
-      merged_into TEXT NULL REFERENCES checklist_items(id),
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      status_changed_at TEXT NOT NULL
-    );
-
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_checklist_items_key
-      ON checklist_items(scope, COALESCE(project_id, ''), domain, signature);
-    CREATE INDEX IF NOT EXISTS idx_checklist_items_status ON checklist_items(domain, status);
-
-    -- One row per time an item was put in front of an assignment, and what the checker said about it.
-    -- Expiry reads only these: "learned" and "not applicable" are claims about deliveries, not about
-    -- how old an item is.
-    CREATE TABLE IF NOT EXISTS checklist_deliveries (
-      item_id TEXT NOT NULL REFERENCES checklist_items(id),
-      assignment_id TEXT NOT NULL,
-      delivered_at TEXT NOT NULL,
-      mark TEXT NULL CHECK (mark IN ('checked', 'violated', 'not-applicable')),
-      marked_by_agent_id TEXT NULL,
-      marked_at TEXT NULL,
-      PRIMARY KEY (item_id, assignment_id)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_checklist_deliveries_item ON checklist_deliveries(item_id, delivered_at);
 
     -- What each verified check last did, per task. Keyed by the *command* rather than the label,
     -- because a label is agent-written prose and the argv is the pinned allowlist entry — two
@@ -419,12 +378,21 @@ export function applySchema(db) {
     ["tasks", "domains", "TEXT NOT NULL DEFAULT '[]'"],
     ["assignments", "domains", "TEXT NOT NULL DEFAULT '[]'"],
     // A reviewer may restate a finding as a short general rule (≤200 chars) under a section; the
-    // detail stays task-specific. checklist_item_id links the finding to the item it is evidence for.
+    // detail stays task-specific. The rule is a lesson recorded beside the finding — whether it
+    // earns a line in checklists/ is the owner's call, not DevTeam's.
     ["assignment_findings", "rule", "TEXT"],
     ["assignment_findings", "section", "TEXT"],
-    ["assignment_findings", "checklist_item_id", "TEXT"],
   ]) {
     try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
+  }
+  // Domain checklists used to be rows DevTeam grew from reviewers' findings, exported to Markdown
+  // and read back. They are now Markdown the owner writes and DevTeam only reads (checklists.mjs),
+  // so the tables have no reader left. Dropped rather than left behind: a table nothing writes and
+  // nothing reads is a trap for whoever next goes looking for where checklists live. Deliveries go
+  // first — it has the foreign key. assignment_findings.checklist_item_id is left in place; SQLite
+  // drops columns only by rebuilding the table, and a stale nullable column costs nothing.
+  for (const table of ["checklist_deliveries", "checklist_items"]) {
+    try { db.exec(`DROP TABLE IF EXISTS ${table}`); } catch { /* an older engine without the table */ }
   }
   // Seed built-in domains on every open, so a release that adds one reaches existing databases too.
   for (const name of DEFAULT_DOMAINS) {

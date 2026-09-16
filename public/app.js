@@ -949,17 +949,29 @@ document.addEventListener("click", async (event) => {
 
 // Domain checkboxes come from the server's live list: the built-ins plus any the owner added. New ones
 // are added through "+ Add domain", which the server validates (slug names, no synonyms of a built-in).
-let domainChoices = ["web", "backend", "mobile", "desktop", "game", "ml", "data", "devops", "docs", "embedded", "security"];
+//
+// Each choice shows how many lines its checklist file holds. A domain with none is still offered —
+// you may want to tag work before writing the list — but it is marked, because tagging it promises a
+// check that will not happen until checklists/<domain>.md exists.
+let domainChoices = ["web", "backend", "mobile", "desktop", "game", "ml", "data", "devops", "docs", "embedded", "security"]
+  .map((name) => ({ name, checklistItems: 0 }));
 function renderDomainPickers() {
   for (const picker of document.querySelectorAll("[data-domain-picker]")) {
     const checked = new Set([...picker.querySelectorAll('input[name="domains"]:checked')].map((box) => box.value));
     picker.querySelectorAll(".domain-choice, .domain-add").forEach((node) => node.remove());
     for (const domain of domainChoices) {
       const label = document.createElement("label");
-      label.className = "domain-choice";
+      const items = Number(domain.checklistItems) || 0;
+      label.className = items ? "domain-choice" : "domain-choice domain-choice-empty";
+      label.title = items
+        ? `checklists/${domain.name}.md — ${items} item(s), shown to reviewers of this work`
+        : `No checklists/${domain.name}.md yet; reviewers get nothing extra for this domain`;
       const box = document.createElement("input");
-      box.type = "checkbox"; box.name = "domains"; box.value = domain; box.checked = checked.has(domain);
-      label.append(box, document.createTextNode(domain));
+      box.type = "checkbox"; box.name = "domains"; box.value = domain.name; box.checked = checked.has(domain.name);
+      const count = document.createElement("span");
+      count.className = "domain-count";
+      count.textContent = items ? ` ${items}` : " —";
+      label.append(box, document.createTextNode(domain.name), count);
       picker.append(label);
     }
     const add = document.createElement("span");
@@ -988,7 +1000,9 @@ function renderDomainPickers() {
 async function loadDomainChoices() {
   try {
     const domains = await api("/api/domains");
-    if (Array.isArray(domains) && domains.length) domainChoices = domains.map((domain) => domain.name);
+    if (Array.isArray(domains) && domains.length) {
+      domainChoices = domains.map((domain) => ({ name: domain.name, checklistItems: Number(domain.checklistItems) || 0 }));
+    }
   } catch { /* an older server has no domain list; keep the built-ins */ }
   renderDomainPickers();
 }

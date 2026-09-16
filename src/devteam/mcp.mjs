@@ -301,7 +301,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       checklist: z.array(z.string().max(300)).max(40).optional().describe("Points the assignee must address; overrides the role's default checklist, and an empty array omits it"),
       paths: z.array(z.string().max(500)).max(50).optional().describe("For write work: the paths this will modify (e.g. src/ocean/**). Declaring them lets non-overlapping writers run in parallel; omit for an exclusive whole-project lease."),
       dependsOn: z.array(z.string().uuid()).max(50).optional().describe("Same-task assignment IDs that must finish first. Empty means it can run now."),
-      domains: z.array(z.string().max(30)).max(20).optional().describe(`The domains this work belongs to, which choose the domain checklist it carries. Built-in: ${DOMAINS.join(", ")}; the owner may have added more, and an unknown name is refused with the current list. Omit to inherit the task's domains; an empty array means none.`),
+      domains: z.array(z.string().max(30)).max(20).optional().describe(`The domains this work belongs to, which choose which of the owner's checklists (checklists/<domain>.md) verifying roles are handed. Built-in: ${DOMAINS.join(", ")}; the owner may have added more, and an unknown name is refused with the current list. Omit to inherit the task's domains; an empty array means none.`),
       agree: z.boolean().default(false).describe("Put this to the team as a proposal instead of creating it"),
       kind: z.enum(["role", "handoff", "plan", "decision"]).default("role").describe("agree=true only: role asks that an agent take a role, handoff moves an existing assignment, plan/decision records a shared decision"),
       assignmentId: z.string().uuid().optional().describe("agree=true with kind=handoff: the assignment to move"),
@@ -407,34 +407,14 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       ])).max(100).default([]),
       disconnectAfter: z.boolean().default(false),
       claimToken: z.string().max(200).optional().describe("The claimToken from the assignment you claimed (or from devteam_join when you resumed). Lets the server fence a stale report if your lease has since moved."),
-      checklistMarks: z.array(z.object({
-        itemId: z.string().uuid().describe("The id of an item from your brief's domainChecklist"),
-        mark: z.enum(["checked", "violated", "not-applicable"]).describe("checked: you verified the work follows it. violated: it does not (also send the work back with verdict=changes if you are reviewing). not-applicable: it does not concern this work."),
-      })).max(15).default([]).describe("Your verdict on each domainChecklist item you were delivered. Violations keep a rule alive; items repeatedly marked not-applicable retire themselves."),
+      checklistSections: z.array(z.string().max(80)).max(20).default([]).describe("If your brief carried checklistFiles, name the sections of those files you actually walked (the `## ` headings). Walk the ones your change touches, not all of them. This is recorded in the task timeline as your claim about what you checked."),
     },
-  }, safe(async ({ disconnectAfter, checklistMarks, ...args }) => {
+  }, safe(async ({ disconnectAfter, ...args }) => {
     requireIdentity(args.agentId);
     const result = await store.completeAssignment({
       ...args,
       nextStatus: disconnectAfter ? "disconnected" : "waiting",
     });
-    // Marks are applied only once the report itself has landed, and only by the agent that holds
-    // the reported work. A bad mark is returned rather than thrown: the report already succeeded.
-    if (result?.completed && checklistMarks.length) {
-      const holder = store.db.prepare("SELECT agent_id FROM assignments WHERE id = ?").get(args.assignmentId)?.agent_id;
-      const applied = [];
-      const rejected = [];
-      for (const { itemId, mark } of checklistMarks) {
-        if (holder !== args.agentId) { rejected.push({ itemId, reason: "Only the agent that did this assignment can mark its checklist." }); continue; }
-        try {
-          store.markChecklistItem({ itemId, assignmentId: args.assignmentId, mark, agentId: args.agentId });
-          applied.push({ itemId, mark });
-        } catch (error) {
-          rejected.push({ itemId, reason: error.message });
-        }
-      }
-      result.checklistMarks = { applied, rejected };
-    }
     return disconnectAfter ? result : withInbox(args.agentId, result);
   }));
 
@@ -452,8 +432,8 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
         z.object({
           detail: z.string().min(1).max(2000).describe("What must change and why"),
           path: z.string().max(500).optional().describe("The project-relative file it concerns, when it concerns one"),
-          rule: z.string().max(200).optional().describe("The same finding restated as one short, general, testable rule for this domain's checklist (no task-specific names). Omit if it is not a general lesson."),
-          section: z.string().max(40).optional().describe("The checklist section the rule belongs under, e.g. Security, Testing, Data, Performance, UX"),
+          rule: z.string().max(200).optional().describe("The same finding restated as one short, general, testable rule (no task-specific names). Recorded with the finding as a lesson; the owner decides whether it earns a line in the project's checklists. Omit if it is not a general lesson."),
+          section: z.string().max(40).optional().describe("The section the rule would belong under, e.g. Security, Testing, Data, Performance, UX"),
         }),
       ])).max(50).default([]).describe("changes: the specific changes required. The author is handed this list on re-claim, so be concrete — and DevTeam reads them across tasks to notice conventions this project keeps having to state."),
       proposalId: z.string().uuid().optional().describe("agree/object"),

@@ -17,7 +17,7 @@ import { fromJson, json, now } from "./util.mjs";
 // time, long after both modules have finished evaluating.
 import { reconnectGraceCutoff } from "./store.mjs";
 import { redact } from "./knowledge.mjs";
-import { CHECKLIST_RULE_MAX, checklistMethods } from "./store-checklists.mjs";
+import { CHECKLIST_RULE_MAX } from "./checklists.mjs";
 
 // Whether an assignment reads the work rather than changing it — and therefore waits for pending
 // writers, earns the right to approve, and puts its task in review — is a column on the row,
@@ -32,9 +32,6 @@ const VERIFIES = "verifies = 1";
 export const PROPOSAL_KINDS = ["role", "handoff", "plan", "decision"];
 
 export const consensusMethods = {
-  // The checklist lifecycle is fed only by requestChanges below, so it is composed onto the store
-  // through this mixin rather than registered separately (store-checklists.mjs).
-  ...checklistMethods,
 
   // Did this assignment read the work rather than change it? Asked of the assignment row rather than
   // of the role name recorded on the event, so a project that renamed its reviewing role still earns
@@ -528,7 +525,9 @@ export const consensusMethods = {
       return {
         detail: String((isObject ? item.detail : item) ?? "").trim().slice(0, 2000),
         path: isObject && item.path ? String(item.path).trim().slice(0, 500) : null,
-        // Optional restatement as a general checklist rule; redacted and capped when it is stored.
+        // Optional restatement as one short general lesson; redacted and capped when it is stored.
+        // It is recorded with the finding and reaches the knowledge vault; the owner decides whether
+        // it is worth a line in checklists/ (see checklists.mjs).
         rule: isObject && item.rule ? String(item.rule).trim().slice(0, CHECKLIST_RULE_MAX) : null,
         section: isObject && item.section ? String(item.section).trim().slice(0, 40) : null,
       };
@@ -559,8 +558,6 @@ export const consensusMethods = {
         `).run(id, assignmentId, taskId, agentId, agent?.name || "the human", Number(task.version), finding.detail, finding.path, stamp, rule, finding.section);
         return { ...finding, id, rule };
       });
-      // Findings on a task with domains grow those domains' checklists. No domains, no capture.
-      this._captureChecklistCandidates(task, storedFindings);
       // The version under review was just judged not good enough, so approvals built on it no longer
       // describe a settled state. Clearing them is the same principle as version-invalidates-
       // approvals: if the rework changes files the version bumps and they would have gone anyway,

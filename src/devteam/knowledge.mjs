@@ -54,8 +54,6 @@ const MAX_NOTE_BODY = 24_000;
 // thorough, whereas the same objection raised on separate work is a rule the project has and has
 // never written down.
 const CONVENTION_MIN_FINDINGS = 3;
-// Also the recurrence bar for promoting a domain checklist item (store-checklists.mjs): both features
-// answer "is this the same objection on separate work", so one constant decides it for both.
 export const CONVENTION_MIN_TASKS = 2;
 const CONVENTION_SIGNATURE_WORDS = 6;
 const CONVENTION_MIN_SIGNATURE_WORDS = 3;

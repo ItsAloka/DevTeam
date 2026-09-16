@@ -5,6 +5,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { applySchema } from "./schema.mjs";
 import { DEFAULT_DOMAINS, normalizeDomains, validateNewDomainName } from "./domains.mjs";
+import { DEFAULT_CHECKLIST_DIRNAME, loadChecklist } from "./checklists.mjs";
 
 // The built-in domains, kept under their original export name. The live list (built-ins plus any the
 // owner added) is store.domainNames().
@@ -729,13 +730,22 @@ export class DevTeamStore extends EventEmitter {
 
   // ---- Domains: built-ins plus owner-added, shared by every project like the checklists ----
 
+  // `checklistItems` counts the lines in that domain's file under checklistDir. A domain with none
+  // is offered nowhere: tagging a task with it would promise a check that cannot happen.
   listDomains() {
+    const dir = this.checklistDir || path.join(process.cwd(), DEFAULT_CHECKLIST_DIRNAME);
     return this.db.prepare(`
       SELECT d.name, d.builtin, d.created_at,
-        (SELECT COUNT(*) FROM tasks t, json_each(t.domains) j WHERE j.value = d.name) AS task_count,
-        (SELECT COUNT(*) FROM checklist_items i WHERE i.domain = d.name) AS item_count
+        (SELECT COUNT(*) FROM tasks t, json_each(t.domains) j WHERE j.value = d.name) AS task_count
       FROM domains d ORDER BY d.builtin DESC, d.rowid ASC
-    `).all().map((row) => ({ name: row.name, builtin: Boolean(row.builtin), createdAt: row.created_at, tasks: row.task_count, checklistItems: row.item_count }));
+    `).all().map((row) => ({
+      name: row.name,
+      builtin: Boolean(row.builtin),
+      createdAt: row.created_at,
+      tasks: row.task_count,
+      checklistItems: loadChecklist(dir, row.name)?.itemCount ?? 0,
+      checklistFile: loadChecklist(dir, row.name)?.file ?? null,
+    }));
   }
 
   domainNames() {
@@ -749,7 +759,8 @@ export class DevTeamStore extends EventEmitter {
     return this.listDomains().find((domain) => domain.name === name);
   }
 
-  // Only an unused custom domain can go: removing one a task or checklist item names would orphan it.
+  // Only an unused custom domain can go: removing one a task names would orphan it. A domain whose
+  // checklist file still has lines is kept too — deleting the name would strand the file.
   removeDomain(name) {
     const domain = this.listDomains().find((entry) => entry.name === String(name));
     if (!domain) throw new Error("Domain not found.");
@@ -2057,10 +2068,12 @@ export class DevTeamStore extends EventEmitter {
   // lease**. An agent that has to release its claim to reorganise the work will not do it — it will
   // grind on instead — and in the gap another agent can take the paths it was midway through
   // editing. So the parent stays claimed by the same agent, at the same generation, throughout.
-  async completeAssignment({ agentId, assignmentId, message, status = "done", changedFiles = [], checks = [], nextStatus = "waiting", claimToken = null }) {
+  async completeAssignment({ agentId, assignmentId, message, status = "done", changedFiles = [], checks = [], nextStatus = "waiting", claimToken = null, checklistSections = [] }) {
     const agent = this.getAgent(agentId);
     const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
     if (!assignment) throw new Error("Assignment not found.");
+    const cleanSections = [...new Set((Array.isArray(checklistSections) ? checklistSections : [])
+      .map((section) => String(section).trim().slice(0, 80)).filter(Boolean))].slice(0, 20);
     // Lease fencing: the owning session (session-bound identity already blocks other agents) and,
     // when supplied, the fencing token must match the live claim. A stale report — from a session
     // whose lease was force-released or moved on resume — gets a structured conflict, not a write.
@@ -2220,6 +2233,11 @@ export class DevTeamStore extends EventEmitter {
         // The structured form says which of those lines DevTeam actually ran. Consumers that only
         // understand the strings keep working; consumers that can tell the difference now can.
         checkRecords,
+        // Which checklist sections the agent says it walked. Recorded rather than enforced: DevTeam
+        // cannot know whether a reviewer truly read a section, but naming them puts the claim in the
+        // timeline where the owner and the next reviewer can see it — and an empty list on a
+        // verifying role is itself visible.
+        ...(cleanSections.length ? { checklistSections: cleanSections } : {}),
         version,
         ...(unverifiedFiles.length ? { unverifiedFiles } : {}),
       });

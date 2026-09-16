@@ -54,6 +54,7 @@ export const DEFAULT_ROLES = {
       "No dead code, debug logs, or leftover TODOs",
       "Readable and consistent with the surrounding code",
       "Tests cover the change and actually run",
+      "Walk the checklistFiles in your brief — the sections your change touches — and name them in your report",
     ],
   },
   "security-reviewer": {
@@ -68,6 +69,7 @@ export const DEFAULT_ROLES = {
       "Rate limiting / abuse protection on sensitive endpoints",
       "Error handling does not leak stack traces or internals",
       "Dependencies: no known-vulnerable or unpinned additions",
+      "Walk the checklistFiles in your brief — the sections your change touches — and name them in your report",
     ],
   },
   tester: {
