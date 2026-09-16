@@ -25,26 +25,42 @@ async function fixture(t) {
     await writeFile(path.join(checklistDir, `${name}.md`), body, "utf8");
     clearChecklistCache();
   };
+  // Most tests want a working vocabulary; a domain only exists once its file does.
+  for (const name of ["web", "backend", "mobile"]) await writeChecklist(name);
   return { store, checklistDir, writeChecklist, project: store.ensureProject("Domains", projectRoot) };
 }
 
-test("the built-in domains are the common IT set and cannot be mutated", () => {
+// DEFAULT_DOMAINS is no longer the vocabulary — it is the list domain *inference* knows markers for,
+// and the set of example checklists DevTeam ships. It never makes a domain selectable on its own.
+test("the shipped domain names are a fixed list and cannot be mutated", () => {
   assert.deepEqual([...DOMAINS], ["web", "backend", "mobile", "desktop", "game", "ml", "data", "devops", "docs", "embedded", "security"]);
   assert.throws(() => { DOMAINS.push("frontend"); });
 });
 
+test("a built-in name with no file is not a domain", async (t) => {
+  const { store, project, checklistDir } = await fixture(t);
+  assert.equal(store.domainNames().includes("desktop"), false, "shipped in DEFAULT_DOMAINS, but no file here");
+  assert.throws(() => store.createTask({ projectId: project.id, title: "D", description: "d", domains: ["desktop"] }), /Unknown domain/);
+  // Renaming a file renames the domain: no ghost entry survives for the old name.
+  await rm(path.join(checklistDir, "web.md"));
+  await writeFile(path.join(checklistDir, "web-frontend.md"), "## A\n- [ ] x\n", "utf8");
+  clearChecklistCache();
+  assert.equal(store.domainNames().includes("web"), false, "the old name is gone");
+  assert.equal(store.domainNames().includes("web-frontend"), true);
+});
+
 test("a domain exists because its checklist file exists", async (t) => {
   const { store, project, writeChecklist } = await fixture(t);
-  assert.deepEqual(store.domainNames(), [...DOMAINS], "built-ins are always known");
+  assert.deepEqual(store.domainNames(), ["backend", "mobile", "web"], "only what the directory holds");
   assert.throws(() => store.createTask({ projectId: project.id, title: "Chain", description: "d", domains: ["blockchain"] }), /Unknown domain/);
 
   await writeChecklist("blockchain");
   assert.equal(store.domainNames().includes("blockchain"), true, "the file registers the domain");
   const listed = store.listDomains().find((domain) => domain.name === "blockchain");
-  assert.deepEqual({ builtin: listed.builtin, items: listed.checklistItems }, { builtin: false, items: 1 });
+  assert.equal(listed.checklistItems, 1);
 
   const task = store.createTask({ projectId: project.id, title: "Chain", description: "d", domains: ["blockchain", "web"] });
-  assert.deepEqual(task.domains, ["web", "blockchain"], "ordered as the domain list is");
+  assert.deepEqual(task.domains, ["blockchain", "web"], "ordered as the domain list is");
   assert.equal(store.listDomains().find((domain) => domain.name === "blockchain").tasks, 1);
 });
 
@@ -66,10 +82,14 @@ test("file names that are not domains are ignored", async (t) => {
   await writeChecklist("frontend", "## A\n- [ ] x\n");
   await writeChecklist("ar-vr");
   clearChecklistCache();
-  const found = listChecklistDomains(checklistDir);
-  assert.deepEqual(found, ["ar-vr"], "README is not a domain and frontend is a synonym of web");
+  // web.md exists here, so frontend.md would split one domain's lessons across two lists.
+  assert.deepEqual(listChecklistDomains(checklistDir), ["ar-vr", "backend", "mobile", "web"], "README is not a domain, frontend is a synonym of the web.md beside it");
   assert.equal(store.domainNames().includes("frontend"), false);
   assert.equal(store.domainNames().includes("ar-vr"), true);
+  // With no web.md there is nothing to split, so the name is the owner's to use.
+  await rm(path.join(checklistDir, "web.md"));
+  clearChecklistCache();
+  assert.equal(listChecklistDomains(checklistDir).includes("frontend"), true);
 });
 
 test("the store no longer registers domains itself", async (t) => {
@@ -83,7 +103,7 @@ test("normalizeDomains validates, dedupes, lowercases and orders; undefined stay
   assert.equal(normalizeDomains(null), undefined);
   assert.deepEqual(normalizeDomains([]), []);
   assert.deepEqual(normalizeDomains([" Mobile", "web", "mobile"]), ["web", "mobile"]);
-  assert.throws(() => normalizeDomains(["frontend"]), /Unknown domain\(s\): frontend/);
+  assert.throws(() => normalizeDomains(["nope"]), /Unknown domain\(s\): nope/);
   assert.throws(() => normalizeDomains("web"), /must be an array/);
 });
 

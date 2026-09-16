@@ -951,22 +951,31 @@ document.addEventListener("click", async (event) => {
 // exists because checklists/<name>.md exists. That is also how you add one — there is no button,
 // because a name with no file promises the team a check that cannot happen.
 //
-// Each choice shows how many lines its checklist file holds. A domain with none is still offered —
-// you may want to tag work before writing the list — but it is marked, because tagging it promises a
-// check that will not happen until checklists/<domain>.md exists.
-let domainChoices = ["web", "backend", "mobile", "desktop", "game", "ml", "data", "devops", "docs", "embedded", "security"]
-  .map((name) => ({ name, checklistItems: 0 }));
+// Each choice shows how many lines its file holds. A count of zero means the file has been deleted
+// and only older tasks still carry the name; it is dimmed rather than hidden so those tasks stay
+// editable. Empty until the server answers — there is no built-in list to fall back on, because a
+// name with no file behind it is exactly what this picker must not show.
+let domainChoices = [];
 function renderDomainPickers() {
   for (const picker of document.querySelectorAll("[data-domain-picker]")) {
     const checked = new Set([...picker.querySelectorAll('input[name="domains"]:checked')].map((box) => box.value));
-    picker.querySelectorAll(".domain-choice").forEach((node) => node.remove());
+    picker.querySelectorAll(".domain-choice, .domain-empty").forEach((node) => node.remove());
+    if (!domainChoices.length) {
+      const note = document.createElement("span");
+      note.className = "domain-empty hint";
+      note.textContent = "No checklists yet — write checklists/<name>.md to add a domain.";
+      picker.append(note);
+      continue;
+    }
     for (const domain of domainChoices) {
       const label = document.createElement("label");
       const items = Number(domain.checklistItems) || 0;
       label.className = items ? "domain-choice" : "domain-choice domain-choice-empty";
       label.title = items
         ? `checklists/${domain.name}.md — ${items} item(s), shown to reviewers of this work`
-        : `No checklists/${domain.name}.md yet; reviewers get nothing extra for this domain`;
+        : domain.hasFile
+          ? `checklists/${domain.name}.md exists but has no items yet; reviewers get nothing extra`
+          : `checklists/${domain.name}.md is gone; only older tasks still use this name`;
       const box = document.createElement("input");
       box.type = "checkbox"; box.name = "domains"; box.value = domain.name; box.checked = checked.has(domain.name);
       const count = document.createElement("span");
@@ -980,10 +989,15 @@ function renderDomainPickers() {
 async function loadDomainChoices() {
   try {
     const domains = await api("/api/domains");
-    if (Array.isArray(domains) && domains.length) {
-      domainChoices = domains.map((domain) => ({ name: domain.name, checklistItems: Number(domain.checklistItems) || 0 }));
+    // An empty answer is a real answer: the checklists directory has no files yet.
+    if (Array.isArray(domains)) {
+      domainChoices = domains.map((domain) => ({
+        name: domain.name,
+        checklistItems: Number(domain.checklistItems) || 0,
+        hasFile: Boolean(domain.checklistFile),
+      }));
     }
-  } catch { /* an older server has no domain list; keep the built-ins */ }
+  } catch { /* the server is unreachable; show nothing rather than names that may not exist */ }
   renderDomainPickers();
 }
 renderDomainPickers();

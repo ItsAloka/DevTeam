@@ -190,16 +190,19 @@ export function availableDomains(dir, domains) {
 // registered name with no file promises a check that cannot happen — which is what the old "add
 // domain" button produced.
 //
-// A file whose name is a near-synonym of a built-in (frontend.md beside web.md) is skipped: two
-// names for one domain split a team's lessons across two lists and starve both. README.md is the
-// directory's own documentation, not a domain, and non-slug names are not domains either.
+// `frontend.md` is skipped only when `web.md` is also present: two names for one domain split a
+// team's lessons across two lists and starve both. With no web.md there is nothing to split, so the
+// name is yours to use — someone who renames web.md to frontend.md means it as the domain's name.
+// README.md is the directory's own documentation, and non-slug names are not domains either.
 export function listChecklistDomains(dir) {
   if (!dir) return [];
   let entries;
   try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return []; }
-  return entries
+  const names = entries
     .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"))
     .map((entry) => entry.name.slice(0, -3).toLowerCase())
-    .filter((name) => DOMAIN_NAME_PATTERN.test(name) && !DOMAIN_ALIASES[name] && !RESERVED_FILENAMES.has(name))
+    .filter((name) => DOMAIN_NAME_PATTERN.test(name) && !RESERVED_FILENAMES.has(name))
     .sort();
+  const present = new Set(names);
+  return names.filter((name) => !(DOMAIN_ALIASES[name] && present.has(DOMAIN_ALIASES[name])));
 }

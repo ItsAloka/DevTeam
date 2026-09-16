@@ -149,21 +149,24 @@ test("a brief is a pure read: DevTeam never writes into the checklist directory"
   assert.deepEqual((await readdir(store.checklistDir)).sort(), before);
 });
 
-test("an assignment whose domains have no file briefs exactly as before", async (t) => {
+test("a domain whose file was deleted after tagging contributes nothing to the brief", async (t) => {
   const { store, project } = await fixture(t);
-  const { task, reviewer, claim } = await reviewerClaim(store, project, { domains: ["game"] });
+  const { task, reviewer, claim } = await reviewerClaim(store, project, { domains: ["web"] });
+  await rm(path.join(store.checklistDir, "web.md"));
+  clearChecklistCache();
   const brief = store.taskBrief(reviewer.id, task.id, { currentAssignment: claim });
   const current = brief.assignment || brief.currentAssignment;
-  // security.md still applies — it is not opt-in — but nothing from a domain without a file appears.
+  // security.md still applies — it is not opt-in — but the deleted domain adds nothing.
   assert.deepEqual(current.checklistFiles.map((file) => file.domain), ["security"]);
-  assert.ok(!current.domainChecklist.some((item) => item.domain === "game"));
+  assert.ok(!current.domainChecklist.some((item) => item.domain === "web"));
 });
 
 test("with no checklist directory at all, the brief carries no checklist keys", async (t) => {
   const { store, project } = await fixture(t);
+  const { task, reviewer, claim } = await reviewerClaim(store, project, { domains: ["web"] });
+  // Point the store at a directory that does not exist, as a checkout without checklists/ would.
   store.checklistDir = path.join(os.tmpdir(), "devteam-checklists-absent");
   clearChecklistCache();
-  const { task, reviewer, claim } = await reviewerClaim(store, project, { domains: ["web"] });
   const brief = store.taskBrief(reviewer.id, task.id, { currentAssignment: claim });
   const current = brief.assignment || brief.currentAssignment;
   assert.equal(current.domainChecklist, undefined);
@@ -175,7 +178,8 @@ test("listDomains counts items from the files, and a report records the sections
   const web = store.listDomains().find((domain) => domain.name === "web");
   assert.equal(web.checklistItems, 3);
   assert.equal(path.basename(web.checklistFile), "web.md");
-  assert.equal(store.listDomains().find((domain) => domain.name === "game").checklistItems, 0);
+  // Only the two files in this directory are domains; nothing is offered that has no list.
+  assert.deepEqual(store.listDomains().map((domain) => domain.name), ["security", "web"]);
 
   const { task, reviewer, claim } = await reviewerClaim(store, project, { domains: ["web"] });
   await store.completeAssignment({

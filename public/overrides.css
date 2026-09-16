@@ -1742,3 +1742,4 @@ nav.tasks-collapsed #task-current { display: block; }
 .domain-picker .domain-count { font: 10px ui-monospace, monospace; color: var(--green2); }
 .domain-picker .domain-choice-empty { opacity: .62; }
 .domain-picker .domain-choice-empty .domain-count { color: var(--muted); }
+.domain-picker .domain-empty { flex-basis: 100%; }

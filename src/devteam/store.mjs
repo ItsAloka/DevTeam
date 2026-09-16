@@ -728,31 +728,35 @@ export class DevTeamStore extends EventEmitter {
     return this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
   }
 
-  // ---- Domains: the vocabulary is the checklists directory ----
+  // ---- Domains: the vocabulary IS the checklists directory ----
 
-  // A domain exists because `checklists/<name>.md` exists. There is no registration step and no
-  // "add domain" button any more: a registered name with no file promised a check that could never
-  // happen. Three sources are unioned, in this order:
-  //   1. the domains table — the built-ins, plus any custom name registered before this changed;
-  //   2. the files on disk — the live source, and the only way to add one now;
-  //   3. names already used by existing tasks — so a task whose domain's file was deleted can still
-  //      be opened and edited rather than failing validation on a name it already carries.
+  // A domain exists because `checklists/<name>.md` exists. Nothing else registers one — not a
+  // built-in list, not a database row. A name DevTeam knows but has no file for would appear in the
+  // task dialog offering a checklist that does not exist, which is exactly the confusion this
+  // replaced. Rename `web.md` to `web-frontend.md` and the picker says `web-frontend`, not both.
+  //
+  // The one addition is names already used by existing tasks: a task tagged before its file was
+  // renamed or deleted keeps its tag and stays editable, rather than failing validation on a name it
+  // already carries. Those trail the live ones and show an item count of zero.
   _domainVocabulary() {
     const names = [];
     const add = (value) => {
       const name = String(value || "").toLowerCase();
       if (DOMAIN_NAME_PATTERN.test(name) && !names.includes(name)) names.push(name);
     };
-    for (const row of this.db.prepare("SELECT name FROM domains ORDER BY builtin DESC, rowid ASC").all()) add(row.name);
-    for (const name of listChecklistDomains(this.checklistDir || path.join(process.cwd(), DEFAULT_CHECKLIST_DIRNAME))) add(name);
+    for (const name of listChecklistDomains(this._checklistDir())) add(name);
     for (const row of this.db.prepare("SELECT DISTINCT j.value AS name FROM tasks t, json_each(t.domains) j").all()) add(row.name);
     return names;
   }
 
-  // `checklistItems` counts the lines in that domain's file. Zero means the name is known but the
-  // list has not been written yet, which the dashboard marks rather than hides.
+  _checklistDir() {
+    return this.checklistDir || path.join(process.cwd(), DEFAULT_CHECKLIST_DIRNAME);
+  }
+
+  // `checklistItems` is the number of live lines in that domain's file. Zero means the file is gone
+  // and only old tasks still name it.
   listDomains() {
-    const dir = this.checklistDir || path.join(process.cwd(), DEFAULT_CHECKLIST_DIRNAME);
+    const dir = this._checklistDir();
     const taskCounts = new Map(this.db.prepare(`
       SELECT j.value AS name, COUNT(*) AS n FROM tasks t, json_each(t.domains) j GROUP BY j.value
     `).all().map((row) => [row.name, Number(row.n)]));
@@ -760,7 +764,6 @@ export class DevTeamStore extends EventEmitter {
       const checklist = loadChecklist(dir, name);
       return {
         name,
-        builtin: DEFAULT_DOMAINS.includes(name),
         tasks: taskCounts.get(name) || 0,
         checklistItems: checklist?.itemCount ?? 0,
         checklistFile: checklist?.file ?? null,

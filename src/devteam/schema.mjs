@@ -7,7 +7,6 @@
 //
 // Every statement is idempotent: CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS, and
 // ALTER TABLE ADD COLUMN guarded by try/catch. It runs on every open, not just on a fresh one.
-import { DEFAULT_DOMAINS } from "./domains.mjs";
 
 export function applySchema(db) {
   db.exec(`
@@ -229,15 +228,8 @@ export function applySchema(db) {
 
     CREATE INDEX IF NOT EXISTS idx_assignment_findings ON assignment_findings(assignment_id, created_at);
 
-    -- The domain vocabulary: built-ins seeded below, plus names the owner adds. Shared by all
-    -- projects. A domain chooses which of the owner's Markdown checklists (checklists/<domain>.md,
-    -- see checklists.mjs) a verifying role is handed. The checklist content itself is never stored
-    -- here: the files are the source of truth and DevTeam only reads them.
-    CREATE TABLE IF NOT EXISTS domains (
-      name TEXT PRIMARY KEY,
-      builtin INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
-    );
+    -- There is no domains table. The vocabulary is the checklists directory: a domain exists
+    -- because checklists/<name>.md exists (see checklists.mjs and store.mjs _domainVocabulary).
 
     -- What each verified check last did, per task. Keyed by the *command* rather than the label,
     -- because a label is agent-written prose and the argv is the pinned allowlist entry — two
@@ -385,18 +377,16 @@ export function applySchema(db) {
   ]) {
     try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
   }
+  // `domains` joins them: the vocabulary is now the checklists directory, so a registered name is
+  // at best redundant and at worst a domain offered with no list behind it.
   // Domain checklists used to be rows DevTeam grew from reviewers' findings, exported to Markdown
   // and read back. They are now Markdown the owner writes and DevTeam only reads (checklists.mjs),
   // so the tables have no reader left. Dropped rather than left behind: a table nothing writes and
   // nothing reads is a trap for whoever next goes looking for where checklists live. Deliveries go
   // first — it has the foreign key. assignment_findings.checklist_item_id is left in place; SQLite
   // drops columns only by rebuilding the table, and a stale nullable column costs nothing.
-  for (const table of ["checklist_deliveries", "checklist_items"]) {
+  for (const table of ["checklist_deliveries", "checklist_items", "domains"]) {
     try { db.exec(`DROP TABLE IF EXISTS ${table}`); } catch { /* an older engine without the table */ }
-  }
-  // Seed built-in domains on every open, so a release that adds one reaches existing databases too.
-  for (const name of DEFAULT_DOMAINS) {
-    db.prepare("INSERT OR IGNORE INTO domains (name, builtin, created_at) VALUES (?, 1, ?)").run(name, new Date().toISOString());
   }
   // Rows written before role behaviour was a column carry the software role names that used to be
   // hardcoded. Backfill them from exactly those names, once, so an existing database schedules

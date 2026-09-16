@@ -12,29 +12,24 @@ Add a line whenever you learn something the hard way. That is the whole maintena
 
 | File | Feeds |
 |---|---|
-| `web.md` | tasks tagged `web` |
-| `backend.md` | tasks tagged `backend` |
-| `mobile.md` | tasks tagged `mobile` |
-| `desktop.md` | tasks tagged `desktop` |
-| `ml.md` | tasks tagged `ml` |
+| `<name>.md` | tasks tagged `<name>` |
 | `security.md` | **every** task — pulled in regardless of domain |
 
-The task dialog offers DevTeam's built-in names (`web`, `backend`, `mobile`, `desktop`, `game`,
-`ml`, `data`, `devops`, `docs`, `embedded`, `security`) plus every file in this directory, and shows
-each one's item count. A built-in with no file here is dimmed and shows `—`: you can still tag work
-with it, but reviewers get nothing extra until you write the list.
+The task dialog offers exactly one domain per file in this directory, with its item count. There is
+no built-in list behind it: if `web.md` is not here, `web` is not a domain. Rename `web.md` to
+`web-frontend.md` and the dialog says `web-frontend` on the next load.
 
 **To add a domain, create `<name>.md` here.** That is the whole step — the file *is* the
 registration, and the name appears in the task dialog on the next load. There is no "add domain"
 button, because a registered name with no file promises the team a check that cannot happen.
 
-Names must be lowercase slugs (`ar-vr`, `blockchain`). A file named after a synonym of a built-in
-(`frontend.md`, `api.md`, `ai.md`) is ignored — two names for one domain split your lessons across
-two lists and starve both; add the lines to `web.md`, `backend.md` or `ml.md` instead. `README.md`
-is this file, not a domain.
+Names must be lowercase slugs (`ar-vr`, `blockchain`, `web-frontend`). `README.md` is this file, not
+a domain. A file named after a synonym of another file here (`frontend.md` *beside* `web.md`) is
+ignored — two names for one domain split your lessons across two lists and starve both. With no
+`web.md` present, `frontend.md` is simply the domain called `frontend`.
 
-Deleting a file removes the domain from the picker. Tasks already tagged with it keep the tag and
-stay editable; they simply get no checklist.
+Deleting a file removes the domain from the dialog. Tasks already tagged with it keep the tag and
+stay editable, shown dimmed with a count of `—`; they just get no checklist.
 
 ## Format
 

@@ -92,8 +92,8 @@ rules for that kind of software, at `<DevTeam launch directory>/checklists/<doma
 - **Never edit these files.** They are the owner's. If you think a line is missing, say so in your
   report or as a `rule` on a finding; the owner decides.
 
-Domains are `web`, `backend`, `mobile`, `desktop`, `game`, `ml`, `data`, `devops`, `docs`,
-`embedded`, `security`, plus any file the owner has written in `checklists/`. A planner sets them with `domains` on
+The domains that exist are exactly the files the owner has written in `checklists/` — nothing is
+built in. `devteam_plan` lists the current ones, and an unknown name is refused with that list. A planner sets them with `domains` on
 `devteam_plan` (omit to inherit the task's). A domain with no file adds nothing; a wrong domain is
 worse than none.
 
