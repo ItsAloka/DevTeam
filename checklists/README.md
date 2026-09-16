@@ -19,12 +19,22 @@ Add a line whenever you learn something the hard way. That is the whole maintena
 | `ml.md` | tasks tagged `ml` |
 | `security.md` | **every** task — pulled in regardless of domain |
 
-Domain names come from DevTeam's domain vocabulary (`web`, `backend`, `mobile`, `desktop`, `game`,
-`ml`, `data`, `devops`, `docs`, `embedded`, `security`, plus any you add). A domain with no file
-here is not offered when you create a task — an empty list buys nothing.
+The task dialog offers DevTeam's built-in names (`web`, `backend`, `mobile`, `desktop`, `game`,
+`ml`, `data`, `devops`, `docs`, `embedded`, `security`) plus every file in this directory, and shows
+each one's item count. A built-in with no file here is dimmed and shows `—`: you can still tag work
+with it, but reviewers get nothing extra until you write the list.
 
-To add a domain: create `<name>.md` here and register the name with DevTeam
-(`devteam domain add <name>`).
+**To add a domain, create `<name>.md` here.** That is the whole step — the file *is* the
+registration, and the name appears in the task dialog on the next load. There is no "add domain"
+button, because a registered name with no file promises the team a check that cannot happen.
+
+Names must be lowercase slugs (`ar-vr`, `blockchain`). A file named after a synonym of a built-in
+(`frontend.md`, `api.md`, `ai.md`) is ignored — two names for one domain split your lessons across
+two lists and starve both; add the lines to `web.md`, `backend.md` or `ml.md` instead. `README.md`
+is this file, not a domain.
+
+Deleting a file removes the domain from the picker. Tasks already tagged with it keep the tag and
+stay editable; they simply get no checklist.
 
 ## Format
 

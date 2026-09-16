@@ -4,8 +4,8 @@ import { mkdirSync, statSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { applySchema } from "./schema.mjs";
-import { DEFAULT_DOMAINS, normalizeDomains, validateNewDomainName } from "./domains.mjs";
-import { DEFAULT_CHECKLIST_DIRNAME, loadChecklist } from "./checklists.mjs";
+import { DEFAULT_DOMAINS, DOMAIN_NAME_PATTERN, normalizeDomains } from "./domains.mjs";
+import { DEFAULT_CHECKLIST_DIRNAME, listChecklistDomains, loadChecklist } from "./checklists.mjs";
 
 // The built-in domains, kept under their original export name. The live list (built-ins plus any the
 // owner added) is store.domainNames().
@@ -728,47 +728,48 @@ export class DevTeamStore extends EventEmitter {
     return this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
   }
 
-  // ---- Domains: built-ins plus owner-added, shared by every project like the checklists ----
+  // ---- Domains: the vocabulary is the checklists directory ----
 
-  // `checklistItems` counts the lines in that domain's file under checklistDir. A domain with none
-  // is offered nowhere: tagging a task with it would promise a check that cannot happen.
+  // A domain exists because `checklists/<name>.md` exists. There is no registration step and no
+  // "add domain" button any more: a registered name with no file promised a check that could never
+  // happen. Three sources are unioned, in this order:
+  //   1. the domains table — the built-ins, plus any custom name registered before this changed;
+  //   2. the files on disk — the live source, and the only way to add one now;
+  //   3. names already used by existing tasks — so a task whose domain's file was deleted can still
+  //      be opened and edited rather than failing validation on a name it already carries.
+  _domainVocabulary() {
+    const names = [];
+    const add = (value) => {
+      const name = String(value || "").toLowerCase();
+      if (DOMAIN_NAME_PATTERN.test(name) && !names.includes(name)) names.push(name);
+    };
+    for (const row of this.db.prepare("SELECT name FROM domains ORDER BY builtin DESC, rowid ASC").all()) add(row.name);
+    for (const name of listChecklistDomains(this.checklistDir || path.join(process.cwd(), DEFAULT_CHECKLIST_DIRNAME))) add(name);
+    for (const row of this.db.prepare("SELECT DISTINCT j.value AS name FROM tasks t, json_each(t.domains) j").all()) add(row.name);
+    return names;
+  }
+
+  // `checklistItems` counts the lines in that domain's file. Zero means the name is known but the
+  // list has not been written yet, which the dashboard marks rather than hides.
   listDomains() {
     const dir = this.checklistDir || path.join(process.cwd(), DEFAULT_CHECKLIST_DIRNAME);
-    return this.db.prepare(`
-      SELECT d.name, d.builtin, d.created_at,
-        (SELECT COUNT(*) FROM tasks t, json_each(t.domains) j WHERE j.value = d.name) AS task_count
-      FROM domains d ORDER BY d.builtin DESC, d.rowid ASC
-    `).all().map((row) => ({
-      name: row.name,
-      builtin: Boolean(row.builtin),
-      createdAt: row.created_at,
-      tasks: row.task_count,
-      checklistItems: loadChecklist(dir, row.name)?.itemCount ?? 0,
-      checklistFile: loadChecklist(dir, row.name)?.file ?? null,
-    }));
+    const taskCounts = new Map(this.db.prepare(`
+      SELECT j.value AS name, COUNT(*) AS n FROM tasks t, json_each(t.domains) j GROUP BY j.value
+    `).all().map((row) => [row.name, Number(row.n)]));
+    return this._domainVocabulary().map((name) => {
+      const checklist = loadChecklist(dir, name);
+      return {
+        name,
+        builtin: DEFAULT_DOMAINS.includes(name),
+        tasks: taskCounts.get(name) || 0,
+        checklistItems: checklist?.itemCount ?? 0,
+        checklistFile: checklist?.file ?? null,
+      };
+    });
   }
 
   domainNames() {
-    return this.db.prepare("SELECT name FROM domains ORDER BY builtin DESC, rowid ASC").all().map((row) => row.name);
-  }
-
-  addDomain(rawName) {
-    const name = validateNewDomainName(rawName, this.domainNames());
-    this.db.prepare("INSERT INTO domains (name, builtin, created_at) VALUES (?, 0, ?)").run(name, now());
-    this._changed("domain.added");
-    return this.listDomains().find((domain) => domain.name === name);
-  }
-
-  // Only an unused custom domain can go: removing one a task names would orphan it. A domain whose
-  // checklist file still has lines is kept too — deleting the name would strand the file.
-  removeDomain(name) {
-    const domain = this.listDomains().find((entry) => entry.name === String(name));
-    if (!domain) throw new Error("Domain not found.");
-    if (domain.builtin) throw new Error("Built-in domains cannot be removed.");
-    if (domain.tasks || domain.checklistItems) throw new Error(`"${domain.name}" is in use by ${domain.tasks} task(s) and ${domain.checklistItems} checklist item(s).`);
-    this.db.prepare("DELETE FROM domains WHERE name = ? AND builtin = 0").run(domain.name);
-    this._changed("domain.removed");
-    return { removed: domain.name };
+    return this._domainVocabulary();
   }
 
   createTask({ projectId, title, description, requiredApprovals = 2, sessionPolicy = "per_task", domains = undefined }) {

@@ -234,15 +234,9 @@ export async function startDevTeamServer({
     if (!detail) return res.status(404).json({ error: "Task not found." });
     res.json(detail);
   });
+  // Read-only: a domain is added by writing checklists/<name>.md, not through the API.
   app.get("/api/domains", (req, res) => {
     res.json(store.listDomains());
-  });
-  app.post("/api/domains", (req, res) => {
-    requireFields(req.body, ["name"]);
-    res.status(201).json(store.addDomain(req.body.name));
-  });
-  app.delete("/api/domains/:name", (req, res) => {
-    res.json(store.removeDomain(req.params.name));
   });
   app.post("/api/projects", (req, res) => {
     requireFields(req.body, ["name", "root"]);

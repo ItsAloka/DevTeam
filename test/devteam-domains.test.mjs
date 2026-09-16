@@ -1,18 +1,31 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { DevTeamStore, DOMAINS, normalizeDomains } from "../src/devteam/store.mjs";
 import { applySchema } from "../src/devteam/schema.mjs";
+import { clearChecklistCache, listChecklistDomains } from "../src/devteam/checklists.mjs";
 
 async function fixture(t) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-domains-"));
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-domains-project-"));
+  const checklistDir = await mkdtemp(path.join(os.tmpdir(), "devteam-domains-lists-"));
   const store = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: false } });
-  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); await rm(projectRoot, { recursive: true, force: true }); });
-  return { store, project: store.ensureProject("Domains", projectRoot) };
+  store.checklistDir = checklistDir;
+  clearChecklistCache();
+  t.after(async () => {
+    store.close();
+    clearChecklistCache();
+    for (const dir of [dataDir, projectRoot, checklistDir]) await rm(dir, { recursive: true, force: true });
+  });
+  // Writing checklists/<name>.md is the only way to add a domain.
+  const writeChecklist = async (name, body = "## General\n- [ ] something\n") => {
+    await writeFile(path.join(checklistDir, `${name}.md`), body, "utf8");
+    clearChecklistCache();
+  };
+  return { store, checklistDir, writeChecklist, project: store.ensureProject("Domains", projectRoot) };
 }
 
 test("the built-in domains are the common IT set and cannot be mutated", () => {
@@ -20,26 +33,49 @@ test("the built-in domains are the common IT set and cannot be mutated", () => {
   assert.throws(() => { DOMAINS.push("frontend"); });
 });
 
-test("the owner can add a domain, use it, and remove it only while unused", async (t) => {
-  const { store, project } = await fixture(t);
-  assert.deepEqual(store.domainNames(), [...DOMAINS], "built-ins are seeded");
-  const added = store.addDomain(" Blockchain ");
-  assert.deepEqual({ name: added.name, builtin: added.builtin }, { name: "blockchain", builtin: false });
-  assert.equal(store.domainNames().at(-1), "blockchain");
+test("a domain exists because its checklist file exists", async (t) => {
+  const { store, project, writeChecklist } = await fixture(t);
+  assert.deepEqual(store.domainNames(), [...DOMAINS], "built-ins are always known");
+  assert.throws(() => store.createTask({ projectId: project.id, title: "Chain", description: "d", domains: ["blockchain"] }), /Unknown domain/);
 
-  assert.throws(() => store.addDomain("blockchain"), /already exists/);
-  assert.throws(() => store.addDomain("frontend"), /covered by the "web" domain/);
-  assert.throws(() => store.addDomain("AI"), /covered by the "ml" domain/);
-  assert.throws(() => store.addDomain("../etc"), /lowercase letters/, "names become file names, so no path characters");
-  assert.throws(() => store.addDomain("x"), /2–30 characters/);
-  assert.equal(store.addDomain("ar vr").name, "ar-vr", "spaces become hyphens");
+  await writeChecklist("blockchain");
+  assert.equal(store.domainNames().includes("blockchain"), true, "the file registers the domain");
+  const listed = store.listDomains().find((domain) => domain.name === "blockchain");
+  assert.deepEqual({ builtin: listed.builtin, items: listed.checklistItems }, { builtin: false, items: 1 });
 
   const task = store.createTask({ projectId: project.id, title: "Chain", description: "d", domains: ["blockchain", "web"] });
   assert.deepEqual(task.domains, ["web", "blockchain"], "ordered as the domain list is");
-  assert.throws(() => store.removeDomain("blockchain"), /in use by 1 task/);
-  assert.throws(() => store.removeDomain("web"), /Built-in domains cannot be removed/);
-  assert.deepEqual(store.removeDomain("ar-vr"), { removed: "ar-vr" });
-  assert.throws(() => store.createTask({ projectId: project.id, title: "Gone", description: "d", domains: ["ar-vr"] }), /Unknown domain/);
+  assert.equal(store.listDomains().find((domain) => domain.name === "blockchain").tasks, 1);
+});
+
+test("a domain whose file is deleted stays valid for tasks already using it", async (t) => {
+  const { store, project, checklistDir, writeChecklist } = await fixture(t);
+  await writeChecklist("blockchain");
+  const task = store.createTask({ projectId: project.id, title: "Chain", description: "d", domains: ["blockchain"] });
+  await rm(path.join(checklistDir, "blockchain.md"));
+  clearChecklistCache();
+  // Still in the vocabulary, so the task can be edited rather than failing on a name it carries.
+  assert.equal(store.domainNames().includes("blockchain"), true);
+  assert.equal(store.listDomains().find((domain) => domain.name === "blockchain").checklistItems, 0);
+  assert.deepEqual(store.updateTask(task.id, { title: "Chain v2" }).domains, ["blockchain"]);
+});
+
+test("file names that are not domains are ignored", async (t) => {
+  const { store, checklistDir, writeChecklist } = await fixture(t);
+  await writeChecklist("README");
+  await writeChecklist("frontend", "## A\n- [ ] x\n");
+  await writeChecklist("ar-vr");
+  clearChecklistCache();
+  const found = listChecklistDomains(checklistDir);
+  assert.deepEqual(found, ["ar-vr"], "README is not a domain and frontend is a synonym of web");
+  assert.equal(store.domainNames().includes("frontend"), false);
+  assert.equal(store.domainNames().includes("ar-vr"), true);
+});
+
+test("the store no longer registers domains itself", async (t) => {
+  const { store } = await fixture(t);
+  assert.equal(typeof store.addDomain, "undefined");
+  assert.equal(typeof store.removeDomain, "undefined");
 });
 
 test("normalizeDomains validates, dedupes, lowercases and orders; undefined stays undefined", () => {

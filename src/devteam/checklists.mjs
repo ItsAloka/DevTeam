@@ -26,8 +26,9 @@
 // the owner has ruled out; it is parsed so the file round-trips, and then ignored. Everything else
 // is a line the reviewer is told to walk in the file itself — a 150-item list cannot fit in a brief,
 // and reviewers can read files.
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
+import { DOMAIN_ALIASES, DOMAIN_NAME_PATTERN } from "./domains.mjs";
 
 export const CHECKLIST_RULE_MAX = 220;
 export const DEFAULT_CHECKLIST_DIRNAME = "checklists";
@@ -36,6 +37,8 @@ const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/u;
 const HEADING = /^#{2,3}\s+(.+?)\s*$/u;
 const BULLET = /^\s*[-*]\s*\[( |x|X|-)\]\s*(.+?)\s*$/u;
 const CRITICAL = /^\(\*\)\s*/u;
+// Files in the directory that document it rather than define a domain.
+const RESERVED_FILENAMES = new Set(["readme", "index", "notes", "template"]);
 
 export const checklistPath = (dir, domain) => path.join(dir, `${domain}.md`);
 
@@ -176,9 +179,27 @@ export function checklistBrief(dir, domains, role, { always = [], maxItems = 15,
   };
 }
 
-// Domains that actually have a checklist on disk. The task-creation picker offers only these: a
-// domain with no file buys nothing, and offering it suggests a check that will never happen.
+// Domains that actually have a checklist on disk, out of the ones asked about.
 export function availableDomains(dir, domains) {
   if (!dir || !existsSync(dir)) return [];
   return (domains || []).filter((domain) => (loadChecklist(dir, domain)?.itemCount ?? 0) > 0);
+}
+
+// Every domain the directory defines, from its file names. This is how a new domain comes into
+// existence: you write `checklists/<name>.md`. There is no separate registration step, because a
+// registered name with no file promises a check that cannot happen — which is what the old "add
+// domain" button produced.
+//
+// A file whose name is a near-synonym of a built-in (frontend.md beside web.md) is skipped: two
+// names for one domain split a team's lessons across two lists and starve both. README.md is the
+// directory's own documentation, not a domain, and non-slug names are not domains either.
+export function listChecklistDomains(dir) {
+  if (!dir) return [];
+  let entries;
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"))
+    .map((entry) => entry.name.slice(0, -3).toLowerCase())
+    .filter((name) => DOMAIN_NAME_PATTERN.test(name) && !DOMAIN_ALIASES[name] && !RESERVED_FILENAMES.has(name))
+    .sort();
 }

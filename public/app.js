@@ -947,8 +947,9 @@ document.addEventListener("click", async (event) => {
   if (projectButton) { clearPendingAttachments(); selectedProjectId = projectButton.dataset.project; const first = state.tasks.find((task) => task.project_id === selectedProjectId); selectedTaskId = first?.id || null; syncTaskUrl(); await refresh(); }
 });
 
-// Domain checkboxes come from the server's live list: the built-ins plus any the owner added. New ones
-// are added through "+ Add domain", which the server validates (slug names, no synonyms of a built-in).
+// Domain checkboxes come from the server's live list, which is the checklists directory: a domain
+// exists because checklists/<name>.md exists. That is also how you add one — there is no button,
+// because a name with no file promises the team a check that cannot happen.
 //
 // Each choice shows how many lines its checklist file holds. A domain with none is still offered —
 // you may want to tag work before writing the list — but it is marked, because tagging it promises a
@@ -958,7 +959,7 @@ let domainChoices = ["web", "backend", "mobile", "desktop", "game", "ml", "data"
 function renderDomainPickers() {
   for (const picker of document.querySelectorAll("[data-domain-picker]")) {
     const checked = new Set([...picker.querySelectorAll('input[name="domains"]:checked')].map((box) => box.value));
-    picker.querySelectorAll(".domain-choice, .domain-add").forEach((node) => node.remove());
+    picker.querySelectorAll(".domain-choice").forEach((node) => node.remove());
     for (const domain of domainChoices) {
       const label = document.createElement("label");
       const items = Number(domain.checklistItems) || 0;
@@ -974,27 +975,6 @@ function renderDomainPickers() {
       label.append(box, document.createTextNode(domain.name), count);
       picker.append(label);
     }
-    const add = document.createElement("span");
-    add.className = "domain-add";
-    const input = document.createElement("input");
-    input.type = "text"; input.maxLength = 30; input.placeholder = "new domain"; input.setAttribute("aria-label", "New domain name");
-    const button = document.createElement("button");
-    button.type = "button"; button.className = "secondary"; button.textContent = "+ Add domain";
-    const submit = async () => {
-      const name = input.value.trim();
-      if (!name) { input.focus(); return; }
-      try {
-        const created = await api("/api/domains", { method: "POST", body: JSON.stringify({ name }) });
-        await loadDomainChoices();
-        const box = picker.querySelector(`input[name="domains"][value="${CSS.escape(created.name)}"]`);
-        if (box) box.checked = true;
-        toast(`Domain “${created.name}” added`);
-      } catch (error) { toast(error.message); }
-    };
-    button.addEventListener("click", submit);
-    input.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); submit(); } });
-    add.append(input, button);
-    picker.append(add);
   }
 }
 async function loadDomainChoices() {

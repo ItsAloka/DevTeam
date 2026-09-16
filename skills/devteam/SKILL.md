@@ -93,7 +93,7 @@ rules for that kind of software, at `<DevTeam launch directory>/checklists/<doma
   report or as a `rule` on a finding; the owner decides.
 
 Domains are `web`, `backend`, `mobile`, `desktop`, `game`, `ml`, `data`, `devops`, `docs`,
-`embedded`, `security`, plus any the owner added. A planner sets them with `domains` on
+`embedded`, `security`, plus any file the owner has written in `checklists/`. A planner sets them with `domains` on
 `devteam_plan` (omit to inherit the task's). A domain with no file adds nothing; a wrong domain is
 worse than none.
 
