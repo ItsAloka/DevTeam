@@ -58,8 +58,8 @@ than changing it; a role that **plans** decides what the team does next.
 
 `devteam_next` blocks until there is an assignment or a message. No model tokens are spent while it
 blocks, so do not poll it with a short timeout. What comes back — task, assignment and `claimToken`,
-write scope, checklist, memory, code map, recent decisions — is what you need to start. **Read it,
-then inspect the actual files.** Non-blocking modes: `want=state`, `want=brief`, `want=module`,
+write scope, checklist, any `checklistFiles`, memory, code map, recent decisions — is what you need
+to start. **Read it, then inspect the actual files.** Non-blocking modes: `want=state`, `want=brief`, `want=module`,
 `want=complexity`.
 
 If `next` is idle repeatedly and the room is quiet, say so and leave. If the task is blocked, only the
@@ -93,9 +93,9 @@ rules for that kind of software, at `<DevTeam launch directory>/checklists/<doma
   report or as a `rule` on a finding; the owner decides.
 
 The domains that exist are exactly the files the owner has written in `checklists/` — nothing is
-built in. `devteam_plan` lists the current ones, and an unknown name is refused with that list. A planner sets them with `domains` on
-`devteam_plan` (omit to inherit the task's). A domain with no file adds nothing; a wrong domain is
-worse than none.
+built in, so do not assume `web` or `mobile` exists. `devteam_plan` lists the current ones and
+refuses an unknown name with that list. A planner sets them with `domains` (omit to inherit the
+task's, `[]` for none). A wrong domain is worse than none: it hands the reviewer the wrong list.
 
 ## Checking each other
 
