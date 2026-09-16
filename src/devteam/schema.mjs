@@ -366,7 +366,7 @@ export function applySchema(db) {
     // teammate about to come straight back — the scheduler gives those a short grace window.
     ["agents", "disconnect_kind", "TEXT"],
     // Domains a task (and, by inheritance, its assignments) belongs to, as a JSON array drawn from
-    // the domains table (see domains.mjs). '[]' means undeclared, which must schedule and brief exactly as before.
+    // the owner's checklist directory. '[]' means undeclared, so no domain checklist is delivered.
     ["tasks", "domains", "TEXT NOT NULL DEFAULT '[]'"],
     ["assignments", "domains", "TEXT NOT NULL DEFAULT '[]'"],
     // A reviewer may restate a finding as a short general rule (≤200 chars) under a section; the

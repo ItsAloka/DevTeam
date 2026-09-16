@@ -26,7 +26,8 @@
 // the owner has ruled out; it is parsed so the file round-trips, and then ignored. Everything else
 // is a line the reviewer is told to walk in the file itself — a 150-item list cannot fit in a brief,
 // and reviewers can read files.
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { DOMAIN_ALIASES, DOMAIN_NAME_PATTERN } from "./domains.mjs";
 
@@ -80,7 +81,9 @@ export function parseChecklist(text, domain = null) {
   const appliesTo = (Array.isArray(meta.applies_to) ? meta.applies_to : meta.applies_to ? [meta.applies_to] : [])
     .map((role) => String(role).trim().toLowerCase()).filter(Boolean);
   return {
-    domain: (typeof meta.domain === "string" && meta.domain) || domain,
+    // The filename defines the selectable domain. Frontmatter may describe a standalone parsed
+    // document, but it must not make `web-backend.md` appear in briefs as a different domain.
+    domain: domain || (typeof meta.domain === "string" && meta.domain) || null,
     title: (typeof meta.title === "string" && meta.title) || null,
     appliesTo,
     sections: sections.filter((entry) => entry.items.length),
@@ -89,25 +92,34 @@ export function parseChecklist(text, domain = null) {
   };
 }
 
-// mtime+size keyed, so editing a checklist takes effect on the next brief without a restart, and an
+// Content-keyed, so editing a checklist takes effect on the next brief without a restart, and an
 // untouched file is parsed once no matter how many assignments ask for it.
+//
+// This was keyed on mtime+size, which missed an edit that changed neither: two writes of the same
+// byte length landing on one filesystem timestamp tick served the stale parse. Measured at 6 stale
+// reads in 200 same-size edits. The edits that hit it are the likely ones — fixing a typo, swapping
+// a word, or `- [ ]` -> `- [x]`, which is byte-identical and changes what the line means.
+//
+// So the file is read every time and the hash of its contents is the key. The read is a few KB; the
+// parse is the expensive half and is still cached. Correctness here is worth more than a stat: a
+// checklist the owner has just corrected must not brief the old text.
 const cache = new Map();
 
 export function loadChecklist(dir, domain) {
   const file = checklistPath(dir, domain);
-  let stamp;
+  let text;
   try {
-    const stat = statSync(file);
-    stamp = `${stat.mtimeMs}:${stat.size}`;
+    text = readFileSync(file, "utf8");
   } catch {
     cache.delete(file);
     return null;
   }
+  const stamp = createHash("sha1").update(text).digest("hex");
   const hit = cache.get(file);
   if (hit?.stamp === stamp) return hit.value;
   let value = null;
   try {
-    value = { ...parseChecklist(readFileSync(file, "utf8"), domain), file };
+    value = { ...parseChecklist(text, domain), file };
   } catch {
     value = null;
   }
@@ -128,7 +140,7 @@ export function resolveChecklists(dir, domains, role, { always = [] } = {}) {
   for (const domain of wanted) {
     const loaded = loadChecklist(dir, domain);
     if (!loaded || !loaded.itemCount) continue;
-    if (loaded.appliesTo.length && name && !loaded.appliesTo.includes(name)) continue;
+    if (loaded.appliesTo.length && !loaded.appliesTo.includes(name)) continue;
     out.push(loaded);
   }
   return out;

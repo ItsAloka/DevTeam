@@ -2,9 +2,15 @@
 
 One file per domain. **You write these. DevTeam only reads them.**
 
-When a task declares a domain, every verifying role on that task (Reviewer, Security Reviewer,
-Tester) is handed the matching file's path, plus its critical lines inlined in the brief, and is
-told to walk the sections the change actually touches before giving a verdict.
+When a task selects a domain, the verifying roles on that task (Reviewer, Security Reviewer,
+Tester) are handed the matching file's path, plus its critical lines inlined in the brief, and are
+told to walk the sections the change actually touches before giving a verdict. Select nothing and
+no domain checklist is delivered at all — including security. A role that does not verify, such as
+an implementer or a planner, never receives one.
+
+A checklist is an *additional* check, not a gate. DevTeam delivers it and records which sections a
+reviewer says they walked; it never blocks a report or a verdict on checklist coverage. If a rule is
+not met, the reviewer says so with `verdict=changes` and the implementer fixes it.
 
 Add a line whenever you learn something the hard way. That is the whole maintenance story.
 
@@ -13,7 +19,7 @@ Add a line whenever you learn something the hard way. That is the whole maintena
 | File | Feeds |
 |---|---|
 | `<name>.md` | tasks tagged `<name>` |
-| `security.md` | **every** task — pulled in regardless of domain |
+| `security.md` | tasks tagged `security` — it is selected like any other domain |
 
 The task dialog offers exactly one domain per file in this directory, with its item count. There is
 no built-in list behind it: if `web.md` is not here, `web` is not a domain. Rename `web.md` to
@@ -45,8 +51,10 @@ applies_to: [reviewer, security-reviewer]
 - [-] MFA / OTP (not applicable to this project)
 ```
 
-- **Frontmatter** is optional. `applies_to` limits the file to those roles; omit it and the file
-  feeds any role that asks. `domain` defaults to the filename.
+- **Frontmatter** is optional. `applies_to` limits the file to exactly the roles it names — a
+  verifying role left off the list silently gets nothing, so list every role you mean. Omit
+  `applies_to` and the file reaches every verifying role, built-in or project-defined. `domain` is
+  taken from the file name; a `domain:` key that disagrees with the file name does not rename it.
 - `## Heading` starts a section. Reviewers are asked to name which sections they walked, so keep
   section names meaningful — they are how you audit whether a review was real.
 - `- [ ] text` is one item. One line = one thing to check.

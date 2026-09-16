@@ -13,9 +13,6 @@ import { fromJson, now } from "./util.mjs";
 import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
 import { checklistBrief, DEFAULT_CHECKLIST_DIRNAME } from "./checklists.mjs";
 
-// The checklist every assignment gets, whatever its domains. Security is not a domain you opt into.
-const ALWAYS_CHECKLIST_DOMAIN = "security";
-
 export const viewMethods = {
   // The domain checklist an assignment carries, read from the owner's Markdown under
   // `<checklist dir>/<domain>.md` (see checklists.mjs). Nothing is recorded: the files are the
@@ -24,13 +21,16 @@ export const viewMethods = {
   //
   // Only critical `(*)` lines are inlined. The rest stay in the files, whose paths ride along — a
   // useful checklist is far longer than a brief can hold, and a reviewer can open a file.
-  // `security.md` is pulled in on every assignment regardless of domain.
+  // Domain checklists are an explicit review/test aid: an assignment receives them only when its
+  // selected domains name a file, and only when its role actually verifies work. This keeps a
+  // planner or implementer from being handed a review checklist and makes an empty domain choice
+  // mean exactly "no extra checklist".
   _domainChecklistFor(assignment) {
+    if (!assignment?.verifies) return null;
     const dir = this.checklistDir || path.join(process.cwd(), DEFAULT_CHECKLIST_DIRNAME);
     const declared = fromJson(assignment.domains, Array.isArray(assignment.domains) ? assignment.domains : []);
     const domains = Array.isArray(declared) ? declared : [];
     const brief = checklistBrief(dir, domains, assignment.role, {
-      always: [ALWAYS_CHECKLIST_DOMAIN],
       maxItems: DEFAULT_BRIEF_BUDGET.domainChecklistItems,
       maxBytes: DEFAULT_BRIEF_BUDGET.domainChecklistBytes,
     });

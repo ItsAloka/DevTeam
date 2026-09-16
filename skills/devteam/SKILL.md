@@ -78,10 +78,12 @@ kept so you can fix it. A check without a command is recorded as your assertion.
 
 ## Checklists
 
-Your assignment carries the role's base `checklist`, and — when the task's domains have a list — a
+Verifying assignments carry the role's base `checklist`, and — when the task's selected domains have a list — a
 `domainChecklist` and `checklistFiles`. These are checklists **the owner wrote by hand**: hard-won
 rules for that kind of software, at `<DevTeam launch directory>/checklists/<domain>.md`.
-`security.md` is included on every assignment whether or not the task declares that domain.
+Only selected domains are delivered: if no domain is selected, there is no extra domain checklist.
+Use `applies_to` in a checklist's frontmatter only when the owner deliberately wants it limited to
+specific reviewing roles; otherwise the selected list reaches every verifying role.
 
 - `domainChecklist` holds only the **critical** lines, inlined because missing one means a breach, a
   bill or an outage. It is not the whole list.

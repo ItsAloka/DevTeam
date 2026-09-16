@@ -1,11 +1,10 @@
 ---
 domain: security
-applies_to: [reviewer, security-reviewer]
 ---
 
 # Security checklist
 
-Pulled into every task regardless of domain. `(*)` = missing it is a breach.
+Delivered when a task selects the `security` domain. `(*)` = missing it is a breach.
 
 ## The ones that bite first
 - [ ] (*) no session/access token in localStorage -> httpOnly + Secure + SameSite cookie

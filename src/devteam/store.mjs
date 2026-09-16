@@ -7,8 +7,8 @@ import { applySchema } from "./schema.mjs";
 import { DEFAULT_DOMAINS, DOMAIN_NAME_PATTERN, normalizeDomains } from "./domains.mjs";
 import { DEFAULT_CHECKLIST_DIRNAME, listChecklistDomains, loadChecklist } from "./checklists.mjs";
 
-// The built-in domains, kept under their original export name. The live list (built-ins plus any the
-// owner added) is store.domainNames().
+// Kept under its original export name for inference and the shipped checklist examples. The live
+// vocabulary is the checklist directory plus names already carried by existing tasks.
 export const DOMAINS = DEFAULT_DOMAINS;
 export { normalizeDomains };
 import { fromJson, json, now } from "./util.mjs";

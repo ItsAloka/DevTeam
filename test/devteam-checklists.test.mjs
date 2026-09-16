@@ -4,7 +4,8 @@
 // into the directory, and an assignment whose domains have no file briefs exactly as before.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readdir, rm, writeFile, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, utimes, writeFile, stat } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
 import path from "node:path";
 import { DevTeamStore } from "../src/devteam/store.mjs";
@@ -55,7 +56,7 @@ async function fixture(t) {
     await rm(dataDir, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
   });
-  return { store, project: store.ensureProject("Checklists", projectRoot) };
+  return { store, project: store.ensureProject("Checklists", projectRoot), projectRoot };
 }
 
 // A reviewer assignment, claimed, so taskBrief has a current assignment to describe.
@@ -88,8 +89,17 @@ test("frontmatter applies_to limits a file to the roles it names", async (t) => 
   assert.deepEqual(loadChecklist(dir, "security").appliesTo, ["reviewer", "security-reviewer"]);
   assert.equal(checklistBrief(dir, ["security"], "security-reviewer").files.length, 1);
   assert.equal(checklistBrief(dir, ["security"], "implementer"), null);
+  assert.equal(checklistBrief(dir, ["security"], "tester"), null);
+  assert.equal(checklistBrief(dir, ["security"], ""), null, "an absent role must not bypass a restricted file");
   // A file without applies_to feeds whoever asks.
   assert.equal(checklistBrief(dir, ["web"], "implementer").files.length, 1);
+});
+
+test("a checklist filename remains its delivered domain when frontmatter disagrees", async (t) => {
+  const dir = await checklistDir(t, { "web-backend.md": "---\ndomain: backend\n---\n## API\n- [ ] (*) validate input\n" });
+  const brief = checklistBrief(dir, ["web-backend"], "reviewer");
+  assert.equal(brief.files[0].domain, "web-backend");
+  assert.equal(brief.critical[0].domain, "web-backend");
 });
 
 test("only critical lines are inlined, and the budget is shared across files", async (t) => {
@@ -127,15 +137,40 @@ test("an edited file is re-read without a restart", async (t) => {
   assert.equal(loadChecklist(dir, "web").itemCount, 2);
 });
 
-test("the brief carries critical items, the file paths, and an instruction to walk them", async (t) => {
+// The cache was keyed on mtime+size, which cannot see an edit that changes neither. Both are pinned
+// here on purpose: the file keeps its byte length and its timestamp is forced back to the original,
+// so this reproduces the same-tick collision every run rather than the 3% of the time it happened by
+// chance. `- [ ]` -> `- [-]` is the realistic version — same length, and it rules the line out.
+test("an edit that changes neither size nor mtime is still re-read", async (t) => {
+  const dir = await checklistDir(t, { "web.md": "## A\n- [ ] (*) alpha\n- [ ] (*) bravo\n" });
+  const file = path.join(dir, "web.md");
+  // A whole-second stamp both writes can be pinned to exactly; utimes rounds, so restoring a
+  // captured mtime afterwards would not reproduce the collision.
+  const pinned = new Date(1_700_000_000_000);
+  await utimes(file, pinned, pinned);
+  const before = await stat(file);
+  assert.equal(loadChecklist(dir, "web").itemCount, 2);
+
+  const edited = "## A\n- [-] (*) alpha\n- [ ] (*) bravo\n";
+  await writeFile(file, edited, "utf8");
+  await utimes(file, pinned, pinned);
+  const after = await stat(file);
+  assert.equal(after.size, before.size, "the edit must not change the file's size");
+  assert.equal(after.mtimeMs, before.mtimeMs, "the edit must not change the file's mtime");
+
+  const reloaded = loadChecklist(dir, "web");
+  assert.equal(reloaded.itemCount, 1, "the ruled-out line is gone, so the parse was redone");
+  assert.equal(reloaded.sections[0].items[0].skipped, true);
+});
+
+test("a verifying brief carries only selected-domain critical items, paths, and an instruction to walk them", async (t) => {
   const { store, project } = await fixture(t);
   const { task, reviewer, claim } = await reviewerClaim(store, project, { domains: ["web"] });
   const brief = store.taskBrief(reviewer.id, task.id, { currentAssignment: claim });
   const current = brief.assignment || brief.currentAssignment;
   assert.ok(current.domainChecklist.length, "critical lines are inlined");
   assert.ok(current.domainChecklist.every((item) => typeof item.rule === "string" && item.section));
-  // security.md rides along even though the task declared only web.
-  assert.deepEqual(current.checklistFiles.map((file) => file.domain), ["web", "security"]);
+  assert.deepEqual(current.checklistFiles.map((file) => file.domain), ["web"]);
   assert.match(current.checklistInstruction, /walk the sections your change actually touches/);
   assert.ok(current.domainChecklist.length <= DEFAULT_BRIEF_BUDGET.domainChecklistItems);
 });
@@ -156,9 +191,65 @@ test("a domain whose file was deleted after tagging contributes nothing to the b
   clearChecklistCache();
   const brief = store.taskBrief(reviewer.id, task.id, { currentAssignment: claim });
   const current = brief.assignment || brief.currentAssignment;
-  // security.md still applies — it is not opt-in — but the deleted domain adds nothing.
-  assert.deepEqual(current.checklistFiles.map((file) => file.domain), ["security"]);
-  assert.ok(!current.domainChecklist.some((item) => item.domain === "web"));
+  assert.equal(current.domainChecklist, undefined);
+  assert.equal(current.checklistFiles, undefined);
+});
+
+test("only verifying roles receive a selected domain checklist", async (t) => {
+  const { store, project } = await fixture(t);
+  const task = store.createTask({ projectId: project.id, title: "Work", description: "d", domains: ["web"] });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const implementer = store.connectAgent({ name: "Implementer", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(planner.id);
+  const work = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Build", description: "Write.", role: "implementer", requiresWrite: true, paths: ["src/app.mjs"] });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  const claim = store.claimNextAssignment(implementer.id);
+  assert.equal(claim.id, work.id);
+  const brief = store.taskBrief(implementer.id, task.id, { currentAssignment: claim });
+  const current = brief.assignment || brief.currentAssignment;
+  assert.equal(current.domainChecklist, undefined);
+  assert.equal(current.checklistFiles, undefined);
+});
+
+test("a verifying assignment with no selected domains receives no domain checklist", async (t) => {
+  const { store, project } = await fixture(t);
+  const { task, reviewer, claim } = await reviewerClaim(store, project, { domains: [] });
+  const brief = store.taskBrief(reviewer.id, task.id, { currentAssignment: claim });
+  const current = brief.assignment || brief.currentAssignment;
+  assert.equal(current.domainChecklist, undefined);
+  assert.equal(current.checklistFiles, undefined);
+});
+
+test("a selected unrestricted checklist reaches the built-in tester", async (t) => {
+  const { store, project } = await fixture(t);
+  const task = store.createTask({ projectId: project.id, title: "Work", description: "d", domains: ["web"] });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const tester = store.connectAgent({ name: "Tester", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(planner.id);
+  store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Test", description: "Exercise.", role: "tester" });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  const claim = store.claimNextAssignment(tester.id);
+  const brief = store.taskBrief(tester.id, task.id, { currentAssignment: claim });
+  const current = brief.assignment || brief.currentAssignment;
+  assert.deepEqual(current.checklistFiles.map((file) => file.domain), ["web"]);
+});
+
+test("a selected unrestricted checklist reaches a custom verifying role", async (t) => {
+  const { store, project, projectRoot } = await fixture(t);
+  await mkdir(path.join(projectRoot, ".devteam"), { recursive: true });
+  await writeFile(path.join(projectRoot, ".devteam", "roles.json"), JSON.stringify({ roles: {
+    planner: { plans: true }, writer: { writes: true }, "fact-checker": { verifies: true },
+  } }), "utf8");
+  const task = store.createTask({ projectId: project.id, title: "Work", description: "d", domains: ["web"] });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const checker = store.connectAgent({ name: "Checker", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(planner.id);
+  store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Check", description: "Verify.", role: "fact-checker" });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  const claim = store.claimNextAssignment(checker.id);
+  const brief = store.taskBrief(checker.id, task.id, { currentAssignment: claim });
+  const current = brief.assignment || brief.currentAssignment;
+  assert.deepEqual(current.checklistFiles.map((file) => file.domain), ["web"]);
 });
 
 test("with no checklist directory at all, the brief carries no checklist keys", async (t) => {
@@ -216,10 +307,29 @@ test("the server resolves checklistDir onto the store and leaves it untouched", 
 });
 
 test("the legacy checklist tables are dropped from an existing database", async (t) => {
-  const { store } = await fixture(t);
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-cl-legacy-"));
+  const databasePath = path.join(dataDir, "devteam.db");
+  const legacy = new DatabaseSync(databasePath);
+  legacy.exec(`
+    CREATE TABLE checklist_items (id TEXT PRIMARY KEY);
+    CREATE TABLE checklist_deliveries (id TEXT PRIMARY KEY);
+    CREATE TABLE domains (name TEXT PRIMARY KEY);
+    INSERT INTO checklist_items (id) VALUES ('legacy-item');
+    INSERT INTO checklist_deliveries (id) VALUES ('legacy-delivery');
+    INSERT INTO domains (name) VALUES ('legacyonly');
+  `);
+  legacy.close();
+
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: false } });
+  t.after(async () => {
+    store.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
   const tables = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name);
   assert.ok(!tables.includes("checklist_items"));
   assert.ok(!tables.includes("checklist_deliveries"));
+  assert.ok(!tables.includes("domains"));
   // The role base checklist is a different thing and stays.
   assert.ok(tables.includes("assignment_checklists"));
+  assert.ok(!store.domainNames().includes("legacyonly"));
 });
