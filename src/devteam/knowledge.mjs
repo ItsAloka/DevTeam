@@ -676,17 +676,6 @@ export class KnowledgeVault {
       return;
     }
 
-    if (event.type === "proposal.adopted") {
-      const proposal = metadata.proposalId
-        ? this.db.prepare("SELECT summary, details, kind FROM proposals WHERE id = ?").get(metadata.proposalId)
-        : null;
-      const title = proposal?.summary || event.message.replace(/^Team adopted:\s*/i, "");
-      this.#upsert({ ...common, category: "decisions", slug: `decision-${event.id}-${slugify(title)}`, title,
-        body: clip([proposal?.details ? `Details: ${proposal.details}` : "", `Adopted by the DevTeam as a ${proposal?.kind || metadata.kind || "decision"}.`].filter(Boolean).join("\n\n")),
-        status: "verified", confidence: "high", verifiedAt: event.created_at });
-      return;
-    }
-
     if (["assignment.completed", "assignment.blocked"].includes(event.type)) {
       const role = String(metadata.role || "contributor").toLowerCase();
       const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
@@ -916,7 +905,7 @@ export class KnowledgeVault {
     const recent = this.db.prepare(`
       SELECT e.id, e.task_id, e.type, e.message, e.created_at
       FROM events e JOIN tasks t ON t.id = e.task_id
-      WHERE t.project_id = ? AND e.type IN ('human.message','assignment.completed','assignment.blocked','task.blocked','task.unblocked','task.accepted','proposal.adopted')
+      WHERE t.project_id = ? AND e.type IN ('human.message','assignment.completed','assignment.blocked','task.blocked','task.unblocked','task.accepted')
       ORDER BY e.id DESC LIMIT 12
     `).all(project.id);
     const lines = [
@@ -1008,7 +997,7 @@ export class KnowledgeVault {
   // This does not try to understand the claims. It finds notes that are *about the same thing* — same
   // category and overlapping subject terms, or the same related files — and says "these two are
   // about one subject and say different things, someone should decide". Detection is cheap and
-  // conservative; resolution is the team's job, which is what the proposal mechanism is already for.
+  // conservative; resolving a genuine contradiction is the team's job, not the vault's.
   #conflictCandidates(projectId, note, noteId, limit = 5) {
     const subject = new Set(String(note.title || "").toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word.length >= 4));
     if (!subject.size) return [];
@@ -1121,7 +1110,7 @@ export class KnowledgeVault {
   //
   //   * status is never `verified`. An agent asserting something is `inferred`, however sure it
   //     sounds. `verified` means DevTeam watched it happen (a completed assignment, an adopted
-  //     proposal), and letting an agent claim it would make the distinction worthless exactly where
+  //     human), and letting an agent claim it would make the distinction worthless exactly where
   //     it matters most: deciding what to believe in the next session's briefing.
   //   * `sessions` and `archive` are not writable categories. They are DevTeam's own bookkeeping.
   write({ projectId, category, title, body, confidence = "medium", relatedFiles = [], author = "agent", taskId = null, eventId = null }) {

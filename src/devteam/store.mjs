@@ -11,13 +11,13 @@ export { normalizeDomains };
 import { fromJson, json, now } from "./util.mjs";
 import { checksMethods } from "./store-checks.mjs";
 import { knowledgeMethods } from "./store-knowledge.mjs";
-import { consensusMethods, PROPOSAL_KINDS } from "./store-consensus.mjs";
+import { consensusMethods } from "./store-consensus.mjs";
 import { viewMethods } from "./store-views.mjs";
 import { agentMethods } from "./store-agents.mjs";
 import { CodeGraph } from "./codegraph.mjs";
 import { KnowledgeVault } from "./knowledge.mjs";
 import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
-import { DEFAULT_ROLES, loadProjectRoles, planningRole, roleBehaviour, ROLES_CONFIG_PATH } from "./roles.mjs";
+import { normalizeRoleName, PLANNING_ROLE, roleBehaviour, roleCatalogue } from "./roles.mjs";
 import { hashToken, mintToken, normalizeTokenLabel, tokensMatch } from "./access.mjs";
 
 // A task in one of these states hands out no work; named once so the candidate scan and the
@@ -72,7 +72,7 @@ const DEPENDENCY_CLOSURE_CTE = `
 // (which asks only whether any exist) and by the explanation (which names them).
 const BLOCKING_WRITER_CONDITIONS = `pending_write.task_id = a.task_id
                 -- An assignment can never be the writer it is waiting for. Without this, a
-                -- reviewer/tester that itself declares write access matches its own row here and
+                -- reviewer that itself declares write access matches its own row here and
                 -- is excluded from every scan forever, with nothing reported as blocking it.
                 -- (Kept explicit for the reader: the creation-order rule below now also excludes
                 -- the self row, since nothing is strictly older than itself. Mutation testing
@@ -133,8 +133,6 @@ function holdingProcessIsAlive(pid) {
 }
 
 export class DevTeamStore extends EventEmitter {
-  // Per-project role config, cached by the file's mtime (see projectRoles).
-  #roleCache = new Map();
   #splitOutcome = { inferred: [], keep: false };
 
   // `exclusive: false` opens the database to *look* at it — `devteam token`, a doctor command, a
@@ -175,7 +173,6 @@ export class DevTeamStore extends EventEmitter {
     this.liveness = {
       presenceMs: 120_000,        // quiet longer than this: a waiting agent is gone, a busy one is 'unresponsive'
       staleWorkMs: 900_000,       // quiet longer than this: a read-only claim may be safely recovered
-      proposalTimeoutMs: 600_000, // open longer than this: escalate the proposal for a human decision
       continuationWindowMs: 180_000, // after acceptance, keep the room "active" this long so members stay assembled for a same-conversation follow-up
       forgetMs: 86_400_000,       // gone this long (disconnected, or unresponsive holding no write lease): purge the row so ghosts stop lingering as "online"
       ...liveness,
@@ -356,7 +353,7 @@ export class DevTeamStore extends EventEmitter {
     const knowledgeChanges = new Set([
       "task.created", "task.continued", "task.updated", "task.accepted", "task.blocked", "task.unblocked",
       "assignment.created", "assignment.completed", "assignment.blocked",
-      "proposal.adopted", "blackboard.updated", "agent.decision", "agent.finding", "human.message",
+      "blackboard.updated", "agent.decision", "agent.finding", "human.message",
     ]);
     if (taskId && knowledgeChanges.has(type)) {
       try {
@@ -504,30 +501,7 @@ export class DevTeamStore extends EventEmitter {
   reapAndRecover() {
     const reaped = this._reapStaleAgents();
     this._recoverOrphanedClaims();
-    this.escalateStaleProposals();
     return reaped;
-  }
-
-  // A proposal that stays open past the decision window (a single holdout, or everyone who could
-  // vote going quiet) can freeze team governance forever. Flag each such proposal once for a human
-  // decision instead of leaving it silently stuck. Non-destructive: the proposal stays open and can
-  // still be voted through or objected to.
-  escalateStaleProposals() {
-    const before = new Date(Date.now() - this.liveness.proposalTimeoutMs).toISOString();
-    const stale = this.db.prepare(`
-      SELECT id, task_id, summary FROM proposals
-      WHERE status = 'open' AND escalated_at IS NULL AND created_at < ?
-    `).all(before);
-    if (!stale.length) return [];
-    const stamp = now();
-    this._transaction(() => {
-      for (const proposal of stale) {
-        this.db.prepare("UPDATE proposals SET escalated_at = ? WHERE id = ?").run(stamp, proposal.id);
-        this._event(proposal.task_id, null, "proposal.needs_human", `A proposal has been open past the decision window and needs a human decision: ${proposal.summary}`, { proposalId: proposal.id });
-      }
-    });
-    for (const taskId of new Set(stale.map((proposal) => proposal.task_id))) this._changed("proposal.needs_human", taskId);
-    return stale;
   }
 
   // Role checklists a planner can attach to review work so the team systematically
@@ -535,45 +509,22 @@ export class DevTeamStore extends EventEmitter {
   // to review/security/test assignments unless the caller overrides them.
   // A project's roles, cached until its `.devteam/roles.json` changes on disk. The mtime check keeps
   // an edit picked up without a restart while not re-reading the file on every assignment.
-  projectRoles(projectId) {
-    const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
-    if (!project) return { roles: DEFAULT_ROLES, source: "default" };
-    const cached = this.#roleCache.get(projectId);
-    let stamp = 0;
-    try { stamp = statSync(path.join(project.root, ROLES_CONFIG_PATH)).mtimeMs; } catch { stamp = 0; }
-    if (cached && cached.mtimeMs === stamp) return cached;
-    const loaded = loadProjectRoles(project.root);
-    this.#roleCache.set(projectId, loaded);
-    return loaded;
+  // What a role name means: whether it verifies, plans, or writes, and the checklist its
+  // assignments carry. There are three roles and they are the same in every project, so this takes
+  // no project: see roles.mjs for why the vocabulary stopped being configurable.
+  roleBehaviour(role) {
+    return roleBehaviour(role);
   }
 
-  // What a role name means *in this project*: whether it verifies, plans, or writes by default, and
-  // the checklist its assignments carry. An unknown name is ordinary work rather than an error.
-  roleBehaviour(projectId, role) {
-    return roleBehaviour(this.projectRoles(projectId).roles, role);
+  // The role catalogue, for the dashboard's assignment form and for agents asking what this room
+  // understands.
+  roleCatalogue() {
+    return roleCatalogue();
   }
 
-  // The role a seeded planning assignment is created in for this project.
-  planningRoleFor(projectId) {
-    return planningRole(this.projectRoles(projectId).roles);
-  }
-
-  // The role catalogue for a project, for the dashboard's assignment form and for agents asking what
-  // roles this room understands. Includes whether the config came from the project or the defaults,
-  // and surfaces a malformed config rather than pretending the defaults were chosen.
-  roleCatalogue(projectId) {
-    const loaded = this.projectRoles(projectId);
-    return {
-      source: loaded.source,
-      configPath: ROLES_CONFIG_PATH,
-      ...(loaded.error ? { error: loaded.error } : {}),
-      roles: Object.entries(loaded.roles).map(([name, definition]) => ({ name, ...definition })),
-    };
-  }
-
-  _resolveChecklist(projectId, role, provided) {
+  _resolveChecklist(role, provided) {
     if (Array.isArray(provided)) return provided.map((item) => String(item).trim()).filter(Boolean).slice(0, 40);
-    const checklist = this.roleBehaviour(projectId, role).checklist;
+    const checklist = this.roleBehaviour(role).checklist;
     return checklist.length ? checklist : null;
   }
 
@@ -585,11 +536,6 @@ export class DevTeamStore extends EventEmitter {
   _checklistFor(assignmentId) {
     return fromJson(this.db.prepare("SELECT items FROM assignment_checklists WHERE assignment_id = ?").get(assignmentId)?.items, []);
   }
-
-  // --- Role negotiation: agents (and the human) propose role/handoff/plan changes,
-  // teammates vote, and on agreement the change is adopted and real work is reassigned. ---
-
-  static PROPOSAL_KINDS = PROPOSAL_KINDS;
 
   close() {
     this.#releaseDataDirectory();
@@ -704,7 +650,7 @@ export class DevTeamStore extends EventEmitter {
     return this._domainVocabulary();
   }
 
-  createTask({ projectId, title, description, requiredApprovals = 2, sessionPolicy = "per_task", domains = undefined }) {
+  createTask({ projectId, title, description, requiredApprovals = 2, domains = undefined }) {
     const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
     if (!project) throw new Error("Project not found.");
     const taskDomains = normalizeDomains(domains, this.domainNames()) || [];
@@ -712,19 +658,17 @@ export class DevTeamStore extends EventEmitter {
     const plannerAssignmentId = randomUUID();
     const stamp = now();
     const approvals = Math.max(1, Math.min(8, Number(requiredApprovals) || 2));
-    const planningRoleName = this.planningRoleFor(projectId);
     this._transaction(() => {
       this.db.prepare(`
         INSERT INTO tasks (id, project_id, title, description, status, version, required_approvals,
-          session_policy, session_policy_version, created_at, updated_at, domains)
-        VALUES (?, ?, ?, ?, 'planning', 1, ?, ?, 1, ?, ?, ?)
+          created_at, updated_at, domains)
+        VALUES (?, ?, ?, ?, 'planning', 1, ?, ?, ?, ?)
       `).run(taskId, projectId, title.trim(), description.trim(), approvals,
-        ["manual", "per_task", "adaptive", "per_assignment"].includes(sessionPolicy) ? sessionPolicy : "per_task",
         stamp, stamp, json(taskDomains));
       this.db.prepare(`
         INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at, plans, domains)
         VALUES (?, ?, ?, ?, ?, 0, 'queued', ?, 1, ?)
-      `).run(plannerAssignmentId, taskId, "Create the implementation plan", "Inspect the project, propose a concrete plan, then assign implementation and review work to the team.", planningRoleName, stamp, json(taskDomains));
+      `).run(plannerAssignmentId, taskId, "Create the implementation plan", "Inspect the project, propose a concrete plan, then assign implementation and review work to the team.", PLANNING_ROLE, stamp, json(taskDomains));
       this._event(taskId, null, "task.created", `Task created: ${title.trim()}`, { projectId, requiredApprovals: approvals, ...(taskDomains.length ? { domains: taskDomains } : {}) });
     });
     this._changed("task.created", taskId);
@@ -809,7 +753,7 @@ export class DevTeamStore extends EventEmitter {
   // after creation, so a typo or a sharpened spec no longer means deleting and recreating the room.
   // This is metadata only: it does not touch the version, existing approvals, assignments, or the
   // timeline of work — it just records that the human revised the brief. At least one field changes.
-  updateTask(taskId, { title = undefined, description = undefined, requiredApprovals = undefined, sessionPolicy = undefined, domains = undefined } = {}) {
+  updateTask(taskId, { title = undefined, description = undefined, requiredApprovals = undefined, domains = undefined } = {}) {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     if (task.status === "cancelled") throw new Error("A cancelled task cannot be edited.");
@@ -820,29 +764,26 @@ export class DevTeamStore extends EventEmitter {
     const nextApprovals = requiredApprovals === undefined
       ? task.required_approvals
       : Math.max(1, Math.min(8, Number(requiredApprovals) || task.required_approvals));
-    const nextPolicy = sessionPolicy === undefined ? task.session_policy : String(sessionPolicy);
-    if (!["manual", "per_task", "adaptive", "per_assignment"].includes(nextPolicy)) throw new Error("Invalid session policy.");
     // Changing a task's domains affects only assignments created afterwards; work already queued keeps
     // the domains it was created under, the same rule its checklist follows.
     const nextDomains = normalizeDomains(domains, this.domainNames()) ?? task.domains;
     const domainsChanged = json(nextDomains) !== json(task.domains);
     if (nextTitle === task.title && nextDescription === task.description && nextApprovals === task.required_approvals
-      && nextPolicy === task.session_policy && !domainsChanged) {
+      && !domainsChanged) {
       return this.getTask(taskId);
     }
     const changed = [
       nextTitle !== task.title ? "title" : null,
       nextDescription !== task.description ? "description" : null,
       nextApprovals !== task.required_approvals ? "approvals" : null,
-      nextPolicy !== task.session_policy ? "session policy" : null,
       domainsChanged ? "domains" : null,
     ].filter(Boolean);
     const stamp = now();
     this._transaction(() => {
-      this.db.prepare(`UPDATE tasks SET title = ?, description = ?, required_approvals = ?, session_policy = ?,
-        session_policy_version = session_policy_version + ?, domains = ?, updated_at = ? WHERE id = ?`)
-        .run(nextTitle, nextDescription, nextApprovals, nextPolicy, nextPolicy === task.session_policy ? 0 : 1, json(nextDomains), stamp, taskId);
-      this._event(taskId, null, "task.updated", `Task details edited (${changed.join(", ")}).`, { changed, requiredApprovals: nextApprovals, sessionPolicy: nextPolicy, domains: nextDomains });
+      this.db.prepare(`UPDATE tasks SET title = ?, description = ?, required_approvals = ?,
+        domains = ?, updated_at = ? WHERE id = ?`)
+        .run(nextTitle, nextDescription, nextApprovals, json(nextDomains), stamp, taskId);
+      this._event(taskId, null, "task.updated", `Task details edited (${changed.join(", ")}).`, { changed, requiredApprovals: nextApprovals, domains: nextDomains });
     });
     this._changed("task.updated", taskId);
     return this.getTask(taskId);
@@ -941,13 +882,13 @@ export class DevTeamStore extends EventEmitter {
     if (["accepted", "blocked", "cancelled"].includes(task.status)) throw new Error(this.closedTaskError(task, "create an assignment on it"));
     if (agentId) { this.getAgent(agentId); this.assertMembership(agentId, taskId); }
     const assignment = {
-      id: randomUUID(), taskId, title: title.trim(), description: description.trim(), role: role.trim(),
+      id: randomUUID(), taskId, title: title.trim(), description: description.trim(), role: normalizeRoleName(role),
       requiresWrite: requiresWrite ? 1 : 0, targetAgentName: targetAgentName?.trim() || null, createdAt: now(),
     };
-    // Resolve the role against *this project's* roles once, here, and store what the scheduler needs
-    // on the row. Doing it at creation rather than at scan time means editing a project's role config
-    // never silently re-classifies work that is already queued or in flight.
-    const behaviour = this.roleBehaviour(task.project_id, assignment.role);
+    // The role was resolved onto one of the three above, and its scheduling behaviour is stored on
+    // the row rather than re-derived later. A planner that asks for `security-reviewer` or a name
+    // from some older vocabulary gets a reviewer, and the board only ever shows the three.
+    const behaviour = this.roleBehaviour(assignment.role);
     const reviewSubjectId = reviewSubjectAssignmentId ? String(reviewSubjectAssignmentId).trim() : null;
     if (reviewSubjectId) {
       if (!behaviour.verifies) throw new Error("A review subject is only valid for verifying assignments.");
@@ -981,7 +922,7 @@ export class DevTeamStore extends EventEmitter {
         };
       }
     }
-    const resolvedChecklist = this._resolveChecklist(task.project_id, assignment.role, checklist);
+    const resolvedChecklist = this._resolveChecklist(assignment.role, checklist);
     // A write assignment may declare the paths it will touch, enabling non-overlapping writers
     // to run in parallel; omitting them keeps the conservative whole-project lease.
     const writePaths = assignment.requiresWrite && Array.isArray(paths)
@@ -1217,7 +1158,6 @@ export class DevTeamStore extends EventEmitter {
       const readCandidatePage = (offset) => this.db.prepare(`
         ${DEPENDENCY_CLOSURE_CTE}
         SELECT a.*, t.project_id, t.title AS task_title, t.description AS task_description,
-          t.session_policy AS task_session_policy,
           t.version AS task_version, t.required_approvals, p.root AS project_root, p.name AS project_name
         FROM assignments a
         JOIN tasks t ON t.id = a.task_id
@@ -1267,14 +1207,8 @@ export class DevTeamStore extends EventEmitter {
         `).run(agentId, stamp, this._hashToken(claimToken), candidate.id);
         if (!result.changes) continue;
         const claimGeneration = this.db.prepare("SELECT claim_generation FROM assignments WHERE id = ?").get(candidate.id).claim_generation;
-        if (candidate.task_session_policy === "per_assignment") {
-          this.db.prepare(`UPDATE agents SET status = 'busy', current_task_id = ?, last_seen = ?,
-            fresh_task_id = NULL WHERE id = ?`)
-            .run(candidate.task_id, stamp, agentId);
-        } else {
-          this.db.prepare("UPDATE agents SET status = 'busy', current_task_id = ?, last_seen = ? WHERE id = ?")
-            .run(candidate.task_id, stamp, agentId);
-        }
+        this.db.prepare("UPDATE agents SET status = 'busy', current_task_id = ?, last_seen = ? WHERE id = ?")
+          .run(candidate.task_id, stamp, agentId);
         // An agent reaches this room by joining it or by being invited into it by name. The
         // invited case has no membership row yet, so record one now that it has committed to the
         // work — otherwise it would claim the item and immediately lose sight of the room it is in.
@@ -1892,12 +1826,12 @@ export class DevTeamStore extends EventEmitter {
           assignment.task_id,
           `Resolve blocker: ${assignment.title}`,
           `Review the blocker reported for "${assignment.title}": ${message.trim()}. Re-scope the work, create a replacement assignment, or use devteam_stuck only if the entire task genuinely requires human input.`,
-          this.planningRoleFor(task.project_id),
+          PLANNING_ROLE,
           stamp,
         );
         this._event(assignment.task_id, agentId, "assignment.created", `Resolve blocker: ${assignment.title}`, {
           assignmentId: followUpAssignmentId,
-          role: this.planningRoleFor(task.project_id),
+          role: PLANNING_ROLE,
           requiresWrite: false,
           blockedAssignmentId: assignment.id,
         });
@@ -2003,8 +1937,8 @@ export class DevTeamStore extends EventEmitter {
     };
   }
 
-  // The error an agent hits when it tries to work around a block — filing a fresh assignment, a
-  // proposal, a continuation. A bare "Task is already blocked." is what sent one agent looking for a
+  // The error an agent hits when it tries to work around a block — filing a fresh assignment or a
+  // continuation. A bare "Task is already blocked." is what sent one agent looking for a
   // capability that exists, so the refusal names the one move that works instead.
   closedTaskError(task, action) {
     if (task.status !== "blocked") return `Task is already ${task.status}.`;
@@ -2043,7 +1977,6 @@ export class DevTeamStore extends EventEmitter {
     }
     const stamp = now();
     const assignmentId = randomUUID();
-    const planningRoleName = this.planningRoleFor(task.project_id);
     const routing = target
       ? ` This plan is addressed to ${target}: route the work it creates to ${target} unless the project state makes that impossible, and say so if it does.`
       : "";
@@ -2055,12 +1988,12 @@ export class DevTeamStore extends EventEmitter {
       this.db.prepare(`
         INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at, plans)
         VALUES (?, ?, 'Plan resumed task', ?, ?, 0, ?, 'queued', ?, 1)
-      `).run(assignmentId, taskId, `The human resumed this blocked task: ${cleanReason}. Inspect the current project state and create fresh implementation and review assignments; do not revive stale claims.${routing}`, planningRoleName, target, stamp);
+      `).run(assignmentId, taskId, `The human resumed this blocked task: ${cleanReason}. Inspect the current project state and create fresh implementation and review assignments; do not revive stale claims.${routing}`, PLANNING_ROLE, target, stamp);
       version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(taskId).version;
       this._event(taskId, null, "task.unblocked", `Human resumed the task: ${cleanReason}`, { reason: cleanReason, version, targetAgentName: target });
       this._event(taskId, null, "assignment.created", "Plan resumed task", {
         assignmentId,
-        role: planningRoleName,
+        role: PLANNING_ROLE,
         requiresWrite: false,
         targetAgentName: target,
         resumed: true,
@@ -2188,13 +2121,12 @@ export class DevTeamStore extends EventEmitter {
         this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(stamp, taskId);
       }
       const assignmentId = randomUUID();
-      const planningRoleName = this.planningRoleFor(task.project_id);
-      const title = `Plan follow-up: ${firstLine}`;
+        const title = `Plan follow-up: ${firstLine}`;
       this.db.prepare(`
         INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at, plans)
         VALUES (?, ?, ?, ?, ?, 0, NULL, 'queued', ?, 1)
-      `).run(assignmentId, taskId, title, `Plan the follow-up requested in chat: "${firstLine}". Split it into implementation and review work as needed.`, planningRoleName, stamp);
-      this._event(taskId, byAgentId, "assignment.created", title, { assignmentId, role: planningRoleName, requiresWrite: false, targetAgentName: null, continuesEvent: eventId });
+      `).run(assignmentId, taskId, title, `Plan the follow-up requested in chat: "${firstLine}". Split it into implementation and review work as needed.`, PLANNING_ROLE, stamp);
+      this._event(taskId, byAgentId, "assignment.created", title, { assignmentId, role: PLANNING_ROLE, requiresWrite: false, targetAgentName: null, continuesEvent: eventId });
       this._syncTaskStatus(taskId, stamp);
       const version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(taskId).version;
       result = { taskId, eventId, reopened, version, assignmentId };

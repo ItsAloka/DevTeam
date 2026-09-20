@@ -431,53 +431,6 @@
   line-height: 1.4;
 }
 
-/* Team proposals (role negotiation) */
-.proposal-list {
-  display: grid;
-  gap: 8px;
-}
-
-.proposal {
-  border: 1px solid color-mix(in srgb, var(--blue) 35%, var(--line));
-  background: color-mix(in srgb, var(--blue) 7%, transparent);
-  border-radius: 10px;
-  padding: 9px 10px;
-}
-
-.proposal-top {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.proposal-top strong {
-  font-size: 13px;
-  line-height: 1.35;
-}
-
-.proposal-top .role {
-  flex: 0 0 auto;
-  font: 10px ui-monospace, monospace;
-  color: var(--blue);
-  white-space: nowrap;
-}
-
-.proposal-meta {
-  margin: 5px 0 8px;
-  font-size: 11px;
-  color: #7f8996;
-}
-
-.vote-objection {
-  color: var(--red);
-}
-
-.proposal-actions {
-  display: flex;
-  gap: 6px;
-}
-
 .mini {
   border: 1px solid var(--line);
   background: #11161c;
@@ -487,30 +440,6 @@
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
-}
-
-.mini.agree:hover {
-  border-color: color-mix(in srgb, var(--green2) 55%, transparent);
-  background: color-mix(in srgb, var(--green2) 16%, transparent);
-  color: var(--green);
-}
-
-.mini.object:hover {
-  border-color: color-mix(in srgb, var(--red) 55%, transparent);
-  background: color-mix(in srgb, var(--red) 14%, transparent);
-  color: var(--red);
-}
-
-.system-event.proposal-adopted {
-  color: var(--green2);
-}
-
-.system-event.proposal-declined {
-  color: var(--red);
-}
-
-#role-fields.hidden {
-  display: none;
 }
 
 @media (hover: none) {
@@ -968,18 +897,7 @@
   font-size: 11px;
 }
 
-.proposal-section.attention .proposal {
-  animation: proposal-attention 0.45s ease-in-out 3;
-}
-
-@keyframes proposal-attention {
-  0%, 100% { transform: translateX(0); border-color: color-mix(in srgb, var(--blue) 35%, var(--line)); }
-  35% { transform: translateX(-4px); border-color: var(--blue); }
-  70% { transform: translateX(4px); border-color: var(--blue); }
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .proposal-section.attention .proposal { animation: none; border-color: var(--blue); }
 }
 
 @media (max-width: 720px) {
@@ -990,16 +908,6 @@
   #copy-task-invite { display: inline-flex; }
 }
 
-.proposal-human-vote {
-  color: var(--green2);
-  font-size: 11px;
-  font-weight: 600;
-}
-
-.proposal-actions button:disabled {
-  opacity: 0.5;
-  cursor: wait;
-}
 
 .task-header > div:first-of-type { min-width: 0; }
 

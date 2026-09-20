@@ -260,7 +260,7 @@ export const viewMethods = {
     });
     // The roles this project understands travel with the task, so the dashboard's assignment form
     // offers the project's own vocabulary rather than a hardcoded list of software job titles.
-    const roleCatalogue = this.roleCatalogue(task.project_id);
+    const roleCatalogue = this.roleCatalogue();
     const members = this.db.prepare(`
       SELECT m.role, ag.id AS agent_id, ag.name AS agent_name, ag.provider AS agent_provider, ag.status
       FROM task_members m JOIN agents ag ON ag.id = m.agent_id
@@ -294,7 +294,6 @@ export const viewMethods = {
     for (const event of events) {
       if (event.type === "human.message") event.receipts = receiptsByEvent.get(event.id) || [];
     }
-    const proposals = this.proposalsForTask(taskId);
     const blackboard = this.db.prepare("SELECT key, value, version, updated_by_name, updated_at FROM blackboard WHERE task_id = ? ORDER BY key ASC")
       .all(taskId).map((row) => ({ scope: "task", key: row.key, value: row.value, version: row.version, updatedBy: row.updated_by_name, updatedAt: row.updated_at }));
     const projectBlackboard = this.db.prepare("SELECT key, value, version, updated_by_name, updated_at FROM project_blackboard WHERE project_id = ? ORDER BY key ASC")
@@ -308,7 +307,7 @@ export const viewMethods = {
     `).all(task.project_id)) knowledgeLifecycle[row.status] = Number(row.count);
     const codeGraphState = this.codegraph.projectState(task.project_id);
     return {
-      ...task, assignments, approvals, events, proposals, blackboard, projectBlackboard, knowledge, members, roleCatalogue,
+      ...task, assignments, approvals, events, blackboard, projectBlackboard, knowledge, members, roleCatalogue,
       blockedRecovery: this.blockedRecovery(taskId),
       regressions: this.openRegressions(taskId), checkBaseline: this.checkBaseline(taskId),
       reliability: this.teamReliability(),
@@ -355,7 +354,6 @@ export const viewMethods = {
     assignmentKey = "currentAssignment",
     responseCore = {},
     pendingMessages = [],
-    pendingProposals = [],
   } = {}) {
     this.getAgent(agentId);
     this.assertMembership(agentId, taskId);
@@ -383,14 +381,6 @@ export const viewMethods = {
       target: clip(message.target, 200, "pendingMessageTargets"),
       broadcast: Boolean(message.broadcast),
       at: message.at,
-    }));
-    const boundedPendingProposals = (Array.isArray(pendingProposals) ? pendingProposals : []).slice(0, 20).map((proposal) => ({
-      id: proposal.id,
-      taskId: proposal.taskId,
-      kind: proposal.kind,
-      summary: clip(proposal.summary, 800, "pendingProposalSummaries"),
-      proposer: proposal.proposer ? clip(proposal.proposer, 200, "pendingProposalAuthors") : null,
-      details: proposal.details,
     }));
     const assignmentRows = this.db.prepare(`
       SELECT a.id, a.task_id, substr(a.title, 1, 1200) AS title,
@@ -515,20 +505,6 @@ export const viewMethods = {
       SELECT COUNT(*) AS count FROM knowledge_notes
       WHERE project_id = ? AND status IN ('verified', 'inferred')
     `).get(task.project_id)?.count || 0);
-    const openProposalTotal = Number(this.db.prepare("SELECT COUNT(*) AS count FROM proposals WHERE task_id = ? AND status = 'open'").get(taskId).count);
-    const pendingProposalIds = new Set(boundedPendingProposals.filter((proposal) => proposal.taskId === taskId).map((proposal) => proposal.id));
-    const openProposals = this.db.prepare(`
-      SELECT id, kind, substr(summary, 1, 1600) AS summary FROM proposals
-      WHERE task_id = ? AND status = 'open' ORDER BY created_at ASC LIMIT 30
-    `).all(taskId).filter((proposal) => !pendingProposalIds.has(proposal.id)).map((proposal) => ({
-      id: proposal.id,
-      kind: proposal.kind,
-      summary: clip(proposal.summary, 800, "proposalSummaries"),
-      votes: this.db.prepare(`
-        SELECT voter_name, vote, substr(comment, 1, 600) AS comment, created_at
-        FROM proposal_votes WHERE proposal_id = ? ORDER BY created_at ASC LIMIT 20
-      `).all(proposal.id).map((vote) => ({ ...vote, comment: vote.comment ? clip(vote.comment, 300, "proposalVoteComments") : null })),
-    }));
     const recentTypes = ["human.message", "agent.decision", "agent.finding", "task.blocked", "task.unblocked", "task.accepted"];
     const typePlaceholders = recentTypes.map(() => "?").join(", ");
     const recentTotal = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM events WHERE task_id = ? AND type IN (${typePlaceholders})`).get(taskId, ...recentTypes).count);
@@ -626,8 +602,6 @@ export const viewMethods = {
         { key: "projectKnowledge", group: "knowledge", items: projectKnowledge, totalCount: knowledgeTotal, maxItems: 12, maxBytes: DEFAULT_BRIEF_BUDGET.knowledgeBytes },
         { key: "codeContext", group: "codeContext", items: codeContext || [], emptyValue: this.codegraph.enabled ? [] : null, totalCount: codeContext?.length || 0, maxItems: 30, maxBytes: DEFAULT_BRIEF_BUDGET.codeContextBytes },
         { key: "pendingMessages", group: "activity", items: boundedPendingMessages, totalCount: Array.isArray(pendingMessages) ? pendingMessages.length : 0, maxItems: 20, maxBytes: DEFAULT_BRIEF_BUDGET.activityBytes },
-        { key: "pendingProposals", group: "activity", items: boundedPendingProposals, totalCount: Array.isArray(pendingProposals) ? pendingProposals.length : 0, maxItems: 10, maxBytes: DEFAULT_BRIEF_BUDGET.activityBytes },
-        { key: "openProposals", group: "activity", items: openProposals, totalCount: Math.max(0, openProposalTotal - pendingProposalIds.size), maxItems: 10, maxBytes: DEFAULT_BRIEF_BUDGET.activityBytes },
         { key: "recent", group: "activity", items: recent, totalCount: recentTotal, maxItems: 12, maxBytes: DEFAULT_BRIEF_BUDGET.activityBytes },
         { key: "unresolvedQuestions", group: "activity", items: unresolvedQuestions, totalCount: unresolvedTotal, maxItems: 10, maxBytes: DEFAULT_BRIEF_BUDGET.activityBytes },
       ],

@@ -116,7 +116,7 @@ export function timelineCategory(event = {}) {
   const type = String(event.type || "");
   if (type === "human.message" || type === "agent.message" || type === "agent.question") return "chat";
   if (type === "agent.finding" || type.includes("blocked") || type.includes("failed")) return "findings";
-  if (type === "agent.decision" || type.startsWith("proposal.")) return "decisions";
+  if (type === "agent.decision") return "decisions";
   if (type === "agent.progress" || type === "agent.report" || type.startsWith("assignment.")) return "work";
   return "system";
 }

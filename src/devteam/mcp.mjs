@@ -40,26 +40,20 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   // instead of only when it next goes idle.
   const takeInbox = (agentId) => {
     let pendingMessages = [];
-    let pendingProposals = [];
     try { pendingMessages = store.deliverDirectedMessages(agentId); } catch { pendingMessages = []; }
-    // Surface open proposals the same way, so a *busy* agent (not sitting in devteam_next) is asked to
-    // vote on any call it makes instead of a unanimity decision silently stalling until it next goes
-    // idle. Only proposals in its rooms that it has not yet voted on are returned.
-    try { pendingProposals = store.openProposalsForAgent(store.getAgent(agentId)); } catch { pendingProposals = []; }
-    return { pendingMessages, pendingProposals };
+    return { pendingMessages };
   };
   const withInbox = (agentId, result) => {
-    const { pendingMessages, pendingProposals } = takeInbox(agentId);
+    const { pendingMessages } = takeInbox(agentId);
     // Human steering rides along on whatever call the agent just made, for the same reason messages
     // do: an agent deep in a long edit is not sitting in devteam_next, and "stop, this is no longer
     // worth doing" is worthless if it only arrives when the agent next goes idle.
     let steering = null;
     try { steering = store.steeringFor(agentId); } catch { steering = null; }
-    if (!pendingMessages.length && !pendingProposals.length && !steering) return result;
+    if (!pendingMessages.length && !steering) return result;
     return {
       ...result,
       ...(pendingMessages.length ? { pendingMessages } : {}),
-      ...(pendingProposals.length ? { pendingProposals } : {}),
       ...(steering ? { steering } : {}),
     };
   };
@@ -102,7 +96,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       const task = store.getTask(taskId);
       return withInbox(agentId, {
         ...joined,
-        roles: task ? store.roleCatalogue(task.project_id) : null,
+        roles: task ? store.roleCatalogue() : null,
       });
     }
     if (!name || !provider) throw new Error("A first arrival needs name and provider.");
@@ -116,7 +110,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       connected: true,
       agent: agentInfo,
       room,
-      ...(task ? { roles: store.roleCatalogue(task.project_id) } : {}),
+      ...(task ? { roles: store.roleCatalogue() } : {}),
       ...(roomRequired ? { roomRequired: true, availableTasks: roomStatus.activeTasks } : {}),
       resumeToken: token,
       next: roomRequired
@@ -148,8 +142,8 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       requireIdentity(agentId);
       store.heartbeat(agentId);
       if (!taskId) throw new Error("want=brief needs taskId.");
-      const { pendingMessages, pendingProposals } = takeInbox(agentId);
-      return store.taskBrief(agentId, taskId, { pendingMessages, pendingProposals });
+      const { pendingMessages } = takeInbox(agentId);
+      return store.taskBrief(agentId, taskId, { pendingMessages });
     }
     if (want === "module") {
       requireIdentity(agentId);
@@ -184,15 +178,6 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
           messages,
           keepWaiting: true,
           next: "Read these messages. If a reply or acknowledgement is expected, post it with devteam_message, then call devteam_next again to stay responsive to the team.",
-        };
-      }
-      const proposals = store.openProposalsForAgent(store.getAgent(agentId));
-      if (proposals.length) {
-        return {
-          status: "proposal",
-          proposals,
-          keepWaiting: true,
-          next: "The team is deciding how to organise. Review each proposal and vote with devteam_verdict (agree or object, with a short reason). A proposal is adopted only when every connected teammate agrees.",
         };
       }
       const assignment = store.claimNextAssignment(agentId);
@@ -253,18 +238,16 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     return withInbox(agentId, store.postMessage({ agentId, taskId, message, type: `agent.${kind}`, metadata }));
   }));
 
-  // Putting work on the board, whether you are creating it outright or asking the team to agree
-  // first. Both are the same act from the reader's side — something new is proposed for the queue —
-  // and keeping them apart mostly meant an agent picked whichever schema it found first.
+  // Putting work on the board.
   server.registerTool("devteam_plan", {
     title: "Put work on the board",
-    description: "Create a bounded assignment for whoever can take it. Order is the only scheduling vocabulary you need: leave dependsOn empty and it can start now, in parallel with anything else that is ready; name earlier assignments and it waits for them. Declare `paths` for write work so non-overlapping writers run at the same time instead of queueing behind one lease. Roles carry a checklist automatically where they verify. Set agree=true instead to put the plan to the team as a proposal rather than creating it outright — use that for how the team organises itself (who takes which role, moving an assignment to someone else, recording a shared decision), and it takes effect only when every connected teammate agrees.",
+    description: "Create a bounded assignment for whoever can take it. There are three roles and work moves through them in one direction: planner → implementer → reviewer. Order is the only other scheduling vocabulary you need: leave dependsOn empty and it can start now, in parallel with anything else that is ready; name earlier assignments and it waits for them. Declare `paths` for write work so non-overlapping writers run at the same time instead of queueing behind one lease. A reviewer assignment carries a checklist automatically.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
-      title: z.string().min(1).max(160).optional().describe("Assignment title; also the proposal's one-line summary when agree=true"),
+      title: z.string().min(1).max(160).optional().describe("Assignment title"),
       description: z.string().max(12000).optional(),
-      role: z.string().min(1).max(40).default("implementer").describe("A role this project defines — it may use its own vocabulary (analyst, fact-checker, structural-engineer) rather than software job titles; devteam_join returns the list. A role that verifies makes this a review assignment to the scheduler, and DevTeam will not hand it to whoever wrote the version under review."),
+      role: z.enum(["planner", "implementer", "reviewer"]).default("implementer").describe("planner decides what the team does next (and researches whatever it needs to decide); implementer produces the work and exercises it; reviewer reads someone else's finished work and judges it. A reviewer assignment is never handed to whoever wrote the version under review. Security work is a reviewer assignment with the security domain selected."),
       requiresWrite: z.boolean().default(false),
       targetAgentName: z.string().max(80).optional().describe("Address it to one teammate by name; it returns to the general queue if nobody by that name is connected"),
       reviewSubjectAssignmentId: z.string().uuid().optional().describe("For a verifying assignment: the same-task assignment being reviewed. This keeps its author ineligible even after unrelated later edits."),
@@ -272,29 +255,10 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       paths: z.array(z.string().max(500)).max(50).optional().describe("For write work: the paths this will modify (e.g. src/ocean/**). Declaring them lets non-overlapping writers run in parallel; omit for an exclusive whole-project lease."),
       dependsOn: z.array(z.string().uuid()).max(50).optional().describe("Same-task assignment IDs that must finish first. Empty means it can run now."),
       domains: z.array(z.string().max(30)).max(20).optional().describe(`The domains this work belongs to, which choose which of the owner's checklists (checklists/<domain>.md) verifying roles are handed. A domain exists only if the owner wrote its file; right now: ${store.domainNames().join(", ") || "none — the owner has written no checklists"}. An unknown name is refused with the current list. Omit to inherit the task's domains; an empty array means none.`),
-      agree: z.boolean().default(false).describe("Put this to the team as a proposal instead of creating it"),
-      kind: z.enum(["role", "handoff", "plan", "decision"]).default("role").describe("agree=true only: role asks that an agent take a role, handoff moves an existing assignment, plan/decision records a shared decision"),
-      assignmentId: z.string().uuid().optional().describe("agree=true with kind=handoff: the assignment to move"),
-      quorum: z.number().min(0).max(1).optional().describe("agree=true only: adoption threshold over the voters present when proposed. 1 (default) is unanimity, 0.5 a simple majority."),
     },
   }, safe(async (args) => {
     const { agentId, taskId, title, description, role, requiresWrite, targetAgentName } = args;
     requireIdentity(agentId);
-    if (args.agree) {
-      if (!title) throw new Error("agree=true needs a title: it is the one line the team votes on.");
-      const proposal = store.createProposal({
-        agentId, taskId, kind: args.kind, summary: title,
-        details: {
-          role, targetAgentName, description, requiresWrite,
-          assignmentId: args.assignmentId, quorum: args.quorum,
-        },
-      });
-      return withInbox(agentId, {
-        proposed: true,
-        proposal,
-        next: "Teammates see this on their next devteam_next and answer with devteam_verdict (agree/object). It takes effect once they all agree.",
-      });
-    }
     if (!title || !description) throw new Error("An assignment needs a title and a description.");
     const created = store.createAssignment({
       agentId, taskId, title, description, role, requiresWrite, targetAgentName,
@@ -390,10 +354,10 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_verdict", {
     title: "Pass judgement on someone else's work",
-    description: "Your verdict on work you reviewed. verdict=approve accepts the current task version — only after you completed an independent read-only reviewer or tester assignment on it, and never on a version you wrote yourself; DevTeam will not hand you that review in the first place. verdict=changes sends one assignment back to whoever wrote it with your findings attached, keeping its title, checklist, write scope and history; the author is handed your findings when it re-claims, approvals on the version are cleared, and nobody else's claim is touched. Sending work back is a normal outcome, not a failure — approving work you have doubts about is the failure. verdict=agree and verdict=object answer an open team proposal instead; when every connected teammate agrees it is adopted and its effect applied.",
+    description: "Your verdict on work you reviewed. verdict=approve accepts the current task version — only after you completed an independent read-only reviewer assignment on it, and never on a version you wrote yourself; DevTeam will not hand you that review in the first place. verdict=changes sends one assignment back to whoever wrote it with your findings attached, keeping its title, checklist, write scope and history; the author is handed your findings when it re-claims, approvals on the version are cleared, and nobody else's claim is touched. Sending work back is a normal outcome, not a failure — approving work you have doubts about is the failure.",
     inputSchema: {
       agentId: z.string().uuid(),
-      verdict: z.enum(["approve", "changes", "agree", "object"]),
+      verdict: z.enum(["approve", "changes"]),
       taskId: z.string().uuid().optional().describe("approve/changes"),
       summary: z.string().max(8000).optional().describe("approve: what you checked and found. changes: one line on why this is going back."),
       assignmentId: z.string().uuid().optional().describe("changes: the completed assignment that needs work — the author's, not your own review assignment"),
@@ -406,16 +370,10 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
           section: z.string().max(40).optional().describe("The section the rule would belong under, e.g. Security, Testing, Data, Performance, UX"),
         }),
       ])).max(50).default([]).describe("changes: the specific changes required. The author is handed this list on re-claim, so be concrete — and DevTeam reads them across tasks to notice conventions this project keeps having to state."),
-      proposalId: z.string().uuid().optional().describe("agree/object"),
-      comment: z.string().max(2000).optional().describe("agree/object"),
     },
   }, safe(async (args) => {
-    const { agentId, verdict, taskId, summary, assignmentId, findings, proposalId, comment } = args;
+    const { agentId, verdict, taskId, summary, assignmentId, findings } = args;
     requireIdentity(agentId);
-    if (verdict === "agree" || verdict === "object") {
-      if (!proposalId) throw new Error(`verdict=${verdict} needs proposalId.`);
-      return withInbox(agentId, store.voteProposal({ agentId, proposalId, vote: verdict, comment }));
-    }
     if (!taskId) throw new Error(`verdict=${verdict} needs taskId.`);
     if (!summary) throw new Error(`verdict=${verdict} needs a summary saying why.`);
     if (verdict === "approve") return withInbox(agentId, store.approveTask({ agentId, taskId, summary }));

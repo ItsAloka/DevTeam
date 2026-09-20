@@ -262,15 +262,10 @@ export async function startDevTeamServer({
     if (typeof req.body?.title === "string") patch.title = req.body.title;
     if (typeof req.body?.description === "string") patch.description = req.body.description;
     if (req.body?.requiredApprovals !== undefined) patch.requiredApprovals = Number(req.body.requiredApprovals);
-    if (typeof req.body?.sessionPolicy === "string") patch.sessionPolicy = req.body.sessionPolicy;
     // Validated by the store against the fixed domain list; a bad value is a 400 like any other.
     if (req.body?.domains !== undefined) patch.domains = req.body.domains;
-    if (!Object.keys(patch).length) throw new Error("Provide task details or a session policy to update.");
+    if (!Object.keys(patch).length) throw new Error("Provide task details to update.");
     res.json(store.updateTask(req.params.taskId, patch));
-  });
-  app.patch("/api/tasks/:taskId/session-policy", (req, res) => {
-    requireFields(req.body, ["sessionPolicy"]);
-    res.json(store.updateTask(req.params.taskId, { sessionPolicy: req.body.sessionPolicy }));
   });
   app.delete("/api/tasks/:taskId", (req, res) => {
     requireFields(req.body, ["confirmTaskId"]);
@@ -390,21 +385,6 @@ export async function startDevTeamServer({
     requireFields(req.body, ["confirmTitle"]);
     res.json(store.forceReleaseAssignment({ assignmentId: req.params.assignmentId, confirmTitle: req.body.confirmTitle }));
   });
-  app.post("/api/tasks/:taskId/proposals", (req, res) => {
-    requireFields(req.body, ["summary"]);
-    res.status(201).json(store.createProposal({
-      agentId: null,
-      taskId: req.params.taskId,
-      kind: req.body.kind || "decision",
-      summary: req.body.summary,
-      details: req.body.details || {},
-    }));
-  });
-  app.post("/api/proposals/:proposalId/vote", (req, res) => {
-    requireFields(req.body, ["vote"]);
-    res.json(store.voteProposal({ agentId: null, proposalId: req.params.proposalId, vote: req.body.vote, comment: req.body.comment }));
-  });
-
   app.get("/api/stream", (req, res) => {
     res.set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
     res.flushHeaders();

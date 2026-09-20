@@ -270,7 +270,7 @@ export const agentMethods = {
   },
 
   // The task rooms an agent may *claim work in*: the rooms it joined as a contributor. Observers
-  // are members (they see chatter and proposals) but never claim, so they are excluded here.
+  // are members (they see the room's chatter) but never claim, so they are excluded here.
   _claimableTaskIds(agentId) {
     return this.db.prepare("SELECT task_id, role FROM task_members WHERE agent_id = ?")
       .all(agentId).filter((row) => row.role !== "observer").map((row) => row.task_id);
@@ -412,8 +412,8 @@ export const agentMethods = {
   },
 
   // Remove an agent row entirely: release any live claim it still holds, detach the historical
-  // references the schema would otherwise pin (events, completed assignments, and proposals it
-  // raised are nullable with no cascade), then delete it — approvals, message receipts, and room
+  // references the schema would otherwise pin (events and completed assignments are nullable with
+  // no cascade), then delete it — approvals, message receipts, and room
   // memberships cascade away. Runs inside the caller's transaction and returns the task ids whose
   // open work changed, so the caller can emit the right change signals.
   _purgeAgent(agentId) {
@@ -441,7 +441,6 @@ export const agentMethods = {
       WHERE agent_id = ?
     `).run(agentId, agentId);
     this.db.prepare("UPDATE events SET agent_id = NULL WHERE agent_id = ?").run(agentId);
-    this.db.prepare("UPDATE proposals SET proposer_id = NULL WHERE proposer_id = ?").run(agentId);
     this.db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
     return claimedTaskIds;
   },

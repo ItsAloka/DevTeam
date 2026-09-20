@@ -94,11 +94,6 @@
       <div id="reconnect-list" class="reconnect-list"></div>
       <div id="room-members" class="room-members hidden"></div>
       <div class="divider"></div>
-      <div id="proposal-section" class="proposal-section hidden">
-        <div class="panel-title"><h3>Proposals</h3><button class="icon-button" id="new-proposal" data-dialog="proposal-dialog" aria-label="Propose a role or decision to the team" title="Propose a role or decision to the team">＋</button></div>
-        <div id="proposal-list" class="proposal-list" aria-live="polite"></div>
-        <div class="divider"></div>
-      </div>
       <div class="panel-title"><h3>Work queue</h3><span id="assignment-count" class="count">0</span></div>
       <div id="regressions" class="regressions hidden"></div>
       <div id="assignment-list" class="assignment-list"></div>
@@ -158,7 +153,6 @@
       <label>Task title<input name="title" maxlength="120" placeholder="Add password reset flow" required></label>
       <label>What should the team deliver?<textarea name="description" rows="5" placeholder="Describe the outcome, constraints, and definition of done…" required></textarea></label>
       <label>Independent approvals<select name="requiredApprovals"><option value="2">2 reviewers (recommended)</option><option value="1">1 reviewer</option><option value="3">3 reviewers</option></select></label>
-      <label>Session policy<select name="sessionPolicy"><option value="per_task" selected>Fresh session per task (recommended)</option><option value="adaptive">Adaptive</option><option value="manual">Manual</option><option value="per_assignment">Per assignment (experimental)</option></select></label>
       <fieldset class="domain-picker" data-domain-picker><legend>Domains <span class="hint">optional · one per file in checklists/ · add a domain by writing its .md</span></legend></fieldset>
       <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Start task</button></div>
     </form>
@@ -204,7 +198,6 @@
       <label>Task title<input name="title" maxlength="120" required></label>
       <label>What should the team deliver?<textarea name="description" rows="5" required></textarea></label>
       <label>Independent approvals<select name="requiredApprovals"><option value="1">1 reviewer</option><option value="2">2 reviewers</option><option value="3">3 reviewers</option></select></label>
-      <label>Session policy<select name="sessionPolicy"><option value="per_task">Fresh session per task</option><option value="adaptive">Adaptive</option><option value="manual">Manual</option><option value="per_assignment">Per assignment (experimental)</option></select></label>
       <fieldset class="domain-picker" data-domain-picker><legend>Domains <span class="hint">changes apply to work planned from now on</span></legend></fieldset>
       <p class="hint">Editing the brief does not reset the version, existing approvals, or work already done — it just updates the task's information.</p>
       <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Save changes</button></div>
@@ -221,21 +214,6 @@
     </form>
   </dialog>
 
-  <dialog id="proposal-dialog">
-    <form id="proposal-form" method="dialog">
-      <div class="dialog-head"><div><span class="eyebrow">TEAM DECISION</span><h2>Propose to the team</h2></div><button type="button" class="close">×</button></div>
-      <label>Type<select name="kind" id="proposal-kind"><option value="role">Assign a role</option><option value="decision">Record a decision</option></select></label>
-      <label>Summary (what the team votes on)<input name="summary" maxlength="200" placeholder="Codex takes the security-reviewer role" required></label>
-      <div id="role-fields">
-        <label>Role<select name="role" id="proposal-role"></select></label>
-        <label>For agent<select name="targetAgentName" id="proposal-agent"><option value="">Anyone available</option></select></label>
-        <p class="hint role-agent-hint">One connected agent can take different roles in sequence. A review by the same agent is self-review, not independent consensus.</p>
-        <label>What should they do?<textarea name="description" rows="3" placeholder="Describe the work for this role…"></textarea></label>
-      </div>
-      <p class="hint">Agents vote on their next check. Adopted only when every connected teammate agrees; a role proposal creates the assignment automatically.</p>
-      <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Send proposal</button></div>
-    </form>
-  </dialog>
 
 
 

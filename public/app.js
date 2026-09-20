@@ -76,8 +76,6 @@ let eventLookup = new Map();
 let replyTo = null;
 let refreshGeneration = 0;
 let pendingAttachments = [];
-let proposalTaskId = null;
-let proposalStatuses = new Map();
 let renderedTaskId = null;
 let messageSending = false;
 let timelineFilter = "all";
@@ -261,7 +259,7 @@ function deliveryLine(event) {
   return `<div class="delivery"><span class="delivery-dot delivered"></span>To ${escapeHtml(target)} · delivered to ${names(receipts)}</div>`;
 }
 
-const SYSTEM_EVENTS = ["task.created", "assignment.created", "task.accepted", "assignment.reassigned", "proposal.created", "proposal.adopted", "proposal.declined"];
+const SYSTEM_EVENTS = ["task.created", "assignment.created", "task.accepted", "assignment.reassigned"];
 
 // Authorship comes from the event's own recorded author, not from its nullable agent_id: purging an
 // agent from the roster clears that foreign key, which used to reattribute every message it ever
@@ -291,9 +289,8 @@ function checkChips(metadata) {
 }
 
 function renderEvent(event) {
-  if (event.type === "proposal.vote") return "";
   if (SYSTEM_EVENTS.includes(event.type)) {
-    const icon = event.type === "proposal.adopted" ? "✓ " : event.type === "proposal.declined" ? "✕ " : event.type.startsWith("proposal") ? "⇄ " : "";
+    const icon = "";
     return `<div id="event-${event.id}" class="system-event ${event.type.replace(".", "-")}">${icon}${escapeHtml(event.message)} <span class="provider">· ${time(event.created_at)}</span></div>`;
   }
   const human = eventIsHuman(event);
@@ -407,12 +404,12 @@ function renderBlockedBanner(task) {
 
 function renderTask(task) {
   const taskChanged = renderedTaskId !== task.id;
+  document.title = `DevTeam — ${task.title}`;
   $("#project-name").textContent = task.project_name;
-  $("#task-status").textContent = `${task.status} · ${(task.session_policy || "manual").replace("_", " ")}`;
+  $("#task-status").textContent = task.status;
   $("#task-title").textContent = task.title;
   renderTaskDescription(task.description);
   $("#task-version").textContent = `v${task.version}`;
-  $("#copy-task-invite").textContent = task.session_policy === "manual" ? "Invite agent" : "Fresh-session invite";
   const eventList = $("#event-list");
   const nearBottom = eventList.scrollHeight - eventList.scrollTop - eventList.clientHeight < 220;
   renderedTaskId = task.id;
@@ -422,7 +419,6 @@ function renderTask(task) {
   renderTimeline(task, { taskChanged, wasNearBottom: nearBottom });
   if (taskChanged) restoreMessageDraft(task.id);
   renderMembers(task);
-  renderProposals(task);
   const openAssignments = task.assignments.filter((item) => ["queued", "claimed"].includes(item.status)).length;
   $("#assignment-count").textContent = openAssignments;
   $("#assignment-list").innerHTML = task.assignments.slice().reverse().slice(0, 8).map((item) => {
@@ -465,7 +461,6 @@ function renderTask(task) {
     return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write && leaseIsLive ? " · write lease" : ""}</p>${rework}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${sendBack}${release}</div></div>`;
   }).join("") || `<p class="hint">Waiting for the plan</p>`;
   renderRegressions(task);
-  renderRoleOptions($("#proposal-role"), task.roleCatalogue);
   renderBlackboard(task);
   const approvals = task.approvals.length;
   $("#approval-label").textContent = `${approvals} / ${task.required_approvals}`;
@@ -624,62 +619,8 @@ function renderAgents() {
   renderAgentList();
   const connected = state.agents.filter((agent) => agent.status !== "disconnected");
   populateMessageTargets(connected);
-  populateProposalAgents(connected);
 }
 
-// Team role negotiation: show open proposals with live vote tallies and let the human weigh in.
-function renderProposals(task) {
-  const section = $("#proposal-section");
-  const active = !["accepted", "blocked", "cancelled"].includes(task.status);
-  section.classList.toggle("hidden", !active);
-  if (!active) {
-    document.title = `DevTeam — ${task.title}`;
-    proposalTaskId = task.id;
-    proposalStatuses = new Map((task.proposals || []).map((proposal) => [proposal.id, proposal.status]));
-    return;
-  }
-  const open = (task.proposals || []).filter((proposal) => proposal.status === "open");
-  const sameTask = proposalTaskId === task.id;
-  const newlyOpen = sameTask ? open.filter((proposal) => !proposalStatuses.has(proposal.id)) : [];
-  const newlyAdopted = sameTask ? (task.proposals || []).filter((proposal) => proposal.status === "adopted" && proposalStatuses.get(proposal.id) === "open") : [];
-  proposalTaskId = task.id;
-  proposalStatuses = new Map((task.proposals || []).map((proposal) => [proposal.id, proposal.status]));
-  const connectedNames = state.agents.filter((agent) => agent.status !== "disconnected").map((agent) => agent.name);
-  $("#proposal-list").innerHTML = open.length
-    ? open.map((proposal) => renderProposal(proposal, connectedNames)).join("")
-    : `<p class="hint">No open proposals. Use ＋ to propose a role or decision.</p>`;
-  document.title = open.length ? `(${open.length}) DevTeam — ${task.title}` : `DevTeam — ${task.title}`;
-  if (newlyOpen.length) {
-    section.classList.add("attention");
-    navigator.vibrate?.([90, 45, 90]);
-    toast(`${newlyOpen.length} new proposal${newlyOpen.length === 1 ? "" : "s"} needs attention`);
-    setTimeout(() => section.classList.remove("attention"), 1800);
-  }
-  if (newlyAdopted.length) {
-    navigator.vibrate?.(70);
-    toast(`Accepted: ${newlyAdopted[0].summary}`);
-  }
-}
-
-function renderProposal(proposal, connectedNames) {
-  const agreers = proposal.votes.filter((vote) => vote.vote === "agree").map((vote) => vote.voter_name);
-  const objectors = proposal.votes.filter((vote) => vote.vote === "object");
-  // A dashboard-created proposal historically stored the human proposer's implicit agreement as
-  // voter_id=human. That is not an explicit button vote, so keep actions available for those legacy
-  // rows; agent-created proposals may still show the human's explicit pending vote.
-  const humanVote = proposal.proposer_id ? proposal.votes.find((vote) => vote.voter_id === "human") : null;
-  const stillNeeded = connectedNames.filter((name) => name !== proposal.proposer_name && !agreers.includes(name));
-  const tally = objectors.length
-    ? `<span class="vote-objection">objected: ${escapeHtml(objectors[0].voter_name)}</span>`
-    : `${agreers.length} agreed${stillNeeded.length ? ` · waiting on ${escapeHtml(stillNeeded.join(", "))}` : " · ready"}`;
-  const label = proposal.kind === "role" && proposal.details.role
-    ? `${escapeHtml(proposal.details.role)}${proposal.details.targetAgentName ? ` → ${escapeHtml(proposal.details.targetAgentName)}` : ""}`
-    : escapeHtml(proposal.kind);
-  const actions = humanVote
-    ? `<div class="proposal-human-vote">Your vote: ${humanVote.vote === "agree" ? "Agree" : "Object"} · waiting for resolution</div>`
-    : `<div class="proposal-actions"><button class="mini agree" data-vote-proposal="${proposal.id}" data-vote="agree">Agree</button><button class="mini object" data-vote-proposal="${proposal.id}" data-vote="object">Object</button></div>`;
-  return `<div class="proposal"><div class="proposal-top"><strong>${escapeHtml(proposal.summary)}</strong><span class="role">${label}</span></div><div class="proposal-meta">from ${escapeHtml(proposal.proposer_name)} · ${tally}</div>${actions}</div>`;
-}
 
 // Presence + unread badges + re-ping list. Split out so a lightweight timer can
 // refresh relative "last seen" times without disturbing the message composer.
@@ -720,8 +661,7 @@ function renderReconnectList() {
 function agentInvite(name = "your agent") {
   const task = state?.selectedTask;
   if (!task) return "Use $devteam to join the local DevTeam.";
-  const fresh = task.session_policy === "manual" ? "" : " Open a fresh desktop conversation for this task using host-advertised runtime settings; related assignments normally stay in that session.";
-  return `Use $devteam as ${name} and join task "${task.title}" with taskId ${task.id}.${fresh} If this is the same returning conversation, resume the prior DevTeam session so missed messages replay before claiming work.`;
+  return `Use $devteam as ${name} and join task "${task.title}" with taskId ${task.id}. If this is the same returning conversation, resume the prior DevTeam session so missed messages replay before claiming work.`;
 }
 
 function addAttachments(files) {
@@ -773,16 +713,6 @@ function populateMessageTargets(connected) {
     : "No agents connected yet — they will read this in the timeline when they join.";
 }
 
-function populateProposalAgents(connected) {
-  const select = $("#proposal-agent");
-  if (!select) return;
-  const previous = select.value;
-  const unique = [...new Map(connected.map((agent) => [agent.name, agent])).values()];
-  select.innerHTML = [`<option value="">Anyone available</option>`]
-    .concat(unique.map((agent) => `<option value="${escapeHtml(agent.name)}">${escapeHtml(agent.name)} · ${escapeHtml(agent.provider)}</option>`))
-    .join("");
-  select.value = unique.some((agent) => agent.name === previous) ? previous : "";
-}
 
 document.addEventListener("click", async (event) => {
   const retrySend = event.target.closest("[data-retry-send]");
@@ -908,14 +838,6 @@ document.addEventListener("click", async (event) => {
     } catch (error) { toast(error.message); }
     return;
   }
-  const voteButton = event.target.closest("[data-vote-proposal]");
-  if (voteButton) {
-    const actions = voteButton.closest(".proposal-actions");
-    for (const button of actions.querySelectorAll("button")) button.disabled = true;
-    try { await api(`/api/proposals/${voteButton.dataset.voteProposal}/vote`, { method: "POST", body: JSON.stringify({ vote: voteButton.dataset.vote }) }); await refresh(); }
-    catch (error) { for (const button of actions.querySelectorAll("button")) button.disabled = false; toast(error.message); }
-    return;
-  }
   const reconnectButton = event.target.closest("[data-reconnect]");
   if (reconnectButton) {
     const name = reconnectButton.dataset.reconnect;
@@ -1025,7 +947,6 @@ function openTaskEditor() {
   form.elements.title.value = task.title;
   form.elements.description.value = task.description;
   form.elements.requiredApprovals.value = String(task.required_approvals);
-  form.elements.sessionPolicy.value = task.session_policy || "manual";
   const selected = new Set(taskDomains(task));
   for (const box of form.querySelectorAll('input[name="domains"]')) box.checked = selected.has(box.value);
   $("#task-edit-dialog").showModal();
@@ -1045,7 +966,7 @@ $("#task-edit-form").addEventListener("submit", async (event) => {
   const formData = new FormData(form);
   const values = Object.fromEntries(formData);
   try {
-    await api(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify({ title: values.title, description: values.description, requiredApprovals: Number(values.requiredApprovals), sessionPolicy: values.sessionPolicy, domains: formData.getAll("domains") }) });
+    await api(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify({ title: values.title, description: values.description, requiredApprovals: Number(values.requiredApprovals), domains: formData.getAll("domains") }) });
     form.closest("dialog").close(); await refresh(); toast("Task updated");
   } catch (error) { toast(error.message); }
 });
@@ -1154,26 +1075,6 @@ for (const type of ["dragleave", "drop"]) {
     if (type === "drop") addAttachments(event.dataTransfer?.files || []);
   });
 }
-
-$("#proposal-kind").addEventListener("change", (event) => {
-  $("#role-fields").classList.toggle("hidden", event.target.value !== "role");
-});
-
-$("#proposal-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  if (!selectedTaskId) return;
-  const values = Object.fromEntries(new FormData(event.target));
-  const body = { kind: values.kind, summary: values.summary };
-  if (values.kind === "role") {
-    body.details = { role: values.role };
-    if (values.targetAgentName) body.details.targetAgentName = values.targetAgentName;
-    if (values.description) body.details.description = values.description;
-  }
-  try {
-    await api(`/api/tasks/${selectedTaskId}/proposals`, { method: "POST", body: JSON.stringify(body) });
-    event.target.reset(); $("#role-fields").classList.remove("hidden"); event.target.closest("dialog").close(); await refresh(); toast("Proposal sent to the team");
-  } catch (error) { toast(error.message); }
-});
 
 $("#accept-task").addEventListener("click", async () => {
   if (!confirm("Accept this task without full agent consensus?\n\nThis overrides the normal independent-review requirement. The task will be marked as human-accepted.")) return;

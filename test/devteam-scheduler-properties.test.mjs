@@ -36,8 +36,11 @@ const DRAIN_STEPS = 600;
 // is not here. This is the F9 case: it must fall back to the general queue, not sit unclaimable.
 const DEPARTED = "AgentWhoLeft";
 
-const WRITER_ROLES = ["implementer", "architect", "planner"];
-const VERIFIER_ROLES = ["reviewer", "security-reviewer", "tester"];
+// There are three roles now, and only `reviewer` verifies. The generator used to draw from a wider
+// vocabulary (architect, security-reviewer, tester) that normalizes onto these three, which meant
+// the graph and the invariants disagreed about which items were verifiers.
+const WRITER_ROLES = ["implementer", "planner"];
+const VERIFIER_ROLES = ["reviewer"];
 const SCOPES = [null, ["src"], ["src/devteam"], ["src/devteam/store.mjs"], ["test"], ["public", "docs"], ["src", "test"]];
 
 function mulberry32(seed) {
@@ -192,7 +195,7 @@ function assertClaimWasLegal(store, claim, agent, context) {
       SELECT pending.title FROM assignments pending
       WHERE pending.task_id = ? AND pending.id != ?
         AND pending.requires_write = 1 AND pending.status IN ('queued', 'claimed')
-        AND lower(pending.role) NOT IN ('reviewer', 'security-reviewer', 'tester')
+        AND lower(pending.role) NOT IN ('reviewer')
         AND NOT EXISTS (
           SELECT 1 FROM assignment_dependencies link
           JOIN assignments dependency ON dependency.id = link.depends_on_assignment_id

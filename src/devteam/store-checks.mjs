@@ -179,7 +179,7 @@ export const checksMethods = {
       const soleSuspect = regression.suspects.length === 1 ? regression.suspects[0] : null;
       if (!existing && regression.suspects.length) {
         fixAssignmentId = randomUUID();
-        const behaviour = this.roleBehaviour(projectId, "implementer");
+        const behaviour = this.roleBehaviour("implementer");
         const suspectSummary = soleSuspect
           ? `“${soleSuspect.title}”${soleSuspect.author ? ` (${soleSuspect.author})` : ""}`
           : `${regression.suspects.length} pieces of work`;

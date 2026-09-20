@@ -89,34 +89,6 @@ export function applySchema(db) {
       PRIMARY KEY (event_id, agent_id)
     );
 
-    CREATE TABLE IF NOT EXISTS proposals (
-      id TEXT PRIMARY KEY,
-      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-      proposer_id TEXT REFERENCES agents(id),
-      proposer_name TEXT NOT NULL,
-      kind TEXT NOT NULL,
-      summary TEXT NOT NULL,
-      details TEXT NOT NULL,
-      status TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      resolved_at TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS proposal_votes (
-      proposal_id TEXT NOT NULL REFERENCES proposals(id) ON DELETE CASCADE,
-      voter_id TEXT NOT NULL,
-      voter_name TEXT NOT NULL,
-      vote TEXT NOT NULL,
-      comment TEXT,
-      created_at TEXT NOT NULL,
-      PRIMARY KEY (proposal_id, voter_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS proposal_voters (
-      proposal_id TEXT NOT NULL REFERENCES proposals(id) ON DELETE CASCADE,
-      voter_id TEXT NOT NULL,
-      PRIMARY KEY (proposal_id, voter_id)
-    );
 
     CREATE TABLE IF NOT EXISTS assignment_checklists (
       assignment_id TEXT PRIMARY KEY REFERENCES assignments(id) ON DELETE CASCADE,
@@ -260,21 +232,16 @@ export function applySchema(db) {
     CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(type, created_at);
     CREATE INDEX IF NOT EXISTS idx_agents_status_seen ON agents(status, last_seen);
     CREATE INDEX IF NOT EXISTS idx_receipts_agent ON message_receipts(agent_id, delivered_at, seen_at);
-    CREATE INDEX IF NOT EXISTS idx_proposals_task_status ON proposals(task_id, status);
     CREATE INDEX IF NOT EXISTS idx_task_members_agent ON task_members(agent_id);
     PRAGMA optimize;
   `);
-  // Additive columns for databases created before consensus snapshots/quorum/timeout existed.
+  // Additive columns for databases created before the feature that needed them.
   for (const [table, column, ddl] of [
-    ["proposals", "required_ratio", "REAL NOT NULL DEFAULT 1"],
-    ["proposals", "escalated_at", "TEXT"],
     ["agents", "resume_token_hash", "TEXT"],  // hashed at rest; the raw token is returned once at connect
     ["agents", "message_floor", "TEXT"],       // on resume, replay messages back to the original session's start
     ["assignments", "claim_generation", "INTEGER NOT NULL DEFAULT 0"], // bumped every (re)claim, for lease fencing
     ["assignments", "claim_token_hash", "TEXT"],                        // hashed fencing token for the live claim
     ["assignments", "assignment_version", "INTEGER NOT NULL DEFAULT 1"],
-    ["tasks", "session_policy", "TEXT NOT NULL DEFAULT 'manual'"],
-    ["tasks", "session_policy_version", "INTEGER NOT NULL DEFAULT 1"],
     ["agents", "session_generation", "INTEGER NOT NULL DEFAULT 1"],
     ["agents", "fresh_task_id", "TEXT"],
     ["agents", "replaced_by_agent_id", "TEXT"],
@@ -335,7 +302,11 @@ export function applySchema(db) {
   // scores work any more: an agent takes what it can take, so the score gated nothing and the table
   // has no reader left. assignments.complexity_override stays as a stale nullable column, for the
   // reason given above.
-  for (const table of ["checklist_deliveries", "checklist_items", "domains", "project_check_commands", "jobs", "complexity_assessments"]) {
+  // proposals/proposal_votes/proposal_voters held a room's open questions and the votes on them.
+  // Roles are fixed now, so there is nothing to appoint anyone to; a handoff is a planner creating
+  // the work again for someone else, and a decision is a note on the board.
+  for (const table of ["checklist_deliveries", "checklist_items", "domains", "project_check_commands", "jobs", "complexity_assessments",
+    "proposal_votes", "proposal_voters", "proposals"]) {
     try { db.exec(`DROP TABLE IF EXISTS ${table}`); } catch { /* an older engine without the table */ }
   }
   // Baselines used to be keyed by the argv DevTeam ran; they are now keyed by the reported label.
@@ -360,6 +331,20 @@ export function applySchema(db) {
       UPDATE assignments SET plans = 1 WHERE lower(role) = 'planner';
     `);
     db.prepare("INSERT INTO metadata (key, value) VALUES ('role_behaviour_backfilled', ?)").run(new Date().toISOString());
+  }
+  // Roles collapsed from a per-project vocabulary to three fixed ones: plan → implement → review.
+  // Existing rows are renamed by the behaviour they were *created* with rather than by their name,
+  // because that behaviour is what the scheduler has been acting on all along. A `tester` row
+  // therefore becomes a `reviewer` rather than an `implementer`, even though new testing work now
+  // belongs to the implementer: retroactively demoting it would withdraw review evidence an
+  // in-flight task may already be counting towards its approvals.
+  if (!db.prepare("SELECT value FROM metadata WHERE key = 'roles_collapsed_to_three'").get()) {
+    db.exec(`
+      UPDATE assignments SET role = 'planner'     WHERE plans = 1;
+      UPDATE assignments SET role = 'reviewer'    WHERE verifies = 1 AND plans = 0;
+      UPDATE assignments SET role = 'implementer' WHERE verifies = 0 AND plans = 0;
+    `);
+    db.prepare("INSERT INTO metadata (key, value) VALUES ('roles_collapsed_to_three', ?)").run(new Date().toISOString());
   }
   // One agent may hold at most one claimed assignment at a time. Self-heal any legacy
   // double-claims (keep the earliest) before enforcing it at the schema level, so the

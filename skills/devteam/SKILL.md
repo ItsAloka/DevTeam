@@ -28,7 +28,7 @@ The project files are the source of truth. DevTeam tells you what the team knows
 | `devteam_next` | get your next work, or look something up |
 | `devteam_plan` | put work on the board |
 | `devteam_report` | finish the assignment you hold, with evidence |
-| `devteam_verdict` | judge someone else's work, or answer a proposal |
+| `devteam_verdict` | judge someone else's work |
 | `devteam_stuck` | say you cannot proceed, or ask why something will not move |
 | `devteam_memory` | search or record what the project knows |
 | `devteam_message` | talk to the room or one teammate |
@@ -50,8 +50,12 @@ are. They are recorded so the board says who did what; they gate nothing.
 Keep `agentId` and `resumeToken` private. If the connection drops, join again with your new `agentId`
 and the old `resumeToken` to reclaim your work, room and missed messages.
 
-The reply lists this project's roles (`.devteam/roles.json`). A role that **verifies** reads work rather
-than changing it; a role that **plans** decides what the team does next.
+There are three roles and work moves through them in one direction: **planner** → **implementer** →
+**reviewer**. A planner decides what the team does next and researches whatever it needs to decide.
+An implementer produces the work and exercises it. A reviewer reads someone else's finished work and
+judges it — that is the only role whose completion earns the right to approve or request changes, and
+DevTeam never hands it a version the same agent wrote. Security review is a reviewer assignment with
+the security domain selected; there is no separate security role.
 
 ## Getting work
 
@@ -119,8 +123,7 @@ Answer a review with `devteam_verdict`:
   It is recorded as a lesson and the owner decides whether it earns a line in `checklists/`. Leave
   `rule` out for one-off problems.
 
-**Sending work back is normal.** Approving work you doubt is the failure. `verdict=agree` /
-`verdict=object` answer a team proposal.
+**Sending work back is normal.** Approving work you doubt is the failure.
 
 ## Planning work
 
@@ -150,7 +153,7 @@ versioned scratchpad, `scope=task` or `scope=project`; re-read and merge on conf
 
 ## Staying reachable
 
-Messages and proposals ride along on **any** call. Read what comes back and reply with
+Messages ride along on **any** call. Read what comes back and reply with
 `devteam_message` (`target` for one teammate, omit for the room) before carrying on.
 
 ## Working alone

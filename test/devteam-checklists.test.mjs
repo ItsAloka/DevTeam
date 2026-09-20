@@ -220,36 +220,38 @@ test("a verifying assignment with no selected domains receives no domain checkli
   assert.equal(current.checklistFiles, undefined);
 });
 
-test("a selected unrestricted checklist reaches the built-in tester", async (t) => {
+// There is one verifying role now. `tester` and `security-reviewer` were two of the six that used to
+// exist, and a project could name its own besides; all of them resolve onto the three that remain,
+// and only the one that verifies is handed a domain checklist.
+test("an old verifying role name resolves onto reviewer and still gets the checklist", async (t) => {
   const { store, project } = await fixture(t);
-  const task = store.createTask({ projectId: project.id, title: "Work", description: "d", domains: ["web"] });
-  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
-  const tester = store.connectAgent({ name: "Tester", provider: "test", freshTaskId: task.id });
-  const plan = store.claimNextAssignment(planner.id);
-  store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Test", description: "Exercise.", role: "tester" });
-  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
-  const claim = store.claimNextAssignment(tester.id);
-  const brief = store.taskBrief(tester.id, task.id, { currentAssignment: claim });
-  const current = brief.assignment || brief.currentAssignment;
-  assert.deepEqual(current.checklistFiles.map((file) => file.domain), ["web"]);
-});
-
-test("a selected unrestricted checklist reaches a custom verifying role", async (t) => {
-  const { store, project, projectRoot } = await fixture(t);
-  await mkdir(path.join(projectRoot, ".devteam"), { recursive: true });
-  await writeFile(path.join(projectRoot, ".devteam", "roles.json"), JSON.stringify({ roles: {
-    planner: { plans: true }, writer: { writes: true }, "fact-checker": { verifies: true },
-  } }), "utf8");
   const task = store.createTask({ projectId: project.id, title: "Work", description: "d", domains: ["web"] });
   const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
   const checker = store.connectAgent({ name: "Checker", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
-  store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Check", description: "Verify.", role: "fact-checker" });
+  store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Check", description: "Verify.", role: "security-reviewer" });
   await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
   const claim = store.claimNextAssignment(checker.id);
+  assert.equal(claim.role, "reviewer", "security-reviewer is a reviewer with the security checklist selected");
   const brief = store.taskBrief(checker.id, task.id, { currentAssignment: claim });
   const current = brief.assignment || brief.currentAssignment;
   assert.deepEqual(current.checklistFiles.map((file) => file.domain), ["web"]);
+});
+
+test("a role that no longer verifies is handed no domain checklist", async (t) => {
+  const { store, project } = await fixture(t);
+  const task = store.createTask({ projectId: project.id, title: "Work", description: "d", domains: ["web"] });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const worker = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(planner.id);
+  // Testing folded into implementation: you exercise what you built, and that is not a review.
+  store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Test", description: "Exercise.", role: "tester" });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  const claim = store.claimNextAssignment(worker.id);
+  assert.equal(claim.role, "implementer");
+  const brief = store.taskBrief(worker.id, task.id, { currentAssignment: claim });
+  const current = brief.assignment || brief.currentAssignment;
+  assert.equal(current.checklistFiles, undefined);
 });
 
 test("with no checklist directory at all, the brief carries no checklist keys", async (t) => {

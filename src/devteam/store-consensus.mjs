@@ -1,5 +1,11 @@
-// Consensus: proposals the room votes on, approvals of a task version, and the rule that decides
-// whether an approval is independent at all.
+// Consensus: approvals of a task version, and the rule that decides whether an approval is
+// independent at all.
+//
+// Proposals used to live here too — an agent put a role change, a handoff or a decision to the room,
+// every connected teammate voted, and an adopted one created or moved real work. It went with the
+// per-project role vocabulary it mostly existed to negotiate: with three fixed roles there is
+// nothing to appoint anyone to, a handoff is a planner creating the assignment again for someone
+// else, and a decision is a note on the board. One human at a keyboard does not need a quorum.
 //
 // The invariant with the most history behind it lives here. An agent may not verify work it wrote,
 // enforced at claim time by _verifierIsAuthor rather than only at approval — refusing it only at
@@ -21,15 +27,10 @@ import { CHECKLIST_RULE_MAX } from "./checklists.mjs";
 
 // Whether an assignment reads the work rather than changing it — and therefore waits for pending
 // writers, earns the right to approve, and puts its task in review — is a column on the row,
-// resolved from the project's role config when the assignment was created (see roles.mjs). It is
-// deliberately NOT a list of role names here: a project that calls its reviewing role `fact-checker`
-// or `structural-engineer` must schedule identically, and no domain vocabulary belongs in this SQL.
+// resolved from the role when the assignment was created (see roles.mjs). Keeping it as a column
+// rather than a list of role names in this SQL is what let the vocabulary change without touching
+// the scheduler, twice now.
 const VERIFIES = "verifies = 1";
-
-// The kinds of thing a room can be asked to agree on. Defined here, beside the only code that
-// validates against it, and re-exposed as DevTeamStore.PROPOSAL_KINDS so the class keeps the static
-// it has always had.
-export const PROPOSAL_KINDS = ["role", "handoff", "plan", "decision"];
 
 export const consensusMethods = {
 
@@ -41,227 +42,7 @@ export const consensusMethods = {
     return Boolean(this.db.prepare("SELECT verifies FROM assignments WHERE id = ?").get(assignmentId)?.verifies);
   },
 
-  createProposal({ agentId = null, taskId, kind = "role", summary, details = {} }) {
-    const task = this.getTask(taskId);
-    if (!task) throw new Error("Task not found.");
-    this.assertMembership(agentId, taskId);
-    if (["accepted", "blocked", "cancelled"].includes(task.status)) throw new Error(this.closedTaskError(task, "open a proposal on it"));
-    if (!PROPOSAL_KINDS.includes(kind)) throw new Error(`Unknown proposal kind: ${kind}.`);
-    const proposer = agentId ? this.getAgent(agentId) : null;
-    const proposerName = proposer ? proposer.name : "You";
-    if (kind === "handoff" && !details?.assignmentId) throw new Error("A handoff proposal needs details.assignmentId.");
-    if (kind === "role" && !String(details?.role || "").trim()) throw new Error("A role proposal needs details.role.");
-    const id = randomUUID();
-    const stamp = now();
-    // Quorum: 1 (default) = unanimity of the voter set snapshotted now; a fraction in (0,1) adopts
-    // once that share of the snapshot agrees (supermajority/majority).
-    const ratio = Math.min(1, Math.max(0, Number(details?.quorum) || 1)) || 1;
-    // Snapshot the required voter set at creation: exactly the members connected right now, minus
-    // the proposer. A teammate connecting mid-vote afterwards can neither block an almost-adopted
-    // proposal nor be silently conscripted into it.
-    const snapshotVoters = this._connectedMemberIds(taskId).filter((memberId) => memberId !== agentId);
-    this._transaction(() => {
-      this.db.prepare(`
-        INSERT INTO proposals (id, task_id, proposer_id, proposer_name, kind, summary, details, status, created_at, required_ratio)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
-      `).run(id, taskId, agentId, proposerName, kind, summary.trim(), json(details), stamp, ratio);
-      for (const voterId of snapshotVoters) {
-        this.db.prepare("INSERT OR IGNORE INTO proposal_voters (proposal_id, voter_id) VALUES (?, ?)").run(id, voterId);
-      }
-      // An AGENT proposer implicitly agrees to its own proposal. A human proposer gets no implicit
-      // vote: the human decides with an explicit dashboard Agree/Object, and pre-seeding a "human
-      // agree" here would make that later click an idempotent no-op that never resolves the proposal.
-      if (agentId) {
-        this.db.prepare(`
-          INSERT INTO proposal_votes (proposal_id, voter_id, voter_name, vote, comment, created_at)
-          VALUES (?, ?, ?, 'agree', NULL, ?)
-        `).run(id, agentId, proposerName, stamp);
-      }
-      this._event(taskId, agentId, "proposal.created", summary.trim(), { proposalId: id, kind, details, requiredVoters: snapshotVoters.length, quorum: ratio });
-    });
-    this._changed("proposal.created", taskId);
-    return this.getProposal(id);
-  },
-
-  getProposal(proposalId) {
-    const row = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(proposalId);
-    if (!row) return null;
-    const votes = this.db.prepare("SELECT voter_id, voter_name, vote, comment, created_at FROM proposal_votes WHERE proposal_id = ? ORDER BY created_at ASC").all(proposalId);
-    return { ...row, details: fromJson(row.details, {}), votes };
-  },
-
-  voteProposal({ agentId = null, proposalId, vote = "agree", comment = null }) {
-    if (!["agree", "object"].includes(vote)) throw new Error("Vote must be 'agree' or 'object'.");
-    const voter = agentId ? this.getAgent(agentId) : null;
-    const voterName = voter ? voter.name : "You";
-    if (agentId) {
-      const owning = this.db.prepare("SELECT task_id FROM proposals WHERE id = ?").get(proposalId);
-      if (owning) this.assertMembership(agentId, owning.task_id);
-    }
-    let outcome;
-    this._transaction(() => {
-      const proposal = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(proposalId);
-      if (!proposal) throw new Error("Proposal not found.");
-      if (proposal.status !== "open") { outcome = { proposalId, taskId: proposal.task_id, status: proposal.status, alreadyResolved: true }; return; }
-      const voterId = agentId || "human";
-      const stamp = now();
-      // Re-casting the identical vote records nothing new and emits no vote event, but we still
-      // re-evaluate: a decisive vote already on record — e.g. a legacy proposal pre-seeded with the
-      // human's implicit agree — must resolve exactly once instead of being frozen by a no-op. A vote
-      // that leaves it open is marked unchanged so it doesn't spam duplicate "vote" change signals.
-      const existing = this.db.prepare("SELECT vote FROM proposal_votes WHERE proposal_id = ? AND voter_id = ?").get(proposalId, voterId);
-      if (existing && existing.vote === vote) {
-        outcome = this._evaluateProposal(proposal, stamp);
-        if (outcome.status === "open") outcome.unchanged = true;
-        return;
-      }
-      this.db.prepare(`
-        INSERT INTO proposal_votes (proposal_id, voter_id, voter_name, vote, comment, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(proposal_id, voter_id) DO UPDATE SET vote = excluded.vote, comment = excluded.comment, created_at = excluded.created_at
-      `).run(proposalId, voterId, voterName, vote, comment?.trim() || null, stamp);
-      this._event(proposal.task_id, agentId, "proposal.vote", `${voterName} ${vote === "agree" ? "agreed to" : "objected to"}: ${proposal.summary}`, { proposalId, vote, comment: comment?.trim() || null });
-      outcome = this._evaluateProposal(proposal, stamp);
-    });
-    this.markMessagesSeen(agentId || "");
-    // A resolution always signals (even when reached by re-evaluating an identical decisive vote); a
-    // vote that merely stays open signals once, and a true no-op stays silent.
-    if (outcome?.status === "adopted") this._changed("proposal.adopted", outcome.taskId);
-    else if (outcome?.status === "declined") this._changed("proposal.declined", outcome.taskId);
-    else if (!outcome?.unchanged && !outcome?.alreadyResolved) this._changed("proposal.vote", outcome?.taskId);
-    return outcome;
-  },
-
-  // Decide whether an open proposal is now adopted (all required teammates agreed) or
-  // declined (someone objected). Runs inside the caller's transaction.
-  _evaluateProposal(proposal, stamp) {
-    const votes = this.db.prepare("SELECT voter_id, vote FROM proposal_votes WHERE proposal_id = ?").all(proposal.id);
-    // Decide against the voter set snapshotted at creation, not whoever is connected right now.
-    const snapshot = this.db.prepare("SELECT voter_id FROM proposal_voters WHERE proposal_id = ?").all(proposal.id).map((r) => r.voter_id);
-    // The human is the room's owner: an explicit human vote is decisive and overrides agent consensus,
-    // so a dashboard Agree/Object actually resolves the proposal (agree adopts, object declines) rather
-    // than waiting on agent votes that may never come.
-    const humanVote = votes.find((v) => v.voter_id === "human");
-    if (humanVote && humanVote.vote === "agree") {
-      this._adoptProposal(proposal, stamp);
-      this.db.prepare("UPDATE proposals SET status = 'adopted', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
-      return { proposalId: proposal.id, taskId: proposal.task_id, status: "adopted" };
-    }
-    if (humanVote && humanVote.vote === "object") {
-      this.db.prepare("UPDATE proposals SET status = 'declined', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
-      this._event(proposal.task_id, null, "proposal.declined", `Proposal declined: ${proposal.summary}`, { proposalId: proposal.id });
-      return { proposalId: proposal.id, taskId: proposal.task_id, status: "declined" };
-    }
-    const authoritative = new Set([...snapshot, "human"]); // late joiners can neither block nor carry a vote
-    const objection = votes.find((v) => v.vote === "object" && authoritative.has(v.voter_id));
-    if (objection) {
-      this.db.prepare("UPDATE proposals SET status = 'declined', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
-      this._event(proposal.task_id, null, "proposal.declined", `Proposal declined: ${proposal.summary}`, { proposalId: proposal.id });
-      return { proposalId: proposal.id, taskId: proposal.task_id, status: "declined" };
-    }
-    const agreed = new Set(votes.filter((v) => v.vote === "agree").map((v) => v.voter_id));
-    const agreements = snapshot.filter((id) => agreed.has(id)).length;
-    const ratio = Number(proposal.required_ratio) || 1;
-    let adopt;
-    if (!snapshot.length) {
-      // No teammate was around at creation — only the human can decide a solo proposer's request.
-      adopt = agreed.has("human");
-    } else if (ratio >= 1) {
-      // Unanimity of those still able to vote: a snapshot voter who has since disconnected or gone
-      // unresponsive can't hold the whole team hostage, but if none remain it stays open for the
-      // human/timeout rather than silently adopting.
-      const eligible = snapshot.filter((id) => this._canVoteNow(id));
-      adopt = eligible.length > 0 && eligible.every((id) => agreed.has(id));
-    } else {
-      // Quorum/supermajority against the fixed snapshot denominator.
-      const needed = Math.max(1, Math.ceil(ratio * snapshot.length));
-      adopt = agreements >= needed;
-    }
-    if (adopt) {
-      this._adoptProposal(proposal, stamp);
-      this.db.prepare("UPDATE proposals SET status = 'adopted', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
-      return { proposalId: proposal.id, taskId: proposal.task_id, status: "adopted" };
-    }
-    // Report what adoption actually needs *now*: for unanimity that is the snapshot voters still able
-    // to vote (a disconnected/unresponsive snapshot voter no longer counts), matching the adopt rule
-    // above — so the dashboard never shows "need 2" when only one reachable voter remains.
-    const needed = ratio >= 1
-      ? snapshot.filter((id) => this._canVoteNow(id)).length
-      : Math.max(1, Math.ceil(ratio * snapshot.length));
-    return { proposalId: proposal.id, taskId: proposal.task_id, status: "open", agreements, needed };
-  },
-
-  // An agent can cast a vote right now only if it is connected and actually responsive — an
-  // 'unresponsive' (silently busy) agent is present but can't be waited on to break a tie.
-  _canVoteNow(agentId) {
-    const row = this.db.prepare("SELECT status FROM agents WHERE id = ?").get(agentId);
-    return Boolean(row) && row.status !== "disconnected" && row.status !== "unresponsive";
-  },
-
-  // Apply an adopted proposal's real effect. Runs inside the caller's transaction.
-  _adoptProposal(proposal, stamp) {
-    const details = fromJson(proposal.details, {});
-    if (proposal.kind === "role") {
-      const assignmentId = randomUUID();
-      const title = (details.title || `${details.role} work`).toString().trim();
-      const description = (details.description || proposal.summary).toString().trim();
-      this.db.prepare(`
-        INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
-      `).run(assignmentId, proposal.task_id, title, description, String(details.role).trim(), details.requiresWrite ? 1 : 0, details.targetAgentName?.trim() || null, stamp);
-      const adoptedChecklist = this._resolveChecklist(this.getTask(proposal.task_id).project_id, details.role, details.checklist);
-      this._storeChecklist(assignmentId, adoptedChecklist);
-      if (details.requiresWrite && Array.isArray(details.paths) && details.paths.length) {
-        const writePaths = [...new Set(details.paths.map((p) => String(p).trim()).filter(Boolean))].slice(0, 50);
-        if (writePaths.length) this.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)").run(assignmentId, json(writePaths));
-      }
-      this._event(proposal.task_id, proposal.proposer_id, "assignment.created", title, { assignmentId, role: details.role, requiresWrite: Boolean(details.requiresWrite), targetAgentName: details.targetAgentName?.trim() || null, viaProposal: proposal.id, checklist: adoptedChecklist || [] });
-      this._syncTaskStatus(proposal.task_id, stamp);
-    } else if (proposal.kind === "handoff") {
-      const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(details.assignmentId);
-      if (assignment) {
-        const target = details.targetAgentName?.trim() || null;
-        if (assignment.status === "claimed") {
-          this.db.prepare("UPDATE assignments SET target_agent_name = ?, status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL WHERE id = ?").run(target, assignment.id);
-        } else {
-          this.db.prepare("UPDATE assignments SET target_agent_name = ? WHERE id = ?").run(target, assignment.id);
-        }
-        this._event(proposal.task_id, proposal.proposer_id, "assignment.reassigned", `Reassigned "${assignment.title}"${target ? ` to ${target}` : ""}.`, { assignmentId: assignment.id, targetAgentName: target, viaProposal: proposal.id });
-        this._syncTaskStatus(proposal.task_id, stamp);
-      }
-    }
-    this._event(proposal.task_id, null, "proposal.adopted", `Team adopted: ${proposal.summary}`, { proposalId: proposal.id, kind: proposal.kind });
-  },
-
-  // Open proposals a waiting agent should weigh in on (in its rooms, not its own, not yet voted).
-  openProposalsForAgent(agent) {
-    const rooms = this._memberTaskIds(agent.id);
-    if (!rooms.length) return [];
-    const roomPlaceholders = rooms.map(() => "?").join(", ");
-    const rows = this.db.prepare(`
-      SELECT p.* FROM proposals p
-      JOIN tasks t ON t.id = p.task_id
-      WHERE p.status = 'open'
-        AND p.task_id IN (${roomPlaceholders})
-        AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
-        AND (p.proposer_id IS NULL OR p.proposer_id != ?)
-        AND NOT EXISTS (SELECT 1 FROM proposal_votes v WHERE v.proposal_id = p.id AND v.voter_id = ?)
-      ORDER BY p.created_at ASC
-      LIMIT 20
-    `).all(...rooms, agent.id, agent.id);
-    return rows.map((row) => ({ id: row.id, taskId: row.task_id, kind: row.kind, summary: row.summary, proposer: row.proposer_name, details: fromJson(row.details, {}) }));
-  },
-
-  proposalsForTask(taskId) {
-    const rows = this.db.prepare("SELECT * FROM proposals WHERE task_id = ? ORDER BY created_at ASC").all(taskId);
-    return rows.map((row) => ({
-      ...row,
-      details: fromJson(row.details, {}),
-      votes: this.db.prepare("SELECT voter_id, voter_name, vote, comment, created_at FROM proposal_votes WHERE proposal_id = ? ORDER BY created_at ASC").all(row.id),
-    }));
-  },
-
-  // Connected agents that belong to a given task (used to scope proposal consensus).
+  // Connected agents that belong to a given task.
   _connectedMemberIds(taskId) {
     const connected = this.db.prepare("SELECT id FROM agents WHERE status != 'disconnected'").all().map((row) => row.id);
     return connected.filter((id) => this._memberTaskIds(id).includes(taskId));
@@ -420,7 +201,7 @@ export const consensusMethods = {
         && this._assignmentVerifies(metadata.assignmentId)
         && (!Array.isArray(metadata.changedFiles) || metadata.changedFiles.length === 0);
     });
-    if (!reviewEvidence) throw new Error("Approval requires a completed, read-only reviewer or tester assignment on the current task version.");
+    if (!reviewEvidence) throw new Error("Approval requires a completed, read-only reviewer assignment on the current task version.");
     // Reviewer ≠ author: when the team is more than one agent, the author of the current version
     // cannot approve it — an independent teammate must. A genuine solo run is still allowed to
     // finish (no dead-ends), but its acceptance is labeled selfReviewed so it is never mistaken
@@ -428,7 +209,7 @@ export const consensusMethods = {
     const authors = this._currentVersionAuthors(taskId, task.version);
     const eligibleIndependent = this._eligibleIndependentApprovers(taskId, task.version);
     if (authors.has(agentId) && eligibleIndependent.size > 0) {
-      throw new Error("The author of the current version cannot approve it; an independent reviewer or tester must.");
+      throw new Error("The author of the current version cannot approve it; an independent reviewer must.");
     }
     let outcome;
     this._transaction(() => {
@@ -505,7 +286,7 @@ export const consensusMethods = {
     // that verifier claim right now — the reviewer that finds the problem mid-review should not have
     // to finish and file its own report before it can say so.
     if (agentId && !this._hasReviewStanding(agentId, taskId, task.version)) {
-      throw new Error("Requesting changes needs a completed or in-progress read-only reviewer or tester assignment on the current task version.");
+      throw new Error("Requesting changes needs a completed or in-progress read-only reviewer assignment on the current task version.");
     }
     const cleanFindings = (Array.isArray(findings) ? findings : []).slice(0, 50).map((item) => {
       const isObject = item && typeof item === "object" && !Array.isArray(item);
