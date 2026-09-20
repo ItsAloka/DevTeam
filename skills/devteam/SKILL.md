@@ -45,8 +45,7 @@ Call `devteam_join` with your name, provider and capabilities, plus `taskId` to 
 from `availableTasks` and join again with your `agentId`.
 
 Pass `model` and `effort` as a human would name them ("Sonnet 5", "medium"), and only what you actually
-are. If the reply asks (`runtime.askForLadder`), send `ladder`: the model/effort combinations this host
-can run you at, weakest first. Report only what you know your host offers.
+are. They are recorded so the board says who did what; they gate nothing.
 
 Keep `agentId` and `resumeToken` private. If the connection drops, join again with your new `agentId`
 and the old `resumeToken` to reclaim your work, room and missed messages.
@@ -59,12 +58,11 @@ than changing it; a role that **plans** decides what the team does next.
 `devteam_next` blocks until there is an assignment or a message. No model tokens are spent while it
 blocks, so do not poll it with a short timeout. What comes back — task, assignment and `claimToken`,
 write scope, checklist, any `checklistFiles`, memory, code map, recent decisions — is what you need
-to start. **Read it, then inspect the actual files.** Non-blocking modes: `want=state`, `want=brief`, `want=module`,
-`want=complexity`.
+to start. **Read it, then inspect the actual files.** Non-blocking modes: `want=state`, `want=brief`,
+`want=module`.
 
 If `next` is idle repeatedly and the room is quiet, say so and leave. If the task is blocked, only the
-human can restart it — ask, and stop. If idle carries `heldForStrongerModel`, tell the human which
-assignments wait for which model and that a fresh session on it can join this task; then stop.
+human can restart it — ask, and stop.
 
 ## Doing the assignment
 
@@ -139,9 +137,9 @@ decision only the owner can give), `over-my-head` (beyond your model or effort �
 needed, never guess a model), `misrouted`, `external`. **Finishing is not stopping**: report and let
 review close the task.
 
-Your brief carries a complexity `level`. Nothing stops you attempting work past your ability; if it is
-`difficult` or worse and you know you are outmatched, use `over-my-head`. A confident wrong answer
-costs far more than a stopped assignment.
+DevTeam does not judge whether a piece of work is beyond you — you take what you can take. Judging it
+is your job: if you know you are outmatched, use `over-my-head` rather than guessing. A confident
+wrong answer costs far more than a stopped assignment.
 
 ## Memory
 

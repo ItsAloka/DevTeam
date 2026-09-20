@@ -246,10 +246,6 @@ export const viewMethods = {
       WHERE a.task_id = ? ORDER BY a.created_at ASC
     `).all(taskId).map((assignment) => {
       const dependencies = this._dependenciesFor(assignment.id);
-      const assessment = this._assessmentRecord(this.db.prepare(`
-        SELECT * FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
-        ORDER BY created_at DESC LIMIT 1
-      `).get(assignment.id));
       return {
         ...assignment,
         checklist: this._checklistFor(assignment.id),
@@ -260,10 +256,6 @@ export const viewMethods = {
         findings: this._findingsFor(assignment.id),
         resolvedFindings: this._findingsFor(assignment.id, { includeResolved: true }).filter((finding) => finding.resolved_at),
         schedulingHold: this._schedulingHold(assignment),
-        assessment,
-        // The score in the words the human uses for their own models. "Base · Score 0" is DevTeam's
-        // vocabulary, not anyone else's; "Needs Sonnet 5 · medium" is the same fact said usefully.
-        needsRung: assessment ? this._rungLabelFor(task.project_id, assessment.level) : null,
       };
     });
     // The roles this project understands travel with the task, so the dashboard's assignment form
@@ -492,10 +484,6 @@ export const viewMethods = {
         project_root: clip(currentSource.project_root || task.project_root, 2_000, "currentAssignmentProjectRoot"),
         project_name: clip(currentSource.project_name || task.project_name, 400, "currentAssignmentProjectName"),
         claimGeneration: Number(currentSource.claimGeneration ?? currentSource.claim_generation ?? 0),
-        assessment: this._assessmentForBrief(this.db.prepare(`
-          SELECT * FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
-          ORDER BY created_at DESC LIMIT 1
-        `).get(currentSource.id)),
         ...(currentSource.claimToken ? { claimToken: currentSource.claimToken } : {}),
       };
     }

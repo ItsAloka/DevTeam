@@ -79,19 +79,15 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       name: z.string().min(1).max(80).optional().describe("Your display name on a first arrival, for example Codex or Claude"),
       provider: z.string().min(1).max(80).optional().describe("Your host on a first arrival, for example OpenAI Codex or Anthropic Claude Code"),
       capabilities: z.array(z.string().max(80)).max(20).default([]).describe("What you are good at — implementation, review, security, testing, research. DevTeam matches these to work; it never appoints you to a role you did not claim."),
-      model: z.string().max(80).optional().describe("The model you are running as right now, in the name a human would recognise — \"Sonnet 5\", \"Opus 5\". Report what you actually are; do not guess."),
+      model: z.string().max(80).optional().describe("The model you are running as right now, in the name a human would recognise — \"Sonnet 5\", \"Opus 5\". Recorded so the board says who did what; it gates nothing."),
       effort: z.string().max(40).optional().describe("The effort or thinking level you are running at right now — low, medium, high, maximum — if your host exposes one."),
-      ladder: z.array(z.object({
-        model: z.string().min(1).max(80),
-        effort: z.string().max(40).optional(),
-      })).max(12).optional().describe("The model and effort combinations THIS host can run you at, ordered weakest first. Send it when the reply to a previous join asked for it, or on a first arrival. DevTeam uses it only to say which rung a piece of work needs and whether you are on it — it is never compared against another provider. Report only combinations you know your host offers."),
       taskId: z.string().uuid().optional().describe("The task room to enter"),
       role: z.enum(["contributor", "observer"]).default("contributor").describe("Observers watch and never claim work"),
       agentId: z.string().uuid().optional().describe("Your existing agentId, when joining a further room or resuming"),
       resumeToken: z.string().max(200).optional().describe("The resumeToken from the session you are reclaiming, alongside your new agentId"),
     },
   }, safe(async (args) => {
-    const { name, provider, capabilities, taskId, role, agentId, resumeToken, model, effort, ladder } = args;
+    const { name, provider, capabilities, taskId, role, agentId, resumeToken, model, effort } = args;
     // Resuming and joining act as an already-connected agent; arriving is the one call that has no
     // identity yet, and it is what establishes one for this MCP session.
     if (resumeToken) {
@@ -107,7 +103,6 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       return withInbox(agentId, {
         ...joined,
         roles: task ? store.roleCatalogue(task.project_id) : null,
-        runtime: store.runtimeLadder({ agentId, taskId, model, effort, ladder }),
       });
     }
     if (!name || !provider) throw new Error("A first arrival needs name and provider.");
@@ -117,13 +112,11 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     const roomStatus = store.roomStatusForAgent(agent.id);
     const roomRequired = roomStatus.joinedTaskIds.length === 0 && roomStatus.activeTasks.length > 0;
     const task = taskId ? store.getTask(taskId) : null;
-    const runtime = taskId ? store.runtimeLadder({ agentId: agent.id, taskId, model, effort, ladder }) : null;
     return {
       connected: true,
       agent: agentInfo,
       room,
       ...(task ? { roles: store.roleCatalogue(task.project_id) } : {}),
-      ...(runtime ? { runtime } : {}),
       ...(roomRequired ? { roomRequired: true, availableTasks: roomStatus.activeTasks } : {}),
       resumeToken: token,
       next: roomRequired
@@ -134,16 +127,15 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_next", {
     title: "Get your next piece of work, or look something up",
-    description: "Your main loop. With no arguments beyond agentId it blocks locally until DevTeam has an assignment or a message for you — no model tokens are spent while blocked — and returns everything you need to start: the task, your assignment with its claim token, write scope and checklist, the relevant project memory, a map of the code around it, recent decisions and open questions. Returns 'room_required' if you are in no room yet, 'assigned' or 'message' when something arrives, or 'idle' after the timeout. The other modes are lookups, and none of them blocks: want=state reads the compact current state of a task, want=brief re-reads the full briefing for a task you are already working, want=module returns the one-hop neighbourhood of a file from the code graph (paths and symbols, never source), and want=complexity returns the deterministic score and reasons behind one assignment.",
+    description: "Your main loop. With no arguments beyond agentId it blocks locally until DevTeam has an assignment or a message for you — no model tokens are spent while blocked — and returns everything you need to start: the task, your assignment with its claim token, write scope and checklist, the relevant project memory, a map of the code around it, recent decisions and open questions. Returns 'room_required' if you are in no room yet, 'assigned' or 'message' when something arrives, or 'idle' after the timeout. The other modes are lookups, and none of them blocks: want=state reads the compact current state of a task, want=brief re-reads the full briefing for a task you are already working, and want=module returns the one-hop neighbourhood of a file from the code graph (paths and symbols, never source).",
     inputSchema: {
       agentId: z.string().uuid(),
-      want: z.enum(["work", "state", "brief", "module", "complexity"]).default("work"),
+      want: z.enum(["work", "state", "brief", "module"]).default("work"),
       timeoutSeconds: z.number().int().min(1).max(50).default(45).describe("want=work only: how long to block before answering idle"),
       taskId: z.string().uuid().optional().describe("Required for brief and module; optional for state to narrow it to one task"),
       path: z.string().max(500).optional().describe("want=module: the project-relative file whose neighbours you want"),
-      assignmentId: z.string().uuid().optional().describe("want=complexity: the assignment to score"),
     },
-  }, safe(async ({ agentId, want, timeoutSeconds, taskId, path: modulePath, assignmentId }) => {
+  }, safe(async ({ agentId, want, timeoutSeconds, taskId, path: modulePath }) => {
     // The lookups first: they are the same act as waiting — "tell me what I need to work" — but
     // answered from what DevTeam already knows instead of by blocking for something new.
     if (want === "state") {
@@ -163,12 +155,6 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       requireIdentity(agentId);
       if (!taskId || !modulePath) throw new Error("want=module needs taskId and path.");
       return withInbox(agentId, store.codeGraphSearch({ agentId, taskId, path: modulePath }));
-    }
-    if (want === "complexity") {
-      requireIdentity(agentId);
-      store.heartbeat(agentId);
-      if (!assignmentId) throw new Error("want=complexity needs assignmentId.");
-      return withInbox(agentId, store.assignmentAssessment({ agentId, assignmentId }));
     }
     requireIdentity(agentId);
     store.heartbeat(agentId, "waiting");
@@ -237,21 +223,6 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
         blockedRooms,
         message: `Nothing is claimable because ${blockedRooms.length === 1 ? "this task is blocked" : "these tasks are blocked"}: ${blockedRooms.map((room) => `"${room.taskTitle}"${room.reason ? ` — ${room.reason}` : ""}`).join("; ")}.`,
         next: blockedRooms[0].agentAction,
-      };
-    }
-    // Idle because the rest needs a stronger session is a completely different answer from idle
-    // because the work is finished, and the two look identical from here. Say which it is: the
-    // scheduler withheld those assignments rather than blocking the task, so this agent has already
-    // finished everything it could, and what remains is waiting for a model, not for a decision.
-    const aboveRung = store.workAboveCurrentRung(agentId);
-    if (aboveRung) {
-      return {
-        status: "idle",
-        keepWaiting: false,
-        activity,
-        heldForStrongerModel: aboveRung,
-        message: `${aboveRung.message} Everything this session could take is done.`,
-        next: `Tell the human, in these words: ${aboveRung.humanAction} Then stop — do not attempt the held work at this setting, and do not block the task.`,
       };
     }
     return {

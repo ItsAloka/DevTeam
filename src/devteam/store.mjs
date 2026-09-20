@@ -18,9 +18,7 @@ import { CodeGraph } from "./codegraph.mjs";
 import { KnowledgeVault } from "./knowledge.mjs";
 import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
 import { DEFAULT_ROLES, loadProjectRoles, planningRole, roleBehaviour, ROLES_CONFIG_PATH } from "./roles.mjs";
-import { currentRung, ladderIsStale, loadLadders, requiredRung, rungLabel, saveLadder } from "./models.mjs";
 import { hashToken, mintToken, normalizeTokenLabel, tokensMatch } from "./access.mjs";
-import { assessAssignment, COMPLEXITY_POLICY_VERSION } from "./runtime/index.mjs";
 
 // A task in one of these states hands out no work; named once so the candidate scan and the
 // scheduler's explanation can never disagree about what "closed" means.
@@ -35,7 +33,7 @@ const BLOCK_KINDS = ["needs-human", "over-my-head", "misrouted", "external"];
 // The three above that describe work in flight. With an empty board there is nothing for them to
 // stop, so they are refused and the caller is pointed at the move it actually wanted.
 const BLOCK_KINDS_NEEDING_OPEN_WORK = BLOCK_KINDS.filter((kind) => kind !== "needs-human");
-// How far the candidate scan will look past lease-blocked and runtime-gated work before giving up.
+// How far the candidate scan will look past lease-blocked work before giving up.
 // Generous for a local single-user server, and bounded so a pathological board cannot stall a claim.
 // How long a teammate whose MCP transport dropped still counts as present for routing. Some hosts
 // open a fresh session every turn, which leaves a gap of a few seconds with nobody by that name
@@ -729,7 +727,6 @@ export class DevTeamStore extends EventEmitter {
       `).run(plannerAssignmentId, taskId, "Create the implementation plan", "Inspect the project, propose a concrete plan, then assign implementation and review work to the team.", planningRoleName, stamp, json(taskDomains));
       this._event(taskId, null, "task.created", `Task created: ${title.trim()}`, { projectId, requiredApprovals: approvals, ...(taskDomains.length ? { domains: taskDomains } : {}) });
     });
-    this.assignmentAssessment({ assignmentId: plannerAssignmentId });
     this._changed("task.created", taskId);
     return this.getTask(taskId);
   }
@@ -913,104 +910,6 @@ export class DevTeamStore extends EventEmitter {
     return 1 + Math.max(...dependencies.map((item) => this.#dependencyDepth(item.id, new Set(seen))));
   }
 
-  _assessmentRecord(row) {
-    if (!row) return null;
-    return {
-      id: row.id,
-      assignmentId: row.assignment_id,
-      assignmentVersion: Number(row.assignment_version),
-      taskVersion: Number(row.task_version),
-      evidenceHash: row.evidence_hash,
-      policyVersion: Number(row.policy_version),
-      score: Number(row.score),
-      level: row.level,
-      reasons: fromJson(row.reasons, []),
-      requirements: fromJson(row.requirements, {}),
-      createdAt: row.created_at,
-      invalidatedAt: row.invalidated_at || null,
-    };
-  }
-
-  // What the working agent gets, as opposed to what the dashboard gets. The full record carries six
-  // bookkeeping fields — evidence hashes, policy and assignment versions — that an agent cannot act
-  // on, and no instruction at all. On this board 27 of 54 assignments scored difficult or worse and
-  // not one of them produced a word of advice, because model gating needed a registered profile and
-  // there never was one. The gate is gone; the brief says the quiet part instead: nobody is going to
-  // stop you, the judgement is yours, and here is the one move that works.
-  _assessmentForBrief(row) {
-    const record = this._assessmentRecord(row);
-    if (!record) return null;
-    const demanding = ["difficult", "critical", "recovery", "exceptional"].includes(record.level);
-    return {
-      level: record.level,
-      score: record.score,
-      reasons: (record.reasons || []).slice(0, 3).map((reason) => reason.detail || String(reason)),
-      guidance: demanding
-        ? `This assignment scored ${record.level}. No model gate is active, so nothing will stop you if it is beyond the model or effort you are running — that judgement is yours alone. If it is beyond you, do not push on: call devteam_stuck with kind "over-my-head" and name the capability needed.`
-        : null,
-    };
-  }
-
-  assignmentAssessment({ agentId = null, assignmentId, refresh = false }) {
-    const assignment = this.db.prepare(`
-      SELECT a.*, t.title AS task_title, t.description AS task_description, t.version AS task_version
-      FROM assignments a JOIN tasks t ON t.id = a.task_id WHERE a.id = ?
-    `).get(assignmentId);
-    if (!assignment) throw new Error("Assignment not found.");
-    if (agentId) { this.getAgent(agentId); this.assertMembership(agentId, assignment.task_id); }
-    const failures = Number(this.db.prepare(`
-      SELECT COUNT(*) AS count FROM events
-      WHERE task_id = ? AND type = 'assignment.blocked'
-        AND json_extract(metadata, '$.assignmentId') = ?
-        AND CAST(json_extract(metadata, '$.version') AS INTEGER) = ?
-    `).get(assignment.task_id, assignmentId, assignment.task_version).count);
-    const assessed = assessAssignment({
-      ...assignment,
-      paths: assignment.requires_write ? this._writeScopeFor(assignment.id) : [],
-      checklist: this._checklistFor(assignment.id),
-      dependencyDepth: this.#dependencyDepth(assignment.id),
-      priorFailures: failures,
-      override: fromJson(assignment.complexity_override, null),
-    });
-    const current = this.db.prepare(`
-      SELECT * FROM complexity_assessments
-      WHERE assignment_id = ? AND invalidated_at IS NULL ORDER BY created_at DESC LIMIT 1
-    `).get(assignmentId);
-    if (!refresh && current && current.evidence_hash === assessed.evidenceHash
-      && Number(current.policy_version) === COMPLEXITY_POLICY_VERSION
-      && Number(current.assignment_version) === Number(assignment.assignment_version)) return this._assessmentRecord(current);
-    const stamp = now();
-    if (current) this.db.prepare("UPDATE complexity_assessments SET invalidated_at = ? WHERE id = ?").run(stamp, current.id);
-    const id = randomUUID();
-    this.db.prepare(`
-      INSERT INTO complexity_assessments (
-        id, assignment_id, assignment_version, task_version, evidence_hash, policy_version,
-        score, level, reasons, requirements, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, assignmentId, assignment.assignment_version, assignment.task_version, assessed.evidenceHash,
-      assessed.policyVersion, assessed.score, assessed.level, json(assessed.reasons), json(assessed.requirements), stamp);
-    this._event(assignment.task_id, agentId, "assignment.complexity_assessed", `Assessed “${assignment.title}” as ${assessed.level} (${assessed.score}).`, {
-      assignmentId, assessmentId: id, score: assessed.score, level: assessed.level,
-      requirements: assessed.requirements, invalidatedAssessmentId: current?.id || null,
-    });
-    this.emit("change", { type: "assignment.complexity_assessed", taskId: assignment.task_id, at: stamp });
-    return this._assessmentRecord(this.db.prepare("SELECT * FROM complexity_assessments WHERE id = ?").get(id));
-  }
-
-  setAssignmentComplexityOverride({ assignmentId, override = null }) {
-    const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
-    if (!assignment) throw new Error("Assignment not found.");
-    if (override != null && (typeof override !== "object" || Array.isArray(override))) throw new Error("Complexity override must be an object or null.");
-    const level = override?.level;
-    if (level != null && !["base", "difficult", "critical", "recovery", "exceptional"].includes(level)) throw new Error("Invalid complexity override level.");
-    this.db.prepare(`
-      UPDATE assignments SET complexity_override = ?, assignment_version = assignment_version + 1 WHERE id = ?
-    `).run(override == null ? null : json({ level: level || null, score: Number.isFinite(Number(override.score)) ? Math.max(0, Math.floor(Number(override.score))) : null }), assignmentId);
-    const assessment = this.assignmentAssessment({ assignmentId, refresh: true });
-    this._changed("assignment.complexity_override", assignment.task_id);
-    return assessment;
-  }
-
   // --- Task rooms: work, messages, and governance are scoped to the tasks an agent belongs
   // to, so an agent invoked for one task/project can't claim another's work or see its chatter. ---
 
@@ -1123,7 +1022,6 @@ export class DevTeamStore extends EventEmitter {
         ...(assignmentDomains.length ? { domains: assignmentDomains } : {}),
       });
     });
-    this.assignmentAssessment({ assignmentId: assignment.id });
     this._changed("assignment.created", taskId);
     return { ...this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignment.id), checklist: resolvedChecklist || [], writePaths, dependsOn: dependencyIds, domains: assignmentDomains };
   }
@@ -1283,143 +1181,6 @@ export class DevTeamStore extends EventEmitter {
     return [...new Set([...this._claimableTaskIds(agent.id), ...invitedRooms])];
   }
 
-  // Cache what an agent reported it can be run as, and say whether we should ask again.
-  //
-  // Asking the agent is the only honest source: it is the one party that knows what its host offers,
-  // and the alternative — a catalogue typed in by hand — is exactly the dialog nobody ever filled in.
-  // It is cached because interrogating every session is wasteful, and it expires because a list of
-  // models written once in March is wrong by June.
-  runtimeLadder({ agentId, taskId, model = null, effort = null, ladder = null }) {
-    const agent = this.getAgent(agentId);
-    if (!agent) throw new Error("Agent not found.");
-    const stamp = now();
-    if (model || effort) {
-      this.db.prepare("UPDATE agents SET current_model = COALESCE(?, current_model), current_effort = COALESCE(?, current_effort) WHERE id = ?")
-        .run(model ? String(model).trim().slice(0, 80) : null, effort ? String(effort).trim().slice(0, 40) : null, agentId);
-    }
-    const task = taskId ? this.getTask(taskId) : null;
-    if (!task) return { known: false, askForLadder: false, reason: "no project in view yet" };
-    const root = task.project_root;
-    let saved = null;
-    if (Array.isArray(ladder) && ladder.length) {
-      saved = saveLadder(root, agent.provider, { ladder, reportedBy: agent.name });
-      if (saved.written) {
-        this._event(taskId, agentId, "agent.progress",
-          `${agent.name} reported what ${agent.provider} can be run as: ${saved.rungs} rungs, weakest first.`,
-          { ladderRungs: saved.rungs, provider: agent.provider });
-      }
-    }
-    const ladders = loadLadders(root);
-    const entry = ladders.providers[agent.provider];
-    const stale = ladderIsStale(entry, Date.parse(stamp));
-    const rung = this.agentRung({ ...agent, current_model: model || agent.current_model, current_effort: effort || agent.current_effort }, root);
-    return {
-      known: Boolean(entry?.ladder?.length),
-      askForLadder: stale,
-      ...(saved ? { ladderSaved: saved.written, ...(saved.written ? {} : { notSaved: saved.reason }) } : {}),
-      ...(entry?.ladder?.length ? {
-        ladder: entry.ladder.map((step) => rungLabel(step)),
-        ladderSource: entry.source,
-        ladderReportedAt: entry.reportedAt,
-      } : {}),
-      ...(rung && rung.at >= 0 ? { running: rungLabel(rung.ladder[rung.at]), rung: rung.at } : {}),
-      ...(rung && rung.at < 0 && entry?.ladder?.length ? {
-        running: null,
-        note: "This session's model is not on the reported ladder, so DevTeam cannot tell whether work is above it. Nothing will be withheld from you.",
-      } : {}),
-      next: stale
-        ? "Call devteam_join again with `ladder`: the model and effort combinations this host can run you at, ordered weakest first. It is cached for a week and is what lets DevTeam name the model a hard assignment needs."
-        : null,
-    };
-  }
-
-  // The rung a difficulty level needs, named from whatever ladder this project has cached. Any
-  // provider will do: they are all describing the same piece of work, and the human recognises the
-  // names either way. Null when no ladder has been reported yet, and the dashboard then says nothing
-  // rather than falling back to a score nobody can act on.
-  _rungLabelFor(projectId, level) {
-    const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
-    if (!project?.root) return null;
-    let ladders;
-    try { ladders = loadLadders(project.root); } catch { return null; }
-    const entry = Object.values(ladders.providers)[0];
-    if (!entry?.ladder?.length) return null;
-    return rungLabel(entry.ladder[requiredRung(level, entry.ladder.length)]);
-  }
-
-  // The ladder this provider reported, and where this session sits on it. Everything about model
-  // selection reads through here, so there is one place that decides what "too hard for you" means.
-  //
-  // A missing ladder, an unrecognised current model, or a session that never said what it is running
-  // all resolve to "cannot judge", and cannot-judge never withholds work. Silence has to mean the
-  // team keeps working, or one unreported field stalls the board.
-  agentRung(agent, projectRoot) {
-    if (!agent?.provider) return null;
-    let ladders;
-    try { ladders = loadLadders(projectRoot); } catch { return null; }
-    const entry = ladders.providers[agent.provider];
-    if (!entry?.ladder?.length) return null;
-    const at = currentRung(entry.ladder, agent.current_model, agent.current_effort);
-    return { ladder: entry.ladder, at, source: entry.source, reportedAt: entry.reportedAt };
-  }
-
-  #aboveCurrentRung(agent, candidate) {
-    const rung = this.agentRung(agent, candidate.project_root);
-    if (!rung || rung.at < 0) return false;
-    const assessment = this.db.prepare(`
-      SELECT level FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
-      ORDER BY created_at DESC LIMIT 1
-    `).get(candidate.id);
-    if (!assessment) return false;
-    return requiredRung(assessment.level, rung.ladder.length) > rung.at;
-  }
-
-  // What is waiting for a stronger session, in the words the human will recognise. Returned with the
-  // idle answer so "nothing for me" can never be mistaken for "the work is finished".
-  workAboveCurrentRung(agentId) {
-    const agent = this.getAgent(agentId);
-    if (!agent) return null;
-    const rooms = this._claimableTaskIds(agentId);
-    if (!rooms.length) return null;
-    const placeholders = rooms.map(() => "?").join(", ");
-    const queued = this.db.prepare(`
-      SELECT a.id, a.title, a.task_id, t.title AS task_title, p.root AS project_root
-      FROM assignments a
-      JOIN tasks t ON t.id = a.task_id
-      JOIN projects p ON p.id = t.project_id
-      WHERE a.status = 'queued' AND a.task_id IN (${placeholders})
-    `).all(...rooms);
-    const held = [];
-    let rung = null;
-    for (const candidate of queued) {
-      rung = rung || this.agentRung(agent, candidate.project_root);
-      if (!rung || rung.at < 0) return null;
-      if (!this.#aboveCurrentRung(agent, candidate)) continue;
-      const assessment = this.db.prepare(`
-        SELECT level FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
-        ORDER BY created_at DESC LIMIT 1
-      `).get(candidate.id);
-      held.push({
-        assignmentId: candidate.id,
-        title: candidate.title,
-        taskId: candidate.task_id,
-        taskTitle: candidate.task_title,
-        level: assessment?.level || null,
-        needs: rungLabel(rung.ladder[requiredRung(assessment?.level, rung.ladder.length)]),
-      });
-    }
-    if (!held.length) return null;
-    const needed = [...new Set(held.map((item) => item.needs).filter(Boolean))];
-    return {
-      running: rungLabel(rung.ladder[rung.at]),
-      needs: needed,
-      assignments: held.slice(0, 10),
-      count: held.length,
-      message: `${held.length} assignment${held.length === 1 ? "" : "s"} on this board ${held.length === 1 ? "needs" : "need"} ${needed.join(" or ")}, and this session is running ${rungLabel(rung.ladder[rung.at])}.`,
-      humanAction: "Start a fresh session on that model and join this same task. Nothing is lost and nothing needs replanning: the task, its queue, its history and its memory are all still here, and the new session picks up exactly where this one stopped.",
-    };
-  }
-
   claimNextAssignment(agentId) {
     this._reapStaleAgents();
     this._recoverOrphanedClaims();
@@ -1449,9 +1210,8 @@ export class DevTeamStore extends EventEmitter {
       // on its own to say which one held an assignment back. The write lease is not part of it: it
       // is no longer project-wide, so it is resolved per path in the loop below and non-overlapping
       // writers run in parallel.
-      // The write lease and the runtime gate are resolved per candidate below rather than in SQL,
-      // so a fixed window would let work that *is* claimable hide behind a screenful of lease-blocked
-      // rows — the scan would hand out nothing while whyNotClaimable correctly reported the item as
+      // The write lease is resolved per candidate below rather than in SQL, so a fixed window would
+      // let work that *is* claimable hide behind a screenful of lease-blocked rows — the scan would hand out nothing while whyNotClaimable correctly reported the item as
       // claimable. Page instead of truncating, so the two can only disagree on a board larger than
       // any this server is meant to hold.
       const readCandidatePage = (offset) => this.db.prepare(`
@@ -1499,11 +1259,6 @@ export class DevTeamStore extends EventEmitter {
         // depends on who authored the current version and on who is connected right now, neither of which the scan's
         // single query can see.
         if (candidate.verifies && this._verifierIsAuthor(agentId, candidate)) continue;
-        // Above this session's rung: skipped, not blocked. The agent goes on to take everything it
-        // *can* do, and only when nothing claimable is left does it go idle saying what remains and
-        // what that work needs. Stopping at the first hard item instead would strand work the
-        // current model was perfectly capable of finishing.
-        if (this.#aboveCurrentRung(agent, candidate)) continue;
         const claimToken = randomBytes(18).toString("base64url");
         const result = this.db.prepare(`
           UPDATE assignments

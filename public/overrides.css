@@ -1353,10 +1353,6 @@
 .member-row.gone:hover { opacity: 0.85; }
 
 /* Provider-neutral runtime recommendation and decision UI. */
-.complexity { margin: 8px 0; padding: 8px; border: 1px solid #273446; border-radius: 8px; display: grid; gap: 3px; background: #101720; }
-.complexity > strong { text-transform: capitalize; color: #b9d9ff; }
-.complexity > span, .complexity > small { color: var(--muted); }
-.complexity.pending { background: transparent; border-style: dashed; }
 .runtime-profile { color: #9fbce0 !important; }
 .runtime-profile.unknown { color: var(--muted) !important; }
 .runtime-dialog { width: min(700px, calc(100vw - 28px)); }

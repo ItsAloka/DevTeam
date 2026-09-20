@@ -164,21 +164,6 @@ export function applySchema(db) {
       PRIMARY KEY (project_id, key)
     );
 
-    CREATE TABLE IF NOT EXISTS complexity_assessments (
-      id TEXT PRIMARY KEY,
-      assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
-      assignment_version INTEGER NOT NULL,
-      task_version INTEGER NOT NULL,
-      evidence_hash TEXT NOT NULL,
-      policy_version INTEGER NOT NULL,
-      score INTEGER NOT NULL,
-      level TEXT NOT NULL,
-      reasons TEXT NOT NULL,
-      requirements TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      invalidated_at TEXT NULL
-    );
-
     -- What an agent reported its checks did. Every row is the agent's own word: DevTeam used to run
     -- allowlisted commands itself and grade them by exit code, and the columns for that (argv,
     -- exit code, duration, captured output, a verified flag) are gone with the executor.
@@ -277,7 +262,6 @@ export function applySchema(db) {
     CREATE INDEX IF NOT EXISTS idx_receipts_agent ON message_receipts(agent_id, delivered_at, seen_at);
     CREATE INDEX IF NOT EXISTS idx_proposals_task_status ON proposals(task_id, status);
     CREATE INDEX IF NOT EXISTS idx_task_members_agent ON task_members(agent_id);
-    CREATE INDEX IF NOT EXISTS idx_complexity_assignment ON complexity_assessments(assignment_id, created_at DESC);
     PRAGMA optimize;
   `);
   // Additive columns for databases created before consensus snapshots/quorum/timeout existed.
@@ -289,15 +273,13 @@ export function applySchema(db) {
     ["assignments", "claim_generation", "INTEGER NOT NULL DEFAULT 0"], // bumped every (re)claim, for lease fencing
     ["assignments", "claim_token_hash", "TEXT"],                        // hashed fencing token for the live claim
     ["assignments", "assignment_version", "INTEGER NOT NULL DEFAULT 1"],
-    ["assignments", "complexity_override", "TEXT"],
     ["tasks", "session_policy", "TEXT NOT NULL DEFAULT 'manual'"],
     ["tasks", "session_policy_version", "INTEGER NOT NULL DEFAULT 1"],
     ["agents", "session_generation", "INTEGER NOT NULL DEFAULT 1"],
     ["agents", "fresh_task_id", "TEXT"],
     ["agents", "replaced_by_agent_id", "TEXT"],
-    // What this session reports it is running right now. Free text in the agent's own words: it is
-    // the one party that actually knows, and DevTeam compares it only against that provider's own
-    // reported ladder, never across vendors.
+    // What this session reports it is running right now, in its own words. Recorded so the board
+    // and the timeline can say who did what; nothing schedules on it.
     ["agents", "current_model", "TEXT"],
     ["agents", "current_effort", "TEXT"],
     ["events", "author_name", "TEXT"],                                   // who wrote it, kept even after the agent row is purged
@@ -349,7 +331,11 @@ export function applySchema(db) {
   // tables nothing writes and nothing reads — a trap for whoever next goes looking for where
   // verification lives. assignment_checks keeps its now-unwritten command columns: SQLite drops a
   // column only by rebuilding the table, and a stale nullable column costs nothing.
-  for (const table of ["checklist_deliveries", "checklist_items", "domains", "project_check_commands", "jobs"]) {
+  // complexity_assessments held a 0–16 score per assignment and the model rung it implied. Nothing
+  // scores work any more: an agent takes what it can take, so the score gated nothing and the table
+  // has no reader left. assignments.complexity_override stays as a stale nullable column, for the
+  // reason given above.
+  for (const table of ["checklist_deliveries", "checklist_items", "domains", "project_check_commands", "jobs", "complexity_assessments"]) {
     try { db.exec(`DROP TABLE IF EXISTS ${table}`); } catch { /* an older engine without the table */ }
   }
   // Baselines used to be keyed by the argv DevTeam ran; they are now keyed by the reported label.

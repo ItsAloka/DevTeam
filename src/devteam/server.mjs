@@ -280,9 +280,6 @@ export async function startDevTeamServer({
     requireFields(req.body, ["title", "description"]);
     res.status(201).json(store.createAssignment({ ...req.body, taskId: req.params.taskId }));
   });
-  app.get("/api/assignments/:assignmentId/assessment", requireControlAuth, (req, res) => {
-    res.json(store.assignmentAssessment({ assignmentId: req.params.assignmentId }));
-  });
   app.get("/api/assignments/:assignmentId/why-not-claimable", (req, res) => {
     // The dashboard asks agent-agnostically ("why is this queued item stuck?"); passing agentId
     // answers the sharper question of why one particular teammate cannot take it. Naming an agent
@@ -295,9 +292,6 @@ export async function startDevTeamServer({
       store.assertExplainable(agentId, room);
     }
     return res.json(store.whyNotClaimable(req.params.assignmentId, agentId));
-  });
-  app.patch("/api/assignments/:assignmentId/complexity", (req, res) => {
-    res.json(store.setAssignmentComplexityOverride({ assignmentId: req.params.assignmentId, override: req.body?.override ?? req.body ?? null }));
   });
   app.post("/api/tasks/:taskId/messages", (req, res) => {
     requireFields(req.body, ["message"]);

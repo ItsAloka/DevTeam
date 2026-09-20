@@ -462,18 +462,7 @@ function renderTask(task) {
     const rework = item.rework_requested_at
       ? `<div class="rework"><strong>Changes requested${Number(item.rework_count) > 1 ? ` · ${Number(item.rework_count)} times` : ""}</strong><span>${escapeHtml(item.rework_summary || "Sent back to its author.")}</span>${findings}</div>`
       : (item.findings?.length ? `<div class="rework"><strong>Open findings</strong>${findings}</div>` : "");
-    // Complexity answers "is this the right agent and model for the job", which is a question about
-    // work not yet finished. On a done card it is history, and it was the single most repeated block
-    // on the board. The "assessment pending" placeholder is gone outright: an absent assessment now
-    // says nothing rather than taking a line to announce its own absence on every card.
-    const assessment = item.assessment;
-    const assessmentView = assessment && leaseIsLive
-      // Lead with the model this needs, in the names the ladder reported. The level and score are
-      // DevTeam's own vocabulary and stay as the small print — useful when you want to know why, and
-      // meaningless as a headline. With no ladder reported yet, the level leads instead.
-      ? `<div class="complexity"><strong>${item.needsRung ? `Needs ${escapeHtml(item.needsRung)}` : escapeHtml(assessment.level)}</strong>${item.needsRung ? `<span>${escapeHtml(assessment.level)} · score ${Number(assessment.score)}</span>` : ""}<small>${assessment.reasons.slice(0, 2).map((reason) => escapeHtml(reason.detail)).join(" · ") || "Ordinary scoped work."}</small></div>`
-      : "";
-    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write && leaseIsLive ? " · write lease" : ""}</p>${assessmentView}${rework}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${sendBack}${release}</div></div>`;
+    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write && leaseIsLive ? " · write lease" : ""}</p>${rework}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${sendBack}${release}</div></div>`;
   }).join("") || `<p class="hint">Waiting for the plan</p>`;
   renderRegressions(task);
   renderRoleOptions($("#proposal-role"), task.roleCatalogue);
