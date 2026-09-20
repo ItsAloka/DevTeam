@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { DevTeamStore, DOMAINS, normalizeDomains } from "../src/devteam/store.mjs";
+import { DevTeamStore, normalizeDomains } from "../src/devteam/store.mjs";
 import { applySchema } from "../src/devteam/schema.mjs";
 import { clearChecklistCache, listChecklistDomains } from "../src/devteam/checklists.mjs";
 
@@ -30,16 +30,11 @@ async function fixture(t) {
   return { store, checklistDir, writeChecklist, project: store.ensureProject("Domains", projectRoot) };
 }
 
-// DEFAULT_DOMAINS is no longer the vocabulary — it is the list domain *inference* knows markers for,
-// and the set of example checklists DevTeam ships. It never makes a domain selectable on its own.
-test("the shipped domain names are a fixed list and cannot be mutated", () => {
-  assert.deepEqual([...DOMAINS], ["web", "backend", "mobile", "desktop", "game", "ml", "data", "devops", "docs", "embedded", "security"]);
-  assert.throws(() => { DOMAINS.push("frontend"); });
-});
-
-test("a built-in name with no file is not a domain", async (t) => {
+// There is no built-in vocabulary left: a name DevTeam ships a checklist for upstream is still not a
+// domain in a project whose checklist directory does not hold that file.
+test("a name with no file is not a domain", async (t) => {
   const { store, project, checklistDir } = await fixture(t);
-  assert.equal(store.domainNames().includes("desktop"), false, "shipped in DEFAULT_DOMAINS, but no file here");
+  assert.equal(store.domainNames().includes("desktop"), false, "shipped as an example, but no file here");
   assert.throws(() => store.createTask({ projectId: project.id, title: "D", description: "d", domains: ["desktop"] }), /Unknown domain/);
   // Renaming a file renames the domain: no ghost entry survives for the old name.
   await rm(path.join(checklistDir, "web.md"));
@@ -98,13 +93,16 @@ test("the store no longer registers domains itself", async (t) => {
   assert.equal(typeof store.removeDomain, "undefined");
 });
 
+// The allowed names are always passed in, because they come from the checklist directory rather than
+// from any list this module holds. Output follows that list's order, not the caller's.
 test("normalizeDomains validates, dedupes, lowercases and orders; undefined stays undefined", () => {
-  assert.equal(normalizeDomains(undefined), undefined);
-  assert.equal(normalizeDomains(null), undefined);
-  assert.deepEqual(normalizeDomains([]), []);
-  assert.deepEqual(normalizeDomains([" Mobile", "web", "mobile"]), ["web", "mobile"]);
-  assert.throws(() => normalizeDomains(["nope"]), /Unknown domain\(s\): nope/);
-  assert.throws(() => normalizeDomains("web"), /must be an array/);
+  const allowed = ["web", "mobile", "backend"];
+  assert.equal(normalizeDomains(undefined, allowed), undefined);
+  assert.equal(normalizeDomains(null, allowed), undefined);
+  assert.deepEqual(normalizeDomains([], allowed), []);
+  assert.deepEqual(normalizeDomains([" Mobile", "web", "mobile"], allowed), ["web", "mobile"]);
+  assert.throws(() => normalizeDomains(["nope"], allowed), /Unknown domain\(s\): nope/);
+  assert.throws(() => normalizeDomains("web", allowed), /must be an array/);
 });
 
 test("a task with domains persists them and its assignments inherit or override", async (t) => {

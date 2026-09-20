@@ -4,12 +4,9 @@ import { mkdirSync, statSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { applySchema } from "./schema.mjs";
-import { DEFAULT_DOMAINS, DOMAIN_NAME_PATTERN, normalizeDomains } from "./domains.mjs";
+import { DOMAIN_NAME_PATTERN, normalizeDomains } from "./domains.mjs";
 import { DEFAULT_CHECKLIST_DIRNAME, listChecklistDomains, loadChecklist } from "./checklists.mjs";
 
-// Kept under its original export name for inference and the shipped checklist examples. The live
-// vocabulary is the checklist directory plus names already carried by existing tasks.
-export const DOMAINS = DEFAULT_DOMAINS;
 export { normalizeDomains };
 import { fromJson, json, now } from "./util.mjs";
 import { checksMethods } from "./store-checks.mjs";
