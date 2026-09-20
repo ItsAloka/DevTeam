@@ -504,11 +504,6 @@ export class DevTeamStore extends EventEmitter {
     return reaped;
   }
 
-  // Role checklists a planner can attach to review work so the team systematically
-  // covers the usual blind spots instead of eyeballing a diff. Attached automatically
-  // to review/security/test assignments unless the caller overrides them.
-  // A project's roles, cached until its `.devteam/roles.json` changes on disk. The mtime check keeps
-  // an edit picked up without a restart while not re-reading the file on every assignment.
   // What a role name means: whether it verifies, plans, or writes, and the checklist its
   // assignments carry. There are three roles and they are the same in every project, so this takes
   // no project: see roles.mjs for why the vocabulary stopped being configurable.
