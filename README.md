@@ -271,5 +271,3 @@ npm run mutation  # breaks one scheduling rule at a time; every behavioural muta
 ```
 
 A soak failure names a seed. Put that seed in `SEEDS` in `test/devteam-scheduler-properties.test.mjs` and it becomes a permanent regression test — that is the workflow the soak exists to feed. Both run nightly in `.github/workflows/nightly.yml` alongside the suite.
-
-The original command-line bridge remains available as `bridge`, but DevTeam is the recommended desktop/MCP workflow.

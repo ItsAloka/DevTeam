@@ -4,8 +4,7 @@
   "description": "A local dashboard and MCP coordination server for AI development teams.",
   "type": "module",
   "bin": {
-    "devteam": "bin/devteam.mjs",
-    "bridge": "bin/bridge.mjs"
+    "devteam": "bin/devteam.mjs"
   },
   "scripts": {
     "dev": "node bin/devteam.mjs start",
