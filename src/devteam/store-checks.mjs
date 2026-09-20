@@ -1,5 +1,16 @@
-// Verified checks, check baselines and regression detection: the part of DevTeamStore that answers
-// "did this actually pass", as opposed to "who does this work go to".
+// Reported checks, check baselines and regression detection: the part of DevTeamStore that answers
+// "what has this task's suite been doing", as opposed to "who does this work go to".
+//
+// DevTeam used to run checks itself. A human allowlisted commands per project, an agent named one in
+// its report, and DevTeam spawned it in the project root and graded it by exit code. That machinery
+// — executor, argv allowlist, Node permission sandbox, the off-event-loop verifying window and its
+// durable job row — is gone. It was off by default and stayed off, which meant the distinction it
+// bought (verified vs. asserted) was never true in practice, while every path in this file had to
+// carry it. What remains is the part that earned its keep: noticing that a check which used to pass
+// now fails, and routing a fix to whoever plausibly broke it.
+//
+// So a check is now the agent's word: a label plus, optionally, a status it reports. That is weaker
+// evidence and the code says so plainly rather than dressing it up.
 //
 // Composed onto DevTeamStore.prototype as a mixin rather than held as a collaborator object. These
 // methods call the store's own internals constantly, and a collaborator would have had to be handed
@@ -7,177 +18,59 @@
 // that the internals they reach for cannot be #private; see the note on _transaction in store.mjs.
 import { randomUUID } from "node:crypto";
 import { fromJson, json, now } from "./util.mjs";
-import {
-  CHECK_ALLOWLIST_LIMIT,
-  matchCheckCommand,
-  normalizeCheckCommand,
-  packageScriptCommands,
-  projectDeclaredCommands,
-  resolveLocalBinary,
-  runVerifiedCheck,
-  VERIFIED_CHECKS_PER_REPORT,
-} from "./checks.mjs";
+
+// How many checks one report may carry. A report listing a hundred lines is not evidence, it is a
+// log, and the timeline is not where a log belongs.
+export const CHECKS_PER_REPORT = 100;
 
 export const checksMethods = {
-  // The commands DevTeam is allowed to run for this project. This is the whole authority: an empty
-  // list means nothing is ever executed and every reported check stays visibly agent-asserted.
-  // Whether this project confines its checks. Off by default: turning it on can break a suite that
-  // reaches outside the project root, so it is the human's decision like the allowlist itself.
-  projectCheckSandbox(projectId) {
-    return Boolean(this.db.prepare("SELECT check_sandbox FROM projects WHERE id = ?").get(projectId)?.check_sandbox);
-  },
-
-  projectCheckCommands(projectId) {
-    return this.db.prepare("SELECT name, argv FROM project_check_commands WHERE project_id = ? ORDER BY name ASC")
-      .all(projectId)
-      .map((row) => ({ name: row.name, argv: fromJson(row.argv, []) }))
-      .filter((entry) => Array.isArray(entry.argv) && entry.argv.length);
-  },
-
-  // What the project's package.json offers, so a human can see what enabling verification would
-  // allow *before* enabling it. Reading this executes nothing and authorizes nothing.
-  availableCheckCommands(projectId) {
-    const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
-    if (!project) throw new Error("Project not found.");
-    return this._derivableCheckCommands(project.root);
-  },
-
-  // Everything this project *could* offer: what it declares for itself in .devteam/checks.json, plus
-  // whatever is derivable from package.json if it happens to be a Node package. Declared entries win
-  // on a name collision — a human writing the file is a stronger statement of intent than a script
-  // body DevTeam parsed. Every entry has its local-binary shim resolved here, so what the dashboard
-  // shows before enabling is exactly the argv that would run.
-  _derivableCheckCommands(projectRoot) {
-    const declared = projectDeclaredCommands(projectRoot);
-    const derived = packageScriptCommands(projectRoot).map((entry) => ({ ...entry, source: "package.json" }));
-    const byName = new Map();
-    for (const entry of [...derived, ...declared]) {
-      byName.set(entry.name, { ...entry, argv: resolveLocalBinary(projectRoot, entry.argv) });
-    }
-    return [...byName.values()].slice(0, CHECK_ALLOWLIST_LIMIT);
-  },
-
-  // Turn verification on (or off) for a project. Passing no commands snapshots the project's own
-  // package.json scripts; passing an explicit list stores exactly that; passing an empty list turns
-  // verification back off. Snapshotting is what keeps this safe — an agent that later edits a script
-  // body changes nothing, because the argv DevTeam runs was pinned here by a human.
-  setProjectCheckCommands({ projectId, commands = null, sandbox = null }) {
-    const project = this.db.prepare("SELECT id, root FROM projects WHERE id = ?").get(projectId);
-    if (!project) throw new Error("Project not found.");
-    const requested = commands === null ? this._derivableCheckCommands(project.root) : commands;
-    if (!Array.isArray(requested)) throw new Error("Check commands must be a list.");
-    const entries = [];
-    const seen = new Set();
-    for (const candidate of requested.slice(0, CHECK_ALLOWLIST_LIMIT)) {
-      const entry = normalizeCheckCommand(candidate);
-      if (!entry) throw new Error(`Unusable check command: ${JSON.stringify(candidate)?.slice(0, 120)}. A command is a name plus an argv list whose program is a bare executable name.`);
-      if (seen.has(entry.name)) continue;
-      seen.add(entry.name);
-      // A human typing `eslint` means the one installed in this project. Resolve it here, at the
-      // moment of pinning, so the stored argv is runnable rather than a name that fails to spawn.
-      entries.push({ ...entry, argv: resolveLocalBinary(project.root, entry.argv) });
-    }
-    const stamp = now();
-    this._transaction(() => {
-      this.db.prepare("DELETE FROM project_check_commands WHERE project_id = ?").run(projectId);
-      for (const entry of entries) {
-        this.db.prepare("INSERT INTO project_check_commands (project_id, name, argv, created_at) VALUES (?, ?, ?, ?)")
-          .run(projectId, entry.name, json(entry.argv), stamp);
-      }
-      if (sandbox !== null) this.db.prepare("UPDATE projects SET check_sandbox = ? WHERE id = ?").run(sandbox ? 1 : 0, projectId);
-    });
-    this._changed("project.check_commands");
-    return {
-      projectId, commands: entries, verificationEnabled: entries.length > 0,
-      sandbox: this.projectCheckSandbox(projectId),
-    };
-  },
-
-  // What a report claimed and what DevTeam found. Every record says whether it was verified, so an
-  // unverified assertion can never be displayed as if DevTeam had confirmed it.
+  // What a report claimed. Every record is the agent's assertion — there is no other kind now — so
+  // nothing here needs a flag distinguishing the two.
   _checksFor(assignmentId) {
     return this.db.prepare(`
-      SELECT label, requested_command, command, verified, status, exit_code, duration_ms, output, created_at
+      SELECT label, status, created_at
       FROM assignment_checks WHERE assignment_id = ? AND superseded_at IS NULL
       ORDER BY created_at ASC, rowid ASC
     `).all(assignmentId).map((row) => ({
       label: row.label,
-      requestedCommand: row.requested_command,
-      command: fromJson(row.command, null),
-      verified: Boolean(row.verified),
       status: row.status,
-      exitCode: row.exit_code,
-      durationMs: row.duration_ms,
-      output: row.output,
-      // The dashboard and the task detail payload both read this, so an unverified claim is labeled
-      // wherever it is shown rather than only where someone remembered to label it.
-      agentAsserted: !row.verified,
       createdAt: row.created_at,
     }));
   },
 
-  // Normalize what an agent reported, then verify whatever it asked DevTeam to verify. A check is a
-  // plain string (an assertion, as before) or { label, command } where command *selects* an entry
-  // from the project's allowlist. The selected entry's argv is what runs; the agent's text never is.
-  async _gradeReportedChecks(assignment, task, checks) {
-    const allowlist = task?.project_id ? this.projectCheckCommands(task.project_id) : [];
-    const sandbox = task?.project_id ? this.projectCheckSandbox(task.project_id) : false;
+  // Normalize what an agent reported. A check is a plain string — a bare assertion, no claim either
+  // way about the outcome — or { label, status } where status is the result the agent is reporting.
+  // An unrecognized status is recorded as a bare assertion rather than being guessed into a result:
+  // inventing "passed" from a typo is exactly how an unearned green mark gets onto the board.
+  _normalizeReportedChecks(checks) {
     const records = [];
-    let executed = 0;
-    // The configured timeout is the budget for the *report*, not for each command in it. Checks no
-    // longer block the event loop, so this is no longer about keeping the server alive — it is about
-    // keeping one report bounded: the refusal path deliberately leaves the claim intact, so ten
-    // allowlisted checks at the default timeout could otherwise be replayed forever, each round
-    // holding a write lease for twenty minutes while the rest of the team waited on those paths.
-    const budgetStartedAt = Date.now();
-    const remainingBudget = () => this.checkTimeoutMs - (Date.now() - budgetStartedAt);
-    for (const item of Array.isArray(checks) ? checks.slice(0, 100) : []) {
+    for (const item of Array.isArray(checks) ? checks.slice(0, CHECKS_PER_REPORT) : []) {
       const isObject = item && typeof item === "object" && !Array.isArray(item);
-      const requested = isObject ? String(item.command ?? "").trim() : "";
-      const label = String((isObject ? (item.label ?? item.command ?? "") : item) ?? "").trim();
+      const label = String((isObject ? item.label : item) ?? "").trim();
       if (!label) continue;
-      const record = { label: label.slice(0, 500), requestedCommand: requested ? requested.slice(0, 200) : null, command: null, verified: false, status: "asserted", exitCode: null, durationMs: null, output: null };
-      const entry = requested ? matchCheckCommand(allowlist, requested) : null;
-      if (requested && !entry) {
-        // The agent asked for something the human never allowlisted. Recorded plainly as
-        // unavailable: DevTeam refuses to run it *and* refuses to call it verified.
-        record.status = "unavailable";
-        record.output = allowlist.length
-          ? "No allowlisted command matches this name for the project."
-          : "Command verification is not enabled for this project.";
-      } else if (entry && executed >= VERIFIED_CHECKS_PER_REPORT) {
-        record.status = "unavailable";
-        record.output = `Only ${VERIFIED_CHECKS_PER_REPORT} commands are executed per report.`;
-      } else if (entry && remainingBudget() <= 1000) {
-        record.status = "unavailable";
-        record.output = `The ${this.checkTimeoutMs}ms verification budget for this report was already spent.`;
-      } else if (entry) {
-        executed += 1;
-        record.command = entry.argv;
-        Object.assign(record, await runVerifiedCheck({
-          argv: entry.argv,
-          cwd: task.project_root,  // pinned to the project root; nothing selects a working directory
-          timeoutMs: remainingBudget(),
-          sandbox,
-        }));
-      }
-      records.push(record);
+      const reported = isObject ? String(item.status ?? "").trim().toLowerCase() : "";
+      records.push({
+        label: label.slice(0, 500),
+        status: ["passed", "failed"].includes(reported) ? reported : "asserted",
+      });
     }
     return records;
   },
 
   // T2.3 — regression awareness.
   //
-  // Verified checks always produced the raw material (exit codes over time) but nothing compared two
-  // runs, so nothing in DevTeam ever noticed that agent B broke what agent A delivered. A team that
-  // cannot see that cannot cover for each other; it is just several agents in one room.
+  // Nothing in DevTeam used to notice that agent B broke what agent A delivered. A team that cannot
+  // see that cannot cover for each other; it is just several agents in one room.
   //
-  // The comparison is per task, per *command*, and only over verified results. A label is prose an
-  // agent chose; the argv is the allowlist entry DevTeam actually ran, so two agents describing the
-  // same suite differently still compare against the same baseline, and an assertion can neither
-  // establish a baseline nor quietly repair one.
-  _checkCommandKey(record) {
-    return Array.isArray(record.command) ? json(record.command) : null;
+  // The comparison is per task, per check. The key used to be the argv DevTeam ran, which made two
+  // agents describing the same suite differently still compare against one baseline. Without an
+  // executor the only stable handle left is the label itself, normalized for case and spacing — so
+  // "npm test" and "NPM  test" compare, and "ran the test suite" is a different check. That is a
+  // real loss of precision and the honest way to state it is in a comment, not in a heuristic that
+  // guesses which prose means which suite.
+  _checkKey(record) {
+    const key = String(record.label ?? "").trim().toLowerCase().replace(/\s+/gu, " ");
+    return key || null;
   },
 
   // Who plausibly broke it. Not "the agent that reported the failure" — that agent is usually the one
@@ -215,26 +108,26 @@ export const checksMethods = {
     return [...suspects.values()];
   },
 
-  // Compare this report's verified checks against the task's baseline, record the new baseline, and
-  // return whatever regressed. Called on both report paths — a refused report is still evidence, and
-  // is in fact the path on which a regression is most often first seen.
+  // Compare this report's checks against the task's baseline, record the new baseline, and return
+  // whatever regressed. Called on both report paths — a refused report is still evidence, and is in
+  // fact the path on which a regression is most often first seen.
   _recordCheckBaselines({ taskId, assignmentId, records, version, stamp }) {
     const regressions = [];
     for (const record of records) {
-      if (!record.verified) continue;                          // assertions never touch a baseline
-      if (!["passed", "failed"].includes(record.status)) continue; // 'unavailable' is not a result
-      const commandKey = this._checkCommandKey(record);
-      if (!commandKey) continue;
-      const previous = this.db.prepare("SELECT * FROM check_baselines WHERE task_id = ? AND command_key = ?").get(taskId, commandKey);
+      // A bare assertion states no outcome, so it can neither establish a baseline nor quietly
+      // repair one. Only a reported pass or fail moves anything.
+      if (!["passed", "failed"].includes(record.status)) continue;
+      const checkKey = this._checkKey(record);
+      if (!checkKey) continue;
+      const previous = this.db.prepare("SELECT * FROM check_baselines WHERE task_id = ? AND check_key = ?").get(taskId, checkKey);
       const regressed = previous?.status === "passed" && record.status === "failed";
       if (regressed) {
         const suspects = this._regressionSuspects(taskId, previous.last_passed_event_id,
           [assignmentId, previous.last_passed_assignment_id]);
         regressions.push({
           id: randomUUID(),
-          commandKey,
+          checkKey,
           label: record.label,
-          command: record.command,
           lastPassedAt: previous.last_passed_at || previous.updated_at,
           lastPassedAssignmentId: previous.last_passed_assignment_id || previous.assignment_id || null,
           suspects,
@@ -244,9 +137,9 @@ export const checksMethods = {
       // event, so the mark never includes the report that set it.
       const timelineMark = Number(this.db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM events WHERE task_id = ?").get(taskId).id) || 0;
       this.db.prepare(`
-        INSERT INTO check_baselines (task_id, command_key, status, label, assignment_id, task_version, last_passed_at, last_passed_assignment_id, last_passed_event_id, updated_at)
+        INSERT INTO check_baselines (task_id, check_key, status, label, assignment_id, task_version, last_passed_at, last_passed_assignment_id, last_passed_event_id, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(task_id, command_key) DO UPDATE SET
+        ON CONFLICT(task_id, check_key) DO UPDATE SET
           status = excluded.status, label = excluded.label, assignment_id = excluded.assignment_id,
           task_version = excluded.task_version, updated_at = excluded.updated_at,
           -- Only a pass moves the "last green" mark. Keeping it pinned is what lets the *next*
@@ -254,7 +147,7 @@ export const checksMethods = {
           last_passed_at = CASE WHEN excluded.status = 'passed' THEN excluded.updated_at ELSE check_baselines.last_passed_at END,
           last_passed_assignment_id = CASE WHEN excluded.status = 'passed' THEN excluded.assignment_id ELSE check_baselines.last_passed_assignment_id END,
           last_passed_event_id = CASE WHEN excluded.status = 'passed' THEN excluded.last_passed_event_id ELSE check_baselines.last_passed_event_id END
-      `).run(taskId, commandKey, record.status, record.label, assignmentId, Number(version) || 1,
+      `).run(taskId, checkKey, record.status, record.label, assignmentId, Number(version) || 1,
         record.status === "passed" ? stamp : (previous?.last_passed_at || null),
         record.status === "passed" ? assignmentId : (previous?.last_passed_assignment_id || null),
         record.status === "passed" ? timelineMark : (previous?.last_passed_event_id || 0),
@@ -262,8 +155,8 @@ export const checksMethods = {
       // A check going green again closes whatever it broke, so the board does not accumulate
       // regressions that were quietly fixed by ordinary work.
       if (record.status === "passed") {
-        this.db.prepare("UPDATE check_regressions SET resolved_at = ? WHERE task_id = ? AND command_key = ? AND resolved_at IS NULL")
-          .run(stamp, taskId, commandKey);
+        this.db.prepare("UPDATE check_regressions SET resolved_at = ? WHERE task_id = ? AND check_key = ? AND resolved_at IS NULL")
+          .run(stamp, taskId, checkKey);
       }
     }
     return regressions;
@@ -276,12 +169,12 @@ export const checksMethods = {
   _openRegressions({ taskId, assignmentId, regressions, stamp, projectId }) {
     const opened = [];
     for (const regression of regressions) {
-      // One open fix per broken check. Without this, every subsequent report that runs the same
+      // One open fix per broken check. Without this, every subsequent report that names the same
       // failing suite would queue another near-identical assignment.
       const existing = this.db.prepare(`
         SELECT fix_assignment_id FROM check_regressions
-        WHERE task_id = ? AND command_key = ? AND resolved_at IS NULL AND fix_assignment_id IS NOT NULL LIMIT 1
-      `).get(taskId, regression.commandKey);
+        WHERE task_id = ? AND check_key = ? AND resolved_at IS NULL AND fix_assignment_id IS NOT NULL LIMIT 1
+      `).get(taskId, regression.checkKey);
       let fixAssignmentId = null;
       const soleSuspect = regression.suspects.length === 1 ? regression.suspects[0] : null;
       if (!existing && regression.suspects.length) {
@@ -297,7 +190,7 @@ export const checksMethods = {
           fixAssignmentId, taskId,
           `Fix the regression in “${regression.label}”`,
           [
-            `The check “${regression.label}” passed before and now fails.`,
+            `The check “${regression.label}” was reported as passing before and is now reported as failing.`,
             `It was last green before ${suspectSummary} landed.`,
             regression.suspects.length === 1
               ? `Changed files: ${soleSuspect.changedFiles.join(", ")}.`
@@ -320,18 +213,17 @@ export const checksMethods = {
         }
         this._event(taskId, null, "assignment.created", `Fix the regression in “${regression.label}”`, {
           assignmentId: fixAssignmentId, role: "implementer", requiresWrite: true,
-          targetAgentName: soleSuspect?.author || null, regressionOf: regression.commandKey, writePaths: scope,
+          targetAgentName: soleSuspect?.author || null, regressionOf: regression.checkKey, writePaths: scope,
         });
       }
       this.db.prepare(`
-        INSERT INTO check_regressions (id, task_id, command_key, label, detected_by_assignment_id, last_passed_assignment_id, suspects, fix_assignment_id, created_at)
+        INSERT INTO check_regressions (id, task_id, check_key, label, detected_by_assignment_id, last_passed_assignment_id, suspects, fix_assignment_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(regression.id, taskId, regression.commandKey, regression.label, assignmentId,
+      `).run(regression.id, taskId, regression.checkKey, regression.label, assignmentId,
         regression.lastPassedAssignmentId, json(regression.suspects), fixAssignmentId, stamp);
       this._event(taskId, null, "check.regressed",
-        `“${regression.label}” passed before and now fails${soleSuspect ? `, first failing after “${soleSuspect.title}”` : ""}.`, {
+        `“${regression.label}” was reported passing before and is now reported failing${soleSuspect ? `, first failing after “${soleSuspect.title}”` : ""}.`, {
           label: regression.label,
-          command: regression.command,
           suspects: regression.suspects.map((suspect) => ({ assignmentId: suspect.assignmentId, title: suspect.title, author: suspect.author })),
           fixAssignmentId,
           detectedByAssignmentId: assignmentId,
@@ -339,7 +231,6 @@ export const checksMethods = {
       opened.push({
         id: regression.id,
         label: regression.label,
-        command: regression.command,
         lastPassedAt: regression.lastPassedAt,
         suspects: regression.suspects.map((suspect) => ({ assignmentId: suspect.assignmentId, title: suspect.title, author: suspect.author, changedFiles: suspect.changedFiles })),
         fixAssignmentId,
@@ -352,12 +243,11 @@ export const checksMethods = {
   // Open regressions for a task, for the dashboard and for an agent asking what is currently broken.
   openRegressions(taskId) {
     return this.db.prepare(`
-      SELECT id, command_key, label, detected_by_assignment_id, suspects, fix_assignment_id, created_at
+      SELECT id, check_key, label, detected_by_assignment_id, suspects, fix_assignment_id, created_at
       FROM check_regressions WHERE task_id = ? AND resolved_at IS NULL ORDER BY created_at DESC LIMIT 20
     `).all(taskId).map((row) => ({
       id: row.id,
       label: row.label,
-      command: fromJson(row.command_key, null),
       detectedByAssignmentId: row.detected_by_assignment_id,
       suspects: fromJson(row.suspects, []),
       fixAssignmentId: row.fix_assignment_id,
@@ -365,14 +255,14 @@ export const checksMethods = {
     }));
   },
 
-  // The check baseline for a task: what each verified command last did, and when it was last green.
+  // The check baseline for a task: what each check was last reported to do, and when it was last
+  // green.
   checkBaseline(taskId) {
     return this.db.prepare(`
-      SELECT command_key, status, label, task_version, last_passed_at, updated_at
+      SELECT check_key, status, label, task_version, last_passed_at, updated_at
       FROM check_baselines WHERE task_id = ? ORDER BY label ASC
     `).all(taskId).map((row) => ({
       label: row.label,
-      command: fromJson(row.command_key, null),
       status: row.status,
       taskVersion: row.task_version,
       lastPassedAt: row.last_passed_at,
@@ -383,45 +273,16 @@ export const checksMethods = {
   _storeReportedChecks(assignmentId, taskId, records, stamp) {
     // A rejected report leaves the claim intact so the agent can fix the work and report again, so
     // an assignment accumulates one batch per attempt. Only the latest attempt describes the work as
-    // it now stands: without this, an assignment that failed a check and then passed it would go on
-    // showing the failure forever, and "did a check fail here?" would answer yes about work that is
-    // green. Earlier attempts are kept, marked superseded, so the history is still on record.
+    // it now stands: without this, an assignment that reported a failing check and then a passing one
+    // would go on showing the failure forever, and "did a check fail here?" would answer yes about
+    // work that is green. Earlier attempts are kept, marked superseded, so the history is on record.
     this.db.prepare("UPDATE assignment_checks SET superseded_at = ? WHERE assignment_id = ? AND superseded_at IS NULL")
       .run(stamp, assignmentId);
     for (const record of records) {
       this.db.prepare(`
-        INSERT INTO assignment_checks (
-          id, assignment_id, task_id, label, requested_command, command,
-          verified, status, exit_code, duration_ms, output, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        randomUUID(), assignmentId, taskId, record.label, record.requestedCommand, record.command ? json(record.command) : null,
-        record.verified ? 1 : 0, record.status, record.exitCode ?? null, record.durationMs ?? null, record.output ?? null, stamp,
-      );
+        INSERT INTO assignment_checks (id, assignment_id, task_id, label, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(randomUUID(), assignmentId, taskId, record.label, record.status, stamp);
     }
-  },
-
-  // Whether this report will actually execute anything. A report whose checks are all plain
-  // assertions runs no processes and settles in one turn, so it never enters the verifying window —
-  // flagging it would put a "checks running" state on the board for work nobody is checking.
-  _reportRunsCommands(task, checks) {
-    return this._reportedCheckCommands(task, checks).length > 0;
-  },
-
-  // The allowlisted commands this report will actually execute. Both the verifying window and the
-  // durable job row are about *these*, so they are derived once rather than being decided twice by
-  // two nearly-identical predicates that could drift apart.
-  _reportedCheckCommands(task, checks) {
-    if (!Array.isArray(checks) || !checks.length) return [];
-    const allowlist = task?.project_id ? this.projectCheckCommands(task.project_id) : [];
-    if (!allowlist.length) return [];
-    const commands = [];
-    for (const item of checks.slice(0, 100)) {
-      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-      const requested = String(item.command ?? "").trim();
-      const label = String(item.label ?? item.command ?? "").trim();
-      if (label && requested && matchCheckCommand(allowlist, requested)) commands.push(requested);
-    }
-    return [...new Set(commands)];
   },
 };

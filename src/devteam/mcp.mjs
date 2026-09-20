@@ -390,7 +390,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_report", {
     title: "Report completed work",
-    description: "Complete the currently claimed assignment with evidence. Report exact files and checks; changed files advance the task version and invalidate prior approvals. A check may carry a command, which DevTeam runs itself inside the project root and grades by exit code — a report claiming success for a command that actually fails is refused, and your claim is left intact so you can fix it and report again. Checks without a command are recorded as your assertion and labeled as such. While those commands run the assignment shows as verifying and keeps your claim; if this returns completed:false with a verifying payload, an earlier report of yours is still being checked — wait for it rather than reporting again. status=blocked closes only this assignment and queues planner triage; use devteam_stuck separately only for a genuine task-wide blocker.",
+    description: "Complete the currently claimed assignment with evidence. Report exact files and checks; changed files advance the task version and invalidate prior approvals. DevTeam does not run anything itself — a check is your word, so say plainly whether each one passed or failed. Reporting a check as failed while reporting the work as done is refused, and your claim is left intact so you can fix it and report again; report status=blocked instead if you cannot. DevTeam compares each check against what the task last recorded for it, so a check you report as failing that someone previously reported as passing is raised as a regression and a fix is routed to whoever changed files since. status=blocked closes only this assignment and queues planner triage; use devteam_stuck separately only for a genuine task-wide blocker.",
     inputSchema: {
       agentId: z.string().uuid(),
       assignmentId: z.string().uuid(),
@@ -398,10 +398,10 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       status: z.enum(["done", "blocked"]).default("done").describe("blocked applies only to this assignment and queues planner triage; it does not stop the task"),
       changedFiles: z.array(z.string().max(500)).max(200).default([]),
       checks: z.array(z.union([
-        z.string().max(500).describe("An assertion you are making, recorded and labeled as agent-asserted."),
+        z.string().max(500).describe("A bare assertion, recorded as your word with no pass/fail claim either way. It moves no baseline, so prefer the object form when you actually ran something."),
         z.object({
-          label: z.string().min(1).max(500).describe("How this check should read in the timeline"),
-          command: z.string().max(200).nullish().describe("Name of a command the human allowlisted for this project (for example \"test\", or \"npm run test\"). DevTeam runs it and grades the result; your text only selects an allowlisted entry, it is never executed as written. Omit it, or pass null, for a plain assertion."),
+          label: z.string().min(1).max(500).describe("What you ran, named the same way each time — for example \"npm test\". This label is what DevTeam compares against the task's history, so a different name is a different check."),
+          status: z.enum(["passed", "failed"]).optional().describe("What it did. Omit only when you are not claiming an outcome; an unrecognized value is recorded as a bare assertion rather than guessed."),
         }),
       ])).max(100).default([]),
       disconnectAfter: z.boolean().default(false),

@@ -321,7 +321,6 @@ export const viewMethods = {
       regressions: this.openRegressions(taskId), checkBaseline: this.checkBaseline(taskId),
       reliability: this.teamReliability(),
       // What this server has been running for the task, including anything a restart cut short.
-      jobs: this.jobs(taskId, { limit: 10 }),
       knowledgeVault: {
         automated: this.knowledge.enabled,
         path: path.join(task.project_root, "knowledge"),

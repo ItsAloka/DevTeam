@@ -275,19 +275,19 @@ function eventAuthorName(event) {
   return event.agent_name || event.author_name || "Agent";
 }
 
-// A check DevTeam ran and a check an agent merely claimed must never look alike. Reports written
-// before verification existed carry only strings, and stay labeled as the assertions they were.
+// Every check is the reporting agent's word — DevTeam runs nothing — so the label says what was
+// reported rather than implying DevTeam confirmed it. Reports written before checks carried a status
+// are plain strings, and read as the bare assertions they were.
 function checkLabel(record) {
-  if (record.status === "passed") return `check ✓ ${record.label} · verified (exit 0${record.durationMs != null ? `, ${Math.round(record.durationMs / 100) / 10}s` : ""})`;
-  if (record.status === "failed") return `check ✕ ${record.label} · verified failure${record.exitCode != null ? ` (exit ${record.exitCode})` : ""}`;
-  if (record.status === "unavailable") return `check ? ${record.label} · not run`;
-  return `check: ${record.label} · agent-asserted`;
+  if (record.status === "passed") return `check ✓ ${record.label} · reported passing`;
+  if (record.status === "failed") return `check ✕ ${record.label} · reported failing`;
+  return `check: ${record.label} · asserted`;
 }
 
 function checkChips(metadata) {
   const records = metadata.checkRecords;
   if (Array.isArray(records) && records.length) return records.map(checkLabel);
-  return (metadata.checks || []).map((check) => `check: ${check} · agent-asserted`);
+  return (metadata.checks || []).map((check) => `check: ${check} · asserted`);
 }
 
 function renderEvent(event) {
@@ -454,11 +454,6 @@ function renderTask(task) {
     const hold = item.schedulingHold
       ? `<div class="scheduling-hold"><strong>Held back</strong><span>${escapeHtml(item.schedulingHold.detail)}</span></div>`
       : "";
-    // Verification runs off the event loop, so a report can be in flight for minutes while the
-    // assignment still reads "claimed". Say what it is actually doing rather than looking idle.
-    const verifying = item.verifying_at
-      ? `<div class="verifying"><strong>Checks running</strong><span>DevTeam is running this report's checks — started ${escapeHtml(relativeTime(item.verifying_at))}</span></div>`
-      : "";
     // Work sent back for changes reads as an ordinary queued item unless the card says otherwise,
     // which is exactly how rework used to get silently lost.
     const findings = item.findings?.length
@@ -478,7 +473,7 @@ function renderTask(task) {
       // meaningless as a headline. With no ladder reported yet, the level leads instead.
       ? `<div class="complexity"><strong>${item.needsRung ? `Needs ${escapeHtml(item.needsRung)}` : escapeHtml(assessment.level)}</strong>${item.needsRung ? `<span>${escapeHtml(assessment.level)} · score ${Number(assessment.score)}</span>` : ""}<small>${assessment.reasons.slice(0, 2).map((reason) => escapeHtml(reason.detail)).join(" · ") || "Ordinary scoped work."}</small></div>`
       : "";
-    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write && leaseIsLive ? " · write lease" : ""}</p>${assessmentView}${verifying}${rework}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${sendBack}${release}</div></div>`;
+    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write && leaseIsLive ? " · write lease" : ""}</p>${assessmentView}${rework}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${sendBack}${release}</div></div>`;
   }).join("") || `<p class="hint">Waiting for the plan</p>`;
   renderRegressions(task);
   renderRoleOptions($("#proposal-role"), task.roleCatalogue);
@@ -886,7 +881,6 @@ document.addEventListener("click", async (event) => {
     form.dataset.projectId = project.id;
     form.elements.name.value = project.name;
     form.elements.root.value = project.root;
-    loadProjectCheckCommands(project.id, form);
     $("#project-edit-dialog").showModal();
     return;
   }
@@ -1067,32 +1061,6 @@ $("#task-edit-form").addEventListener("submit", async (event) => {
   } catch (error) { toast(error.message); }
 });
 
-// The check allowlist is a human decision and nothing else can make it: show what enabling would
-// permit *before* it is enabled, so "yes" is an informed answer rather than a shrug.
-async function loadProjectCheckCommands(projectId, form) {
-  const list = $("#project-check-commands");
-  list.innerHTML = `<p class="hint">Loading…</p>`;
-  form.elements.verificationEnabled.checked = false;
-  form.elements.checkSandbox.checked = false;
-  try {
-    const config = await api(`/api/projects/${projectId}/check-commands`);
-    form.elements.verificationEnabled.checked = config.verificationEnabled;
-    form.elements.checkSandbox.checked = Boolean(config.sandbox);
-    // Commands already approved, plus what this project's package.json would add. Scripts DevTeam
-    // cannot run without a shell are simply absent — it never guesses at what a script body meant.
-    const approved = new Map(config.commands.map((entry) => [entry.name, entry]));
-    const offered = config.available.filter((entry) => !approved.has(entry.name));
-    const row = (entry, live) => `<div class="check-command ${live ? "approved" : ""}"><code>${escapeHtml(entry.name)}</code><span>${escapeHtml(entry.argv.join(" "))}</span></div>`;
-    list.innerHTML = [
-      config.commands.length ? `<p class="hint">Currently allowed:</p>${config.commands.map((entry) => row(entry, true)).join("")}` : "",
-      offered.length ? `<p class="hint">${config.verificationEnabled ? "Also available in package.json (saving re-snapshots all of them):" : "Would be allowed from package.json:"}</p>${offered.map((entry) => row(entry, false)).join("")}` : "",
-      config.commands.length || offered.length ? "" : `<p class="hint">This project's package.json offers no script DevTeam can run without a shell.</p>`,
-    ].filter(Boolean).join("");
-  } catch (error) {
-    list.innerHTML = `<p class="hint">Could not read the allowlist: ${escapeHtml(error.message)}</p>`;
-  }
-}
-
 $("#project-edit-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.target;
@@ -1101,15 +1069,6 @@ $("#project-edit-form").addEventListener("submit", async (event) => {
   const values = Object.fromEntries(new FormData(form));
   try {
     await api(`/api/projects/${projectId}`, { method: "PATCH", body: JSON.stringify({ name: values.name, root: values.root }) });
-    // Saved after the folder, because re-pointing the folder clears the allowlist by design: the
-    // commands were approved against the tree the human was looking at.
-    await api(`/api/projects/${projectId}/check-commands`, {
-      method: "PUT",
-      body: JSON.stringify({
-        ...(values.verificationEnabled ? {} : { commands: [] }),
-        sandbox: Boolean(values.checkSandbox),
-      }),
-    });
     form.closest("dialog").close(); await refresh(); toast("Project updated");
   } catch (error) { toast(error.message); }
 });

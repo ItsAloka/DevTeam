@@ -179,30 +179,15 @@ export function applySchema(db) {
       invalidated_at TEXT NULL
     );
 
-    -- The per-project allowlist of commands DevTeam may run to verify a reported check. Empty
-    -- means verification is off for the project and every check stays agent-asserted. Rows are a
-    -- pinned snapshot, never a live read of package.json: see the note in checks.mjs.
-    CREATE TABLE IF NOT EXISTS project_check_commands (
-      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-      name TEXT NOT NULL,
-      argv TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      PRIMARY KEY (project_id, name)
-    );
-
-    -- What a report actually claimed, and what DevTeam found when it looked.
+    -- What an agent reported its checks did. Every row is the agent's own word: DevTeam used to run
+    -- allowlisted commands itself and grade them by exit code, and the columns for that (argv,
+    -- exit code, duration, captured output, a verified flag) are gone with the executor.
     CREATE TABLE IF NOT EXISTS assignment_checks (
       id TEXT PRIMARY KEY,
       assignment_id TEXT NOT NULL,
       task_id TEXT NOT NULL,
       label TEXT NOT NULL,
-      requested_command TEXT NULL,
-      command TEXT NULL,
-      verified INTEGER NOT NULL DEFAULT 0,
-      status TEXT NOT NULL,
-      exit_code INTEGER NULL,
-      duration_ms INTEGER NULL,
-      output TEXT NULL,
+      status TEXT NOT NULL,              -- 'passed' | 'failed' | 'asserted'
       created_at TEXT NOT NULL,
       superseded_at TEXT NULL
     );
@@ -236,9 +221,12 @@ export function applySchema(db) {
     -- agents describing the same suite differently must still compare against the same baseline.
     -- Only verified results are ever recorded here: an agent's assertion proves nothing and must
     -- not be able to establish, or quietly repair, a baseline.
+    -- check_key is the reported label, normalized for case and spacing. It used to be the argv
+    -- DevTeam ran, which compared two agents' differing prose against one baseline; without an
+    -- executor the label is the only stable handle left. See _checkKey in store-checks.mjs.
     CREATE TABLE IF NOT EXISTS check_baselines (
       task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-      command_key TEXT NOT NULL,
+      check_key TEXT NOT NULL,
       status TEXT NOT NULL,
       label TEXT,
       assignment_id TEXT,
@@ -251,14 +239,14 @@ export function applySchema(db) {
       -- attribution into a confident and wrong one.
       last_passed_event_id INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL,
-      PRIMARY KEY (task_id, command_key)
+      PRIMARY KEY (task_id, check_key)
     );
 
     -- A check that used to pass and now does not, with who is suspected and what was done about it.
     CREATE TABLE IF NOT EXISTS check_regressions (
       id TEXT PRIMARY KEY,
       task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-      command_key TEXT NOT NULL,
+      check_key TEXT NOT NULL,
       label TEXT,
       detected_by_assignment_id TEXT,
       last_passed_assignment_id TEXT,
@@ -269,30 +257,6 @@ export function applySchema(db) {
     );
     CREATE INDEX IF NOT EXISTS idx_check_regressions_task ON check_regressions(task_id, created_at DESC);
 
-    -- T0.4: work that outlives the call which started it.
-    --
-    -- Verified checks run off the event loop, so a report can be minutes in flight. Before this
-    -- the only trace was assignments.verifying_at, which startup cleared — so a crash mid-suite
-    -- left a record claiming nothing had ever been running. That is the one thing a coordination
-    -- server must not do: forget that it was part-way through something.
-    --
-    -- This is deliberately a *record*, not a queue. Nothing here is ever picked back up: re-running
-    -- a suite after a restart would run it against a working tree that has moved on, under a claim
-    -- that may now belong to somebody else. Recovery closes the row, says so on the timeline, and
-    -- leaves the decision to report again with the agent that still holds the claim.
-    CREATE TABLE IF NOT EXISTS jobs (
-      id TEXT PRIMARY KEY,
-      kind TEXT NOT NULL,                    -- 'verified_checks' today; the column is the seam
-      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-      assignment_id TEXT,
-      agent_id TEXT,
-      state TEXT NOT NULL,                   -- 'running' | 'finished' | 'interrupted'
-      detail TEXT,                           -- JSON: what it was running, for the timeline
-      instance_id TEXT NOT NULL,             -- which server process started it
-      started_at TEXT NOT NULL,
-      finished_at TEXT,
-      outcome TEXT
-    );
     -- T4.1: named, revocable credentials. Only the hash is kept, so this table is a list of who
     -- may connect, never a list of live secrets. The shared token in the metadata table still
     -- works for the single-user localhost case it was designed for.
@@ -304,8 +268,6 @@ export function applySchema(db) {
       last_used_at TEXT,
       revoked_at TEXT
     );
-    CREATE INDEX IF NOT EXISTS idx_jobs_task ON jobs(task_id, started_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_jobs_running ON jobs(state, started_at);
     CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
     CREATE INDEX IF NOT EXISTS idx_assignments_queue ON assignments(status, target_agent_name, created_at);
     CREATE INDEX IF NOT EXISTS idx_assignments_task_status ON assignments(task_id, status);
@@ -340,9 +302,7 @@ export function applySchema(db) {
     ["agents", "current_effort", "TEXT"],
     ["events", "author_name", "TEXT"],                                   // who wrote it, kept even after the agent row is purged
     ["events", "author_kind", "TEXT"],
-    ["projects", "check_sandbox", "INTEGER NOT NULL DEFAULT 0"],       // confine node checks to the project root
-    ["assignment_checks", "superseded_at", "TEXT"],           // only the latest report attempt describes the work as it stands                                   // 'human' or 'agent', so authorship never depends on a nullable FK
-    ["assignments", "verifying_at", "TEXT"],                  // set while DevTeam is running this report's checks off the event loop
+    ["assignment_checks", "superseded_at", "TEXT"],           // only the latest report attempt describes the work as it stands
     ["assignments", "rework_count", "INTEGER NOT NULL DEFAULT 0"], // how many times a reviewer has sent this work back
     ["assignments", "rework_requested_at", "TEXT"],           // set while it is queued *as rework*; cleared when reported again
     ["assignments", "rework_summary", "TEXT"],                // why it went back, handed to the author on re-claim
@@ -354,7 +314,6 @@ export function applySchema(db) {
     // T2.4: whether this approval came from someone other than the version's author, recorded on
     // the row rather than recomputed, so the record cannot drift as agents come and go.
     ["approvals", "independent", "INTEGER NOT NULL DEFAULT 1"],
-    ["approvals", "verified_evidence", "INTEGER NOT NULL DEFAULT 0"],
     // T2.6: human steering. Priority orders the queue; the cancel flag is read cooperatively by
     // the holder.
     ["assignments", "priority", "INTEGER NOT NULL DEFAULT 0"],
@@ -385,8 +344,23 @@ export function applySchema(db) {
   // nothing reads is a trap for whoever next goes looking for where checklists live. Deliveries go
   // first — it has the foreign key. assignment_findings.checklist_item_id is left in place; SQLite
   // drops columns only by rebuilding the table, and a stale nullable column costs nothing.
-  for (const table of ["checklist_deliveries", "checklist_items", "domains"]) {
+  // project_check_commands held the argv a human allowlisted for DevTeam to execute, and `jobs`
+  // recorded the off-event-loop window those executions ran in. The executor is gone, so both are
+  // tables nothing writes and nothing reads — a trap for whoever next goes looking for where
+  // verification lives. assignment_checks keeps its now-unwritten command columns: SQLite drops a
+  // column only by rebuilding the table, and a stale nullable column costs nothing.
+  for (const table of ["checklist_deliveries", "checklist_items", "domains", "project_check_commands", "jobs"]) {
     try { db.exec(`DROP TABLE IF EXISTS ${table}`); } catch { /* an older engine without the table */ }
+  }
+  // Baselines used to be keyed by the argv DevTeam ran; they are now keyed by the reported label.
+  // The two key spaces cannot be compared, so a database written before this would carry baselines
+  // that no new report can ever match — silently, and forever. Rename the column and clear the
+  // history once: at worst one regression goes unnoticed, which beats a permanently mixed key space.
+  try { db.exec("ALTER TABLE check_baselines RENAME COLUMN command_key TO check_key"); } catch { /* already renamed, or a fresh database */ }
+  try { db.exec("ALTER TABLE check_regressions RENAME COLUMN command_key TO check_key"); } catch { /* already renamed, or a fresh database */ }
+  if (!db.prepare("SELECT value FROM metadata WHERE key = 'check_key_migrated'").get()) {
+    db.exec("DELETE FROM check_baselines; DELETE FROM check_regressions;");
+    db.prepare("INSERT INTO metadata (key, value) VALUES ('check_key_migrated', ?)").run(new Date().toISOString());
   }
   // Rows written before role behaviour was a column carry the software role names that used to be
   // hardcoded. Backfill them from exactly those names, once, so an existing database schedules

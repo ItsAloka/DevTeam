@@ -21,18 +21,6 @@ import { DEFAULT_ROLES, loadProjectRoles, planningRole, roleBehaviour, ROLES_CON
 import { currentRung, ladderIsStale, loadLadders, requiredRung, rungLabel, saveLadder } from "./models.mjs";
 import { hashToken, mintToken, normalizeTokenLabel, tokensMatch } from "./access.mjs";
 import { assessAssignment, COMPLEXITY_POLICY_VERSION } from "./runtime/index.mjs";
-import {
-  CHECK_ALLOWLIST_LIMIT,
-  DEFAULT_CHECK_TIMEOUT_MS,
-  matchCheckCommand,
-  normalizeCheckCommand,
-  packageScriptCommands,
-  projectDeclaredCommands,
-  resolveLocalBinary,
-  CHECKS_CONFIG_PATH,
-  runVerifiedCheck,
-  VERIFIED_CHECKS_PER_REPORT,
-} from "./checks.mjs";
 
 // A task in one of these states hands out no work; named once so the candidate scan and the
 // scheduler's explanation can never disagree about what "closed" means.
@@ -174,9 +162,6 @@ export class DevTeamStore extends EventEmitter {
     this.exclusive = exclusive;
     this.instanceId = exclusive ? randomUUID() : null;
     if (exclusive) this.#claimDataDirectory();
-    // How long DevTeam will block while verifying one reported check. The ceiling lives in
-    // checks.mjs; this is the per-install default a host may lower.
-    this.checkTimeoutMs = Number(checks.timeoutMs) || DEFAULT_CHECK_TIMEOUT_MS;
     this.knowledge = new KnowledgeVault(this.db, knowledge);
     this.knowledgeErrors = new Map();
     this.codegraph = new CodeGraph(this.db, codegraph);
@@ -200,13 +185,6 @@ export class DevTeamStore extends EventEmitter {
     // Everything below moves state: it belongs to the process that owns the directory, never to a
     // CLI looking in while that process is running.
     if (!exclusive) return;
-    // A report whose checks were still running when the process died left a verifying flag behind.
-    // The child processes are gone with it, so nothing is coming to settle those reports. Clearing
-    // the flag returns the assignment to a plain live claim, which is exactly what it still is — the
-    // claim, the lease and the fencing token were never released while verification ran — so the
-    // agent simply reports again. The alternative, leaving it set, would refuse every retry forever.
-    this.db.exec("UPDATE assignments SET verifying_at = NULL WHERE verifying_at IS NOT NULL");
-    this.#recoverInterruptedJobs();
     this._recoverOrphanedClaims("Recovered an orphaned assignment during server startup.");
     this.#syncAllTaskStatuses();
   }
@@ -265,50 +243,6 @@ export class DevTeamStore extends EventEmitter {
         this.db.prepare("DELETE FROM metadata WHERE key = 'server_instance'").run();
       }
     } catch { /* closing anyway */ }
-  }
-
-  // A job still marked running belongs to a process that no longer exists — this one has only just
-  // started, and nothing else may hold the directory. Close those rows out and say so on the
-  // timeline. Nothing is retried: see the note on the `jobs` table for why that is the whole point.
-  #recoverInterruptedJobs() {
-    const orphaned = this.db.prepare("SELECT * FROM jobs WHERE state = 'running'").all();
-    if (!orphaned.length) return;
-    const stamp = now();
-    for (const job of orphaned) {
-      this.db.prepare("UPDATE jobs SET state = 'interrupted', finished_at = ?, outcome = ? WHERE id = ?")
-        .run(stamp, "Interrupted by a server restart before it finished.", job.id);
-      const detail = fromJson(job.detail, {});
-      const commands = Array.isArray(detail.commands) ? detail.commands.join(", ") : "";
-      this._event(job.task_id, null, "job.interrupted",
-        `A server restart interrupted the checks DevTeam was running${commands ? ` (${commands})` : ""}. Nothing was recorded from that run; the claim is untouched, so the agent holding it can report again.`,
-        { jobId: job.id, assignmentId: job.assignment_id || null, kind: job.kind });
-    }
-  }
-
-  #startJob({ kind, taskId, assignmentId = null, agentId = null, detail = {} }) {
-    const id = randomUUID();
-    this.db.prepare(`
-      INSERT INTO jobs (id, kind, task_id, assignment_id, agent_id, state, detail, instance_id, started_at)
-      VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)
-    `).run(id, kind, taskId, assignmentId, agentId, json(detail), this.instanceId, now());
-    return id;
-  }
-
-  #finishJob(jobId, { state = "finished", outcome = null } = {}) {
-    if (!jobId) return;
-    this.db.prepare("UPDATE jobs SET state = ?, finished_at = ?, outcome = ? WHERE id = ?")
-      .run(state, now(), outcome, jobId);
-  }
-
-  // Everything currently executing, across every task. The honest answer to "is this server busy, or
-  // is it stuck?" — and, after a restart, it is empty by construction.
-  openJobs() {
-    return this.db.prepare("SELECT * FROM jobs WHERE state = 'running' ORDER BY started_at ASC").all();
-  }
-
-  jobs(taskId, { limit = 20 } = {}) {
-    return this.db.prepare("SELECT * FROM jobs WHERE task_id = ? ORDER BY started_at DESC LIMIT ?")
-      .all(taskId, Math.max(1, Math.min(100, Number(limit) || 20)));
   }
 
   #migrate() {
@@ -2081,68 +2015,19 @@ export class DevTeamStore extends EventEmitter {
     const ownedByCaller = assignment.agent_id === agentId && assignment.status === "claimed";
     const tokenMatches = claimToken == null || (assignment.claim_token_hash && this._hashToken(claimToken) === assignment.claim_token_hash);
     if (!ownedByCaller || !tokenMatches) return this.#claimConflict(assignment, agentId);
-    // This assignment already has a report's checks running. Refusing the second one is not a race
-    // guard for its own sake: an accepted report spawns real processes in the project root, so a
-    // retried or duplicated call would run the suite twice over one working tree and record
-    // whichever finished last. The claim is untouched, so the agent loses nothing by waiting.
-    if (assignment.verifying_at) {
-      return {
-        completed: false,
-        verifying: { assignmentId, taskId: assignment.task_id, since: assignment.verifying_at },
-        reason: "DevTeam is still running the checks from your previous report on this assignment. Wait for that call to return instead of reporting again.",
-      };
-    }
     const cleanChanged = [...new Set(changedFiles.map((item) => String(item).trim()).filter(Boolean))].slice(0, 200);
     const task = this.getTask(assignment.task_id);
-    // Anything the agent asked DevTeam to verify is run *now*, before a single row is written, so a
-    // failure cannot become a permanently green record that approvals are then built on top of.
-    // Running it takes real time and no longer holds the event loop, so the assignment carries a
-    // verifying flag for that window: the board can show "checks running", the duplicate report
-    // above is refused, and a crash mid-verification leaves a flag that startup clears rather than
-    // a claim nobody can settle.
-    const runsCommands = this._reportRunsCommands(task, checks);
-    let jobId = null;
-    if (runsCommands) {
-      this.db.prepare("UPDATE assignments SET verifying_at = ? WHERE id = ?").run(now(), assignmentId);
-      // T0.4 — the same window, recorded durably. verifying_at answers "is this assignment busy
-      // right now"; the job row answers "what was this server part-way through when it died", which
-      // is a question only a row that outlives the process can answer.
-      jobId = this.#startJob({
-        kind: "verified_checks",
-        taskId: assignment.task_id,
-        assignmentId,
-        agentId,
-        detail: { commands: this._reportedCheckCommands(task, checks), title: assignment.title },
-      });
-      this._event(assignment.task_id, agentId, "assignment.verifying",
-        `DevTeam is running the checks ${agent.name} reported for “${assignment.title}”.`, { assignmentId, role: assignment.role, jobId });
-      this._changed("assignment.verifying", assignment.task_id);
-    }
-    let checkRecords;
-    try {
-      checkRecords = await this._gradeReportedChecks(assignment, task, checks);
-    } finally {
-      if (runsCommands) {
-        this.db.prepare("UPDATE assignments SET verifying_at = NULL WHERE id = ?").run(assignmentId);
-        this.#finishJob(jobId, { state: "finished", outcome: `Ran ${checkRecords?.filter((record) => record.verified).length ?? 0} verified check(s).` });
-      }
-    }
-    // The claim can move while those checks run. A force-release and a resume
-    // all reassign it, and none of them wait for verification — so settling against the row read
-    // before the await would write a report on a lease this caller no longer holds. Re-fence against
-    // the row as it stands now, including the generation, which every one of those paths bumps.
-    const current = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
-    if (!current) throw new Error("Assignment not found.");
-    const stillOwned = current.agent_id === agentId
-      && current.status === "claimed"
-      && Number(current.claim_generation) === Number(assignment.claim_generation)
-      && (claimToken == null || (current.claim_token_hash && this._hashToken(claimToken) === current.claim_token_hash));
-    if (!stillOwned) return this.#claimConflict(current, agentId);
+    // What the agent says its checks did. Nothing is executed, so this settles in the same turn:
+    // there is no verifying window to open, no job row outliving the call, and no await across which
+    // the claim could move and need re-fencing.
+    const checkRecords = this._normalizeReportedChecks(checks);
     const cleanChecks = checkRecords.map((record) => record.label).slice(0, 100);
     const failedChecks = checkRecords.filter((record) => record.status === "failed");
-    // A verified failure cannot be reported as done. The claim is deliberately left intact: the
-    // agent fixes the work and reports again rather than losing its lease over a caught overclaim.
-    // status=blocked is still allowed through — reporting a genuine failure is the honest path.
+    // Reporting a check as failed and the work as done is a contradiction, so the report is refused.
+    // This is not DevTeam catching a liar — it has no way to — it is holding the agent to what it
+    // just said. The claim is deliberately left intact: the agent fixes the work and reports again
+    // rather than losing its lease. status=blocked is still allowed through, because reporting a
+    // genuine failure is the honest path.
     if (status !== "blocked" && failedChecks.length) {
       const stamp = now();
       let regressions = [];
@@ -2157,7 +2042,7 @@ export class DevTeamStore extends EventEmitter {
         });
         this._storeReportedChecks(assignmentId, assignment.task_id, checkRecords, stamp);
         this._event(assignment.task_id, agentId, "assignment.check_failed",
-          `${agent.name} reported “${assignment.title}” as done, but ${failedChecks.length === 1 ? "a check" : `${failedChecks.length} checks`} DevTeam ran failed.`, {
+          `${agent.name} reported “${assignment.title}” as done, but also reported ${failedChecks.length === 1 ? "a check" : `${failedChecks.length} checks`} as failing.`, {
             assignmentId,
             role: assignment.role,
             checks: cleanChecks,
@@ -2175,17 +2060,14 @@ export class DevTeamStore extends EventEmitter {
         checksFailed: {
           assignmentId,
           taskId: assignment.task_id,
-          failed: failedChecks.map((record) => ({
-            label: record.label, command: record.command, exitCode: record.exitCode,
-            durationMs: record.durationMs, timedOut: Boolean(record.timedOut), output: record.output,
-          })),
-          reason: "DevTeam ran the commands you reported and they did not pass, so this cannot be recorded as done. Fix the work and report again, or report status=blocked with what you found.",
+          failed: failedChecks.map((record) => ({ label: record.label })),
+          reason: "You reported a check as failing, so this cannot also be recorded as done. Fix the work and report again, or report status=blocked with what you found.",
         },
         ...(regressions.length ? {
           regressions,
           regressionNote: notYourFault.length
-            ? `${notYourFault.length === 1 ? "A check" : `${notYourFault.length} checks`} that used to pass now fails, and the change that broke it was not yours. A fix assignment has been queued for whoever made it. Do not chase it — fix only what your own work needs and report again.`
-            : "A check that used to pass now fails. Nothing in this task changed files since it was last green, so it is most likely your own work in progress.",
+            ? `${notYourFault.length === 1 ? "A check" : `${notYourFault.length} checks`} last reported as passing now fails, and the change that broke it was not yours. A fix assignment has been queued for whoever made it. Do not chase it — fix only what your own work needs and report again.`
+            : "A check last reported as passing now fails. Nothing in this task changed files since it was last green, so it is most likely your own work in progress.",
         } : {}),
         checks: checkRecords,
       };
@@ -2217,7 +2099,7 @@ export class DevTeamStore extends EventEmitter {
         // times this went back is a fact about the work, and the next reviewer should see it.
         this.db.prepare("UPDATE assignments SET rework_requested_at = NULL, rework_summary = NULL WHERE id = ?").run(assignmentId);
       }
-      // A passing run repairs the baseline and closes any regression it was breaking, so ordinary
+      // A reported pass repairs the baseline and closes any regression it was breaking, so ordinary
       // work quietly resolving a breakage does not leave it open on the board forever.
       regressions = this._openRegressions({
         taskId: assignment.task_id, assignmentId, projectId: task?.project_id, stamp,
@@ -2231,8 +2113,8 @@ export class DevTeamStore extends EventEmitter {
         role: assignment.role,
         changedFiles: cleanChanged,
         checks: cleanChecks,
-        // The structured form says which of those lines DevTeam actually ran. Consumers that only
-        // understand the strings keep working; consumers that can tell the difference now can.
+        // The structured form carries the pass/fail the agent reported for each line; the plain
+        // strings above stay for consumers that only understand labels.
         checkRecords,
         // Which checklist sections the agent says it walked. Recorded rather than enforced: DevTeam
         // cannot know whether a reviewer truly read a section, but naming them puts the claim in the
@@ -2283,7 +2165,6 @@ export class DevTeamStore extends EventEmitter {
       version,
       changedFiles: cleanChanged,
       checks: checkRecords,
-      verifiedChecks: checkRecords.filter((record) => record.verified).length,
       ...(regressions.length ? { regressions } : {}),
       agent: agent.name,
       ...(status === "blocked" ? { taskBlocked: false, followUpAssignmentId } : {}),

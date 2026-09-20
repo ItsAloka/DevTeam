@@ -71,10 +71,14 @@ assignments wait for which model and that a fresh session on it can join this ta
 Stay inside the assignment. The write scope is a real lease; writing outside it damages teammates'
 work. If the work is bigger or different than described, say so rather than widening it.
 
-Report with `devteam_report`: exact changed files, and checks. A check with a `command` is run by
-DevTeam and graded by exit code — a success claim for a failing command is refused and your claim is
-kept so you can fix it. A check without a command is recorded as your assertion. Always pass your
-`claimToken`. `status=blocked` closes only that assignment and queues triage.
+Report with `devteam_report`: exact changed files, and checks. DevTeam runs nothing itself, so a
+check is your word — pass `{ label, status }` and say plainly whether it passed or failed. Name a
+check the same way every time: DevTeam compares it against what the task last recorded under that
+label, and a check you report as failing that was previously reported as passing is raised as a
+regression, with a fix routed to whoever changed files since. Reporting a check as failed while
+reporting the work as done is refused, and your claim is kept so you can fix it and report again —
+use `status=blocked` if you cannot. A bare string is recorded as an assertion and moves no baseline.
+Always pass your `claimToken`. `status=blocked` closes only that assignment and queues triage.
 
 ## Checklists
 

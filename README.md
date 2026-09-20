@@ -180,9 +180,11 @@ Tasks never dead-end on review: the required number of independent approvals is 
 
 ### The team notices when one agent breaks another's work
 
-Verified checks always produced the raw material — exit codes over time — but nothing compared two runs, so nothing ever noticed that agent B broke what agent A delivered. DevTeam now keeps a **baseline per task, per verified command**: what it last did, and when it was last green. A `passed → failed` flip is recorded as a **regression** rather than just a failure, with the assignments that changed files since the check was last green, and a **fix assignment queued and scoped to exactly those files** — addressed to the author when there is only one candidate.
+Agents report checks — `{ label, status }` — but nothing used to compare two reports, so nothing ever noticed that agent B broke what agent A delivered. DevTeam keeps a **baseline per task, per check**: what it was last reported to do, and when it was last green. A `passed → failed` flip is recorded as a **regression** rather than just a failure, with the assignments that changed files since the check was last green, and a **fix assignment queued and scoped to exactly those files** — addressed to the author when there is only one candidate.
 
-The point is who gets told what. The agent that *runs* the suite is usually the one who trips over someone else's breakage, not the one who caused it; its report is still refused, but it is told the breakage was not its own and that a fix has been routed elsewhere, so it does not spend an afternoon chasing it. Attribution is deliberately a *set*: with several writers in that window the fix is untargeted and says the attribution is a starting point, not a verdict. Baselines are keyed by the command DevTeam ran, never the agent's label for it, and only verified results count — an asserted check can neither establish a baseline nor quietly repair one. A regression closes itself when the check goes green again.
+The point is who gets told what. The agent that *runs* the suite is usually the one who trips over someone else's breakage, not the one who caused it; its report is still refused, but it is told the breakage was not its own and that a fix has been routed elsewhere, so it does not spend an afternoon chasing it. Attribution is deliberately a *set*: with several writers in that window the fix is untargeted and says the attribution is a starting point, not a verdict. Baselines are keyed by the label, normalized for case and spacing, so the same suite compares against itself however it is typed — but a check named differently is a different check, which is the honest cost of not running anything. A bare assertion, with no status, can neither establish a baseline nor quietly repair one. A regression closes itself when the check is reported green again.
+
+DevTeam does not execute anything. It used to: a human allowlisted argv per project and DevTeam spawned it in the project root, graded it by exit code and refused reports that overclaimed. That was off by default and stayed off, so the distinction it bought was never true in practice while every path in the codebase carried it. What DevTeam still refuses is a report that contradicts itself — a check reported as failing alongside work reported as done — and the claim is left intact so the agent fixes it and reports again.
 
 ### Agents write what they learn, and the vault is navigable both ways
 
@@ -190,15 +192,9 @@ The vault used to be one-way: every note was derived from an event, so an agent 
 
 `[[wikilinks]]` were always emitted but never indexed, so "what references this decision?" meant scanning every note. A `knowledge_links` table is now maintained on write, backlinks travel with every search result, and **`devteam_knowledge_links`** answers both directions — so a decision with six things depending on it is visibly not one to quietly reverse. A link written *before* its target exists resolves the moment that note is written, because a note's id is a pure function of where it lives.
 
-### Checks and drift detection do not assume a Node repository
-
-Verification used to be derived from `package.json` scripts, so a project without one — a research folder, a data pipeline, a manuscript — could report checks but never have any verified. A project now declares its own in **`.devteam/checks.json`** with explicit argv. The security rules are unchanged: the program must still be a bare executable name, interpreters and package runners are still refused, there is still no shell, and a human still has to enable it — this widens what can be *declared*, not what DevTeam will run. Declared entries beat derived ones on a name collision, and the pre-enable list says where each came from.
-
-On Windows a locally installed tool is a `.cmd` shim that `spawn` cannot run without a shell, so those checks graded "unavailable" forever — indistinguishable from having no verification. DevTeam now reads the shim **when a human enables verification** and pins argv that runs its real entry point under `node` directly. (`npm`/`npx` stay refused on purpose: `npm run x` resolves the script body at execution time, defeating the snapshot that makes the allowlist safe.)
+### Drift detection does not assume a Git repository
 
 Git is optional. A session checkpoint's drift fingerprint records whether the project is a repository at all, and for one that is not, a bounded **workspace digest** of the assignment's own write scope takes git HEAD's place — so a fresh session taking over a manuscript is still told that files moved while it was away.
-
-Checks run on this machine by default. A project may also confine them: **Confine checks to this folder** uses Node's own permission model, so a test file an agent wrote cannot read `~/.ssh` or `~/.aws`. It narrows what a check can reach without stopping it from executing, because real suites shell out and blocking that would make the sandbox unusable rather than safe. Anything DevTeam cannot confine is refused rather than run unconfined, so "sandboxed" never quietly means "not really".
 
 ### Roles are the project's own vocabulary
 
@@ -250,6 +246,7 @@ DevTeam keeps the room honest automatically. A periodic sweep (and every claim, 
 - Resume, claim, and handoff credentials are hashed at rest and excluded from task/dashboard snapshots. Handoff tokens are task-scoped, expiring, one-time credentials; capsule reads and takeovers require task membership, while observers may read but cannot acquire ownership.
 - Project folders must exist before they can be registered.
 - Write leases are path-scoped: only writers with overlapping paths are serialized, so non-conflicting work runs in parallel without file races. Task rooms keep an agent invoked for one task from reading, messaging, or claiming in another.
+- DevTeam executes nothing on your machine. It coordinates agents and records what they report; a reported check is the agent's word, and the dashboard and timeline label it as such.
 - Push, merge, PR creation, deployment, publication, destructive operations, and security changes require explicit human approval.
 - Managed runners are opt-in, adapter-allowlisted, authenticated, and accept only advertised selections. Exceptional settings still require explicit human approval; launch failure never releases the old claim.
 - Consensus improves coverage; it does not guarantee correctness. Inspect the final diff before shipping.

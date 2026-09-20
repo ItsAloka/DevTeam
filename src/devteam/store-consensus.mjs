@@ -421,19 +421,6 @@ export const consensusMethods = {
         && (!Array.isArray(metadata.changedFiles) || metadata.changedFiles.length === 0);
     });
     if (!reviewEvidence) throw new Error("Approval requires a completed, read-only reviewer or tester assignment on the current task version.");
-    // T2.4: where a project has verification enabled, an approval must rest on something DevTeam
-    // actually ran. Without this, "verified checks" and "an agent said so" carry identical weight at
-    // the one moment that decides whether work ships — which is where the distinction matters most.
-    // Projects with no allowlist are unaffected: nothing to verify means nothing to require.
-    const verificationEnabled = this.projectCheckCommands(task.project_id).length > 0;
-    const verifiedEvidence = Number(this.db.prepare(`
-      SELECT COUNT(*) AS count FROM assignment_checks c
-      JOIN assignments a ON a.id = c.assignment_id
-      WHERE a.task_id = ? AND c.superseded_at IS NULL AND c.verified = 1 AND c.status = 'passed'
-    `).get(taskId).count) > 0;
-    if (verificationEnabled && !verifiedEvidence) {
-      throw new Error("This project runs verified checks, and nothing on this task version has passed one. Run an allowlisted check and report it before approving.");
-    }
     // Reviewer ≠ author: when the team is more than one agent, the author of the current version
     // cannot approve it — an independent teammate must. A genuine solo run is still allowed to
     // finish (no dead-ends), but its acceptance is labeled selfReviewed so it is never mistaken
@@ -451,14 +438,14 @@ export const consensusMethods = {
       // agents connect and disconnect, which is exactly when it must not.
       const independent = !authors.has(agentId);
       this.db.prepare(`
-        INSERT INTO approvals (task_id, agent_id, version, summary, created_at, independent, verified_evidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO approvals (task_id, agent_id, version, summary, created_at, independent)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(task_id, agent_id, version) DO UPDATE SET summary = excluded.summary, created_at = excluded.created_at,
-          independent = excluded.independent, verified_evidence = excluded.verified_evidence
-      `).run(taskId, agentId, task.version, summary.trim(), stamp, independent ? 1 : 0, verifiedEvidence ? 1 : 0);
+          independent = excluded.independent
+      `).run(taskId, agentId, task.version, summary.trim(), stamp, independent ? 1 : 0);
       this._event(taskId, agentId, "task.approved",
         `${agent.name} approved version ${task.version}${independent ? "" : " (self-review: no independent teammate was available)"}.`,
-        { summary: summary.trim(), version: task.version, independent, verifiedEvidence });
+        { summary: summary.trim(), version: task.version, independent });
       const approvers = this._approvers(taskId, task.version);
       const approvalCount = approvers.size;
       const openAssignments = Number(this.db.prepare("SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status IN ('queued', 'claimed')").get(taskId).count);
