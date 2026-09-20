@@ -94,9 +94,17 @@
       <div id="reconnect-list" class="reconnect-list"></div>
       <div id="room-members" class="room-members hidden"></div>
       <div class="divider"></div>
-      <div class="panel-title"><h3>Work queue</h3><span id="assignment-count" class="count">0</span></div>
+      <div class="panel-title"><h3>Work board</h3><span id="assignment-count" class="count">0</span></div>
       <div id="regressions" class="regressions hidden"></div>
-      <div id="assignment-list" class="assignment-list"></div>
+      <div id="assignment-board" class="assignment-board" aria-label="Assignment dependency board">
+        <p class="hint assignment-board-empty">Waiting for the plan</p>
+        <div class="assignment-board-canvas hidden">
+          <div class="assignment-lanes" aria-hidden="true"></div>
+          <svg class="assignment-edges" aria-hidden="true"></svg>
+          <div class="assignment-nodes"></div>
+        </div>
+      </div>
+      <div id="assignment-detail" class="assignment-detail hidden"></div>
       <div class="divider"></div>
       <div id="project-blackboard-section" class="blackboard-section hidden">
         <div class="panel-title"><h3>Project memory</h3><span id="project-blackboard-count" class="count">0</span></div>

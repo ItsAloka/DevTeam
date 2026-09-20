@@ -1,4 +1,4 @@
-import { blockedBannerCopy, escapeHtml, eventMatchesTimelineFilter, renderSafeMarkdown, unreadTimelineCount } from "/ui-utils.js";
+import { agentColorIndex, blockedBannerCopy, escapeHtml, eventMatchesTimelineFilter, layoutAssignmentBoard, renderSafeMarkdown, unreadTimelineCount } from "/ui-utils.js";
 
 const $ = (selector) => document.querySelector(selector);
 const time = (stamp) => new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date(stamp));
@@ -82,6 +82,7 @@ let timelineFilter = "all";
 let pendingSends = [];
 let pendingJumpEventId = null;
 let searchGeneration = 0;
+let focusedAssignmentId = null;
 const ATTACHMENT_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]);
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const DRAFT_LIMIT = 50_000;
@@ -309,7 +310,8 @@ function renderEvent(event) {
   const parsed = parseAttachmentMarkers(event.message);
   const body = parsed.message ? `<div class="event-body markdown">${renderSafeMarkdown(parsed.message)}</div>` : "";
   const attachments = parsed.attachments.length ? `<div class="message-attachments">${parsed.attachments.map(renderMessageAttachment).join("")}</div>` : "";
-  return `<article id="event-${event.id}" class="event ${human ? "from-human" : ""}"><div class="avatar ${human ? "human" : ""}">${initials(name)}</div><div class="event-main"><div class="event-top"><span class="event-name">${escapeHtml(name)}</span><span class="provider">${escapeHtml(human ? "you" : event.agent_provider || event.type)}</span>${badge}<span class="event-time">${time(event.created_at)}</span><button class="reply-btn" data-reply="${event.id}" title="Reply to this message" aria-label="Reply">↩</button></div>${quote}${body}${attachments}${meta.length ? `<div class="event-meta">${meta.map((item) => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>` : ""}${human ? deliveryLine(event) : ""}</div></article>`;
+  const agentColor = human ? "" : `agent-color-${agentColorIndex(name)}`;
+  return `<article id="event-${event.id}" class="event ${human ? "from-human" : agentColor}"><div class="avatar ${human ? "human" : ""}">${initials(name)}</div><div class="event-main"><div class="event-top"><span class="event-name">${escapeHtml(name)}</span><span class="provider">${escapeHtml(human ? "you" : event.agent_provider || event.type)}</span>${badge}<span class="event-time">${time(event.created_at)}</span><button class="reply-btn" data-reply="${event.id}" title="Reply to this message" aria-label="Reply">↩</button></div>${quote}${body}${attachments}${meta.length ? `<div class="event-meta">${meta.map((item) => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>` : ""}${human ? deliveryLine(event) : ""}</div></article>`;
 }
 
 function renderPendingSend(item) {
@@ -402,8 +404,102 @@ function renderBlockedBanner(task) {
   $("#blocked-meta").textContent = copy.meta;
 }
 
+function assignmentDetailMarkup(item) {
+  const description = item.description ? `<p class="assignment-description">${escapeHtml(item.description)}</p>` : "";
+  const checklist = item.checklist?.length
+    ? `<details class="checklist"><summary>${item.checklist.length}-point checklist</summary><ul>${item.checklist.map((point) => `<li>${escapeHtml(point)}</li>`).join("")}</ul></details>`
+    : "";
+  const leaseIsLive = item.status === "queued" || item.status === "claimed";
+  const scope = item.requires_write && leaseIsLive
+    ? `<span class="scope" title="Write lease scope">${(item.writeScope?.length ? item.writeScope : [""]).map((path) => escapeHtml(path || "whole project")).join(", ")}</span>`
+    : "";
+  const release = item.status === "claimed" && item.requires_write
+    ? `<button class="mini release" data-release="${escapeHtml(item.id)}" data-release-title="${escapeHtml(item.title)}" title="Force-release this stuck write lease (asks you to confirm the title)">Release lease</button>`
+    : "";
+  const sendBack = item.status === "done"
+    ? `<button class="mini send-back" data-send-back="${escapeHtml(item.id)}" data-send-back-title="${escapeHtml(item.title)}" title="Send this work back to its author for changes, with your reasons attached">Request changes</button>`
+    : "";
+  const blockedBy = item.blockedBy?.length
+    ? `<div class="dependency-wait"><strong>Waiting for</strong>${item.blockedBy.map((dependency) => `<span>${escapeHtml(dependency.title)} · ${escapeHtml(dependency.status)}</span>`).join("")}</div>`
+    : "";
+  const checks = item.checks?.length
+    ? `<div class="reported-checks">${item.checks.map((record) => `<span class="check-chip ${escapeHtml(record.status)}" title="${escapeHtml(record.output || "")}">${escapeHtml(checkLabel(record))}</span>`).join("")}</div>`
+    : "";
+  const hold = item.schedulingHold
+    ? `<div class="scheduling-hold"><strong>Held back</strong><span>${escapeHtml(item.schedulingHold.detail)}</span></div>`
+    : "";
+  const findings = item.findings?.length
+    ? `<ul class="finding-list">${item.findings.map((finding) => `<li>${finding.path ? `<code>${escapeHtml(finding.path)}</code> ` : ""}${escapeHtml(finding.detail)}<small>${escapeHtml(finding.requested_by_name)}</small></li>`).join("")}</ul>`
+    : "";
+  const rework = item.rework_requested_at
+    ? `<div class="rework"><strong>Changes requested${Number(item.rework_count) > 1 ? ` · ${Number(item.rework_count)} times` : ""}</strong><span>${escapeHtml(item.rework_summary || "Sent back to its author.")}</span>${findings}</div>`
+    : (item.findings?.length ? `<div class="rework"><strong>Open findings</strong>${findings}</div>` : "");
+  const holder = item.agent_name ? `${item.agent_name} · ` : "";
+  return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><button class="assignment-detail-close" type="button" data-assignment-close aria-label="Close assignment details">×</button></div><span class="role">${escapeHtml(item.role)}</span><p>${escapeHtml(`${holder}${item.status}`)}${item.requires_write && leaseIsLive ? " · write lease" : ""}</p>${description}${rework}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${sendBack}${release}</div></div>`;
+}
+
+function renderAssignmentBoard(task) {
+  const board = $("#assignment-board");
+  const empty = board.querySelector(".assignment-board-empty");
+  const canvas = board.querySelector(".assignment-board-canvas");
+  const nodesContainer = board.querySelector(".assignment-nodes");
+  const detail = $("#assignment-detail");
+  const assignments = task.assignments || [];
+  empty.classList.toggle("hidden", assignments.length > 0);
+  canvas.classList.toggle("hidden", assignments.length === 0);
+  if (!assignments.length) {
+    nodesContainer.replaceChildren();
+    detail.classList.add("hidden");
+    focusedAssignmentId = null;
+    return;
+  }
+
+  const layout = layoutAssignmentBoard(assignments);
+  canvas.style.width = `${layout.width}px`;
+  canvas.style.height = `${layout.height}px`;
+  board.querySelector(".assignment-lanes").innerHTML = layout.lanes.map((lane) => `<div class="assignment-lane" style="left:${lane.x}px;width:${lane.width}px"><span>${escapeHtml(lane.label)}</span></div>`).join("");
+  const svg = board.querySelector(".assignment-edges");
+  svg.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
+  svg.innerHTML = `<defs><marker id="dependency-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path class="dependency-arrow" d="M0,0 L7,3.5 L0,7 Z"></path></marker><marker id="review-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path class="review-arrow" d="M0,0 L7,3.5 L0,7 Z"></path></marker></defs>${layout.edges.map((edge) => `<path class="assignment-edge ${edge.type}" d="${edge.path}" marker-end="url(#${edge.type === "review" ? "review" : "dependency"}-arrow)"></path>`).join("")}`;
+
+  const assignmentById = new Map(assignments.map((item) => [String(item.id), item]));
+  const existing = new Map([...nodesContainer.querySelectorAll("[data-assignment-focus]")].map((node) => [node.dataset.assignmentFocus, node]));
+  const liveIds = new Set();
+  for (const node of layout.nodes) {
+    const item = assignmentById.get(node.id);
+    if (!item) continue;
+    liveIds.add(node.id);
+    let button = existing.get(node.id);
+    if (!button) {
+      button = document.createElement("button");
+      button.type = "button";
+      button.dataset.assignmentFocus = node.id;
+      nodesContainer.append(button);
+    }
+    const hasRework = Number(item.rework_count) > 0 || Boolean(item.rework_requested_at);
+    const colorClass = item.agent_name ? `agent-color-${agentColorIndex(item.agent_name)}` : "is-unclaimed";
+    button.className = `assignment-node status-${item.status} ${colorClass}${hasRework ? " has-rework" : ""}${focusedAssignmentId === node.id ? " selected" : ""}`;
+    button.style.width = `${node.width}px`;
+    button.style.height = `${node.height}px`;
+    button.style.transform = `translate(${node.x}px, ${node.y}px)`;
+    button.setAttribute("aria-expanded", String(focusedAssignmentId === node.id));
+    button.setAttribute("aria-label", `${item.title}, ${item.role}, ${item.agent_name ? `held by ${item.agent_name}, ` : ""}${item.status}${hasRework ? ", changes requested" : ""}`);
+    const holder = item.agent_name ? `<span class="assignment-holder"><span class="agent-swatch"></span>${escapeHtml(item.agent_name)}</span>` : `<span class="assignment-holder unclaimed">Unclaimed</span>`;
+    const statusIcon = { queued: "○", claimed: "◉", done: "✓", blocked: "!" }[item.status] || "•";
+    const rework = hasRework ? `<span class="assignment-rework">↻ Rework${Number(item.rework_count) > 1 ? ` ×${Number(item.rework_count)}` : ""}</span>` : "";
+    button.innerHTML = `<span class="assignment-node-title">${escapeHtml(item.title)}</span><span class="assignment-node-meta"><span class="role">${escapeHtml(item.role)}</span><span class="assignment-status">${statusIcon} ${escapeHtml(item.status)}</span></span><span class="assignment-node-foot">${holder}${rework}</span>`;
+  }
+  for (const [id, node] of existing) if (!liveIds.has(id)) node.remove();
+
+  const focused = focusedAssignmentId ? assignmentById.get(String(focusedAssignmentId)) : null;
+  if (!focused && focusedAssignmentId) focusedAssignmentId = null;
+  detail.classList.toggle("hidden", !focused);
+  detail.innerHTML = focused ? assignmentDetailMarkup(focused) : "";
+}
+
 function renderTask(task) {
   const taskChanged = renderedTaskId !== task.id;
+  if (taskChanged) focusedAssignmentId = null;
   document.title = `DevTeam — ${task.title}`;
   $("#project-name").textContent = task.project_name;
   $("#task-status").textContent = task.status;
@@ -421,45 +517,7 @@ function renderTask(task) {
   renderMembers(task);
   const openAssignments = task.assignments.filter((item) => ["queued", "claimed"].includes(item.status)).length;
   $("#assignment-count").textContent = openAssignments;
-  $("#assignment-list").innerHTML = task.assignments.slice().reverse().slice(0, 8).map((item) => {
-    const checklist = item.checklist && item.checklist.length
-      ? `<details class="checklist"><summary>${item.checklist.length}-point checklist</summary><ul>${item.checklist.map((point) => `<li>${escapeHtml(point)}</li>`).join("")}</ul></details>`
-      : "";
-    // Only while the lease is live. A finished assignment's write scope is history, and printing it
-    // on every completed card was a line of text that answered a question nobody was asking.
-    const leaseIsLive = item.status === "queued" || item.status === "claimed";
-    const scope = item.requires_write && leaseIsLive
-      ? `<span class="scope" title="Write lease scope">${(item.writeScope?.length ? item.writeScope : [""]).map((p) => escapeHtml(p === "" ? "whole project" : p)).join(", ")}</span>`
-      : "";
-    const release = item.status === "claimed" && item.requires_write
-      ? `<button class="mini release" data-release="${item.id}" data-release-title="${escapeHtml(item.title)}" title="Force-release this stuck write lease (asks you to confirm the title)">Release lease</button>`
-      : "";
-    // Completed work can go back to its author without stopping the task. This is the human's half
-    // of the same loop reviewers drive with devteam_request_changes.
-    const sendBack = item.status === "done"
-      ? `<button class="mini send-back" data-send-back="${item.id}" data-send-back-title="${escapeHtml(item.title)}" title="Send this work back to its author for changes, with your reasons attached">Request changes</button>`
-      : "";
-    const blockedBy = item.blockedBy?.length
-      ? `<div class="dependency-wait"><strong>Waiting for</strong>${item.blockedBy.map((dependency) => `<span>${escapeHtml(dependency.title)} · ${escapeHtml(dependency.status)}</span>`).join("")}</div>`
-      : "";
-    // A queued item nobody is picking up used to look identical to one about to be claimed. The
-    // scheduler now says why, so a stall is visible on the card instead of only in a log.
-    const checks = item.checks?.length
-      ? `<div class="reported-checks">${item.checks.map((record) => `<span class="check-chip ${record.status}" title="${escapeHtml(record.output || "")}">${escapeHtml(checkLabel(record))}</span>`).join("")}</div>`
-      : "";
-    const hold = item.schedulingHold
-      ? `<div class="scheduling-hold"><strong>Held back</strong><span>${escapeHtml(item.schedulingHold.detail)}</span></div>`
-      : "";
-    // Work sent back for changes reads as an ordinary queued item unless the card says otherwise,
-    // which is exactly how rework used to get silently lost.
-    const findings = item.findings?.length
-      ? `<ul class="finding-list">${item.findings.map((finding) => `<li>${finding.path ? `<code>${escapeHtml(finding.path)}</code> ` : ""}${escapeHtml(finding.detail)}<small>${escapeHtml(finding.requested_by_name)}</small></li>`).join("")}</ul>`
-      : "";
-    const rework = item.rework_requested_at
-      ? `<div class="rework"><strong>Changes requested${Number(item.rework_count) > 1 ? ` · ${Number(item.rework_count)} times` : ""}</strong><span>${escapeHtml(item.rework_summary || "Sent back to its author.")}</span>${findings}</div>`
-      : (item.findings?.length ? `<div class="rework"><strong>Open findings</strong>${findings}</div>` : "");
-    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write && leaseIsLive ? " · write lease" : ""}</p>${rework}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${sendBack}${release}</div></div>`;
-  }).join("") || `<p class="hint">Waiting for the plan</p>`;
+  renderAssignmentBoard(task);
   renderRegressions(task);
   renderBlackboard(task);
   const approvals = task.approvals.length;
@@ -523,7 +581,7 @@ function renderMembers(task) {
     const forget = dead && member.agent_id
       ? `<button class="row-delete" data-forget-agent="${member.agent_id}" data-forget-name="${escapeHtml(member.agent_name)}" title="Remove this agent from DevTeam" aria-label="Remove ${escapeHtml(member.agent_name)}">×</button>`
       : "";
-    return `<div class="member-row ${dead ? "gone" : ""}"><span class="member-name">${escapeHtml(member.agent_name)}</span><span class="member-role ${member.role === "observer" ? "observer" : ""}">${escapeHtml(member.role)}</span><span class="member-status">${escapeHtml(member.status)}</span>${forget}</div>`;
+    return `<div class="member-row agent-color-${agentColorIndex(member.agent_name)} ${dead ? "gone" : ""}"><span class="agent-swatch"></span><span class="member-name">${escapeHtml(member.agent_name)}</span><span class="member-role ${member.role === "observer" ? "observer" : ""}">${escapeHtml(member.role)}</span><span class="member-status">${escapeHtml(member.status)}</span>${forget}</div>`;
   }).join("");
 }
 
@@ -640,7 +698,7 @@ function renderAgentList() {
     // What this session says it is running, in the words it reported at join.
     const running = [agent.current_model, agent.current_effort].filter(Boolean).join(" · ");
     const runtime = running ? `<small class="runtime-profile">${escapeHtml(running)}</small>` : "";
-    return `<div class="agent"><div class="avatar">${initials(agent.name)}</div><div class="agent-info"><strong>${escapeHtml(agent.name)}${unread}</strong><small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.status)} · session ${Number(agent.session_generation || 1)}</small>${runtime}<small class="activity">${escapeHtml(activityLine(agent))}</small></div><span class="agent-actions"><span class="agent-status ${agent.status} ${freshness(agent.last_seen)}" title="${escapeHtml(agent.status)} · seen ${relativeTime(agent.last_seen)}"></span>${forget}</span></div>`;
+    return `<div class="agent agent-color-${agentColorIndex(agent.name)}"><div class="avatar">${initials(agent.name)}</div><div class="agent-info"><strong>${escapeHtml(agent.name)}${unread}</strong><small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.status)} · session ${Number(agent.session_generation || 1)}</small>${runtime}<small class="activity">${escapeHtml(activityLine(agent))}</small></div><span class="agent-actions"><span class="agent-status ${agent.status} ${freshness(agent.last_seen)}" title="${escapeHtml(agent.status)} · seen ${relativeTime(agent.last_seen)}"></span>${forget}</span></div>`;
   }).join("") || `<p class="hint">No agents connected. Copy the MCP setup, then invoke <code>$devteam</code> in an AI desktop.</p>`;
   renderReconnectList();
 }
@@ -654,7 +712,7 @@ function renderReconnectList() {
     .sort((a, b) => new Date(b.disconnected_at) - new Date(a.disconnected_at))
     .slice(0, 3);
   container.innerHTML = recent.length
-    ? `<div class="reconnect-head">Recently left</div>` + recent.map((agent) => `<div class="reconnect-row"><div class="agent-info"><strong>${escapeHtml(agent.name)}</strong><small>${escapeHtml(agent.provider)} · left ${relativeTime(agent.disconnected_at)}</small></div><button class="reconnect-btn" data-reconnect="${escapeHtml(agent.name)}" title="Copy a reconnect prompt to paste into ${escapeHtml(agent.name)}'s desktop">Re-ping</button></div>`).join("")
+    ? `<div class="reconnect-head">Recently left</div>` + recent.map((agent) => `<div class="reconnect-row agent-color-${agentColorIndex(agent.name)}"><span class="agent-swatch"></span><div class="agent-info"><strong>${escapeHtml(agent.name)}</strong><small>${escapeHtml(agent.provider)} · left ${relativeTime(agent.disconnected_at)}</small></div><button class="reconnect-btn" data-reconnect="${escapeHtml(agent.name)}" title="Copy a reconnect prompt to paste into ${escapeHtml(agent.name)}'s desktop">Re-ping</button></div>`).join("")
     : "";
 }
 
@@ -715,6 +773,18 @@ function populateMessageTargets(connected) {
 
 
 document.addEventListener("click", async (event) => {
+  const assignmentButton = event.target.closest("[data-assignment-focus]");
+  if (assignmentButton && state?.selectedTask) {
+    focusedAssignmentId = focusedAssignmentId === assignmentButton.dataset.assignmentFocus ? null : assignmentButton.dataset.assignmentFocus;
+    renderAssignmentBoard(state.selectedTask);
+    if (focusedAssignmentId) $("#assignment-detail").scrollIntoView({ block: "nearest", behavior: "smooth" });
+    return;
+  }
+  if (event.target.closest("[data-assignment-close]")) {
+    focusedAssignmentId = null;
+    if (state?.selectedTask) renderAssignmentBoard(state.selectedTask);
+    return;
+  }
   const retrySend = event.target.closest("[data-retry-send]");
   if (retrySend) {
     const pending = pendingSends.find((item) => item.id === retrySend.dataset.retrySend);

@@ -2,6 +2,141 @@ export function escapeHtml(value = "") {
   return String(value).replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
 }
 
+export function agentColorIndex(name = "", paletteSize = 8) {
+  const size = Math.max(1, Math.floor(Number(paletteSize)) || 1);
+  let hash = 2166136261;
+  for (const char of String(name).trim().toLowerCase()) {
+    hash ^= char.codePointAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % size;
+}
+
+export function layoutAssignmentBoard(assignments = [], options = {}) {
+  const nodeWidth = Number(options.nodeWidth) || 176;
+  const nodeHeight = Number(options.nodeHeight) || 92;
+  const columnGap = Number(options.columnGap) || 48;
+  const rowGap = Number(options.rowGap) || 22;
+  const padding = Number(options.padding) || 14;
+  const headerHeight = Number(options.headerHeight) || 30;
+  const items = assignments.map((assignment, index) => ({ assignment, index, id: String(assignment.id) }));
+  if (!items.length) return { width: 0, height: 0, lanes: [], nodes: [], edges: [] };
+
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const depthMemo = new Map();
+  const visiting = new Set();
+  const depthOf = (item) => {
+    if (depthMemo.has(item.id)) return depthMemo.get(item.id);
+    // Assignment dependencies are a DAG. Treating a corrupt cycle as a root keeps the dashboard
+    // usable enough to expose the bad rows instead of recursing until the whole room disappears.
+    if (visiting.has(item.id)) return 0;
+    visiting.add(item.id);
+    const predecessors = (item.assignment.dependsOn || []).map((id) => byId.get(String(id))).filter(Boolean);
+    const depth = predecessors.length ? Math.max(...predecessors.map((dependency) => depthOf(dependency) + 1)) : 0;
+    visiting.delete(item.id);
+    depthMemo.set(item.id, depth);
+    return depth;
+  };
+  const maxDepth = Math.max(...items.map(depthOf));
+  const layers = Array.from({ length: maxDepth + 1 }, () => []);
+  for (const item of items) layers[depthOf(item)].push(item);
+
+  // Barycentric passes preserve creation order when there is no crossing to remove. That stability
+  // matters on a live board: a heartbeat should not make unrelated notes trade places.
+  for (let pass = 0; pass < 2; pass += 1) {
+    const priorPositions = new Map(layers.flatMap((layer) => layer.map((item, index) => [item.id, index])));
+    for (let depth = 1; depth < layers.length; depth += 1) {
+      layers[depth].sort((left, right) => {
+        const barycenter = (item) => {
+          const positions = (item.assignment.dependsOn || []).map((id) => priorPositions.get(String(id))).filter(Number.isFinite);
+          return positions.length ? positions.reduce((sum, value) => sum + value, 0) / positions.length : item.index;
+        };
+        return barycenter(left) - barycenter(right) || left.index - right.index || left.id.localeCompare(right.id);
+      });
+    }
+    const nextPositions = new Map(layers.flatMap((layer) => layer.map((item, index) => [item.id, index])));
+    for (let depth = layers.length - 2; depth >= 0; depth -= 1) {
+      layers[depth].sort((left, right) => {
+        const barycenter = (item) => {
+          const positions = items
+            .filter((candidate) => (candidate.assignment.dependsOn || []).map(String).includes(item.id))
+            .map((candidate) => nextPositions.get(candidate.id))
+            .filter(Number.isFinite);
+          return positions.length ? positions.reduce((sum, value) => sum + value, 0) / positions.length : item.index;
+        };
+        return barycenter(left) - barycenter(right) || left.index - right.index || left.id.localeCompare(right.id);
+      });
+    }
+  }
+
+  const largestLayer = Math.max(...layers.map((layer) => layer.length));
+  const contentHeight = largestLayer * nodeHeight + Math.max(0, largestLayer - 1) * rowGap;
+  const nodes = [];
+  for (let depth = 0; depth < layers.length; depth += 1) {
+    const layer = layers[depth];
+    const layerHeight = layer.length * nodeHeight + Math.max(0, layer.length - 1) * rowGap;
+    const top = headerHeight + padding + (contentHeight - layerHeight) / 2;
+    layer.forEach((item, row) => nodes.push({
+      id: item.id,
+      depth,
+      row,
+      x: padding + depth * (nodeWidth + columnGap),
+      y: top + row * (nodeHeight + rowGap),
+      width: nodeWidth,
+      height: nodeHeight,
+    }));
+  }
+  const positioned = new Map(nodes.map((node) => [node.id, node]));
+  const edges = [];
+  for (const item of items) {
+    const target = positioned.get(item.id);
+    for (const dependencyId of item.assignment.dependsOn || []) {
+      const source = positioned.get(String(dependencyId));
+      if (!source || !target) continue;
+      const x1 = source.x + source.width;
+      const y1 = source.y + source.height / 2;
+      const x2 = target.x;
+      const y2 = target.y + target.height / 2;
+      const bend = Math.max(20, (x2 - x1) / 2);
+      edges.push({
+        id: `dependency:${source.id}:${target.id}`,
+        type: "dependency",
+        sourceId: source.id,
+        targetId: target.id,
+        path: `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`,
+      });
+    }
+    const subject = positioned.get(String(item.assignment.review_subject_assignment_id || ""));
+    if (subject && target) {
+      const x1 = target.x;
+      const y1 = target.y + target.height / 2;
+      const x2 = subject.x + subject.width;
+      const y2 = subject.y + subject.height / 2;
+      const lift = Math.max(28, Math.abs(x1 - x2) * 0.18);
+      edges.push({
+        id: `review:${target.id}:${subject.id}`,
+        type: "review",
+        sourceId: target.id,
+        targetId: subject.id,
+        path: `M ${x1} ${y1} C ${x1 - lift} ${y1 - lift}, ${x2 + lift} ${y2 - lift}, ${x2} ${y2}`,
+      });
+    }
+  }
+  const lanes = layers.map((layer, depth) => ({
+    depth,
+    x: padding + depth * (nodeWidth + columnGap),
+    width: nodeWidth,
+    label: [...new Set(layer.map((item) => String(item.assignment.role || "work")))].join(" / "),
+  }));
+  return {
+    width: padding * 2 + layers.length * nodeWidth + Math.max(0, layers.length - 1) * columnGap,
+    height: headerHeight + padding * 2 + contentHeight,
+    lanes,
+    nodes,
+    edges,
+  };
+}
+
 function renderInline(value = "") {
   const source = String(value);
   const tokenPattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))/gi;

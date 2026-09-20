@@ -1,6 +1,68 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { blockedBannerCopy, eventMatchesTimelineFilter, renderSafeMarkdown, timelineCategory, unreadTimelineCount } from "../public/ui-utils.js";
+import { agentColorIndex, blockedBannerCopy, eventMatchesTimelineFilter, layoutAssignmentBoard, renderSafeMarkdown, timelineCategory, unreadTimelineCount } from "../public/ui-utils.js";
+
+test("assignment board lays out an empty task and an isolated note", () => {
+  assert.deepEqual(layoutAssignmentBoard([]), { width: 0, height: 0, lanes: [], nodes: [], edges: [] });
+
+  const isolated = layoutAssignmentBoard([{ id: "solo", title: "Stand alone", role: "implementer", dependsOn: [] }]);
+  assert.equal(isolated.nodes.length, 1);
+  assert.equal(isolated.nodes[0].depth, 0);
+  assert.equal(isolated.lanes[0].label, "implementer");
+  assert.deepEqual(isolated.edges, []);
+});
+
+test("assignment board layers a linear dependency chain from left to right", () => {
+  const assignments = [
+    { id: "plan", role: "planner", dependsOn: [] },
+    { id: "build", role: "implementer", dependsOn: ["plan"] },
+    { id: "review", role: "reviewer", dependsOn: ["build"], review_subject_assignment_id: "build" },
+  ];
+  const layout = layoutAssignmentBoard(assignments);
+  assert.deepEqual(layout.nodes.map(({ id, depth }) => ({ id, depth })), [
+    { id: "plan", depth: 0 },
+    { id: "build", depth: 1 },
+    { id: "review", depth: 2 },
+  ]);
+  assert.deepEqual(layout.lanes.map((lane) => lane.label), ["planner", "implementer", "reviewer"]);
+  assert.equal(layout.edges.filter((edge) => edge.type === "dependency").length, 2);
+  assert.deepEqual(layout.edges.find((edge) => edge.type === "review") && {
+    sourceId: layout.edges.find((edge) => edge.type === "review").sourceId,
+    targetId: layout.edges.find((edge) => edge.type === "review").targetId,
+  }, { sourceId: "review", targetId: "build" });
+});
+
+test("assignment board keeps parallel diamond branches apart before they converge", () => {
+  const assignments = [
+    { id: "plan", role: "planner", dependsOn: [] },
+    { id: "api", role: "implementer", dependsOn: ["plan"] },
+    { id: "ui", role: "implementer", dependsOn: ["plan"] },
+    { id: "review", role: "reviewer", dependsOn: ["api", "ui"], review_subject_assignment_id: "ui" },
+  ];
+  const layout = layoutAssignmentBoard(assignments);
+  const byId = new Map(layout.nodes.map((node) => [node.id, node]));
+  assert.equal(byId.get("api").depth, 1);
+  assert.equal(byId.get("ui").depth, 1);
+  assert.notEqual(byId.get("api").y, byId.get("ui").y);
+  assert.equal(byId.get("review").depth, 2);
+  assert.equal(layout.edges.filter((edge) => edge.type === "dependency").length, 4);
+  assert.equal(layout.edges.filter((edge) => edge.type === "review").length, 1);
+});
+
+test("assignment board layout and agent colours are deterministic", () => {
+  const assignments = [
+    { id: "root", role: "planner", dependsOn: [] },
+    { id: "right", role: "implementer", dependsOn: ["root"] },
+    { id: "left", role: "implementer", dependsOn: ["root"] },
+    { id: "end", role: "reviewer", dependsOn: ["left", "right"] },
+  ];
+  const snapshot = JSON.stringify(assignments);
+  assert.deepEqual(layoutAssignmentBoard(assignments), layoutAssignmentBoard(assignments));
+  assert.equal(JSON.stringify(assignments), snapshot, "layout does not mutate the task payload");
+  assert.equal(agentColorIndex("Codex"), agentColorIndex("codex"));
+  assert.equal(agentColorIndex("Claude"), agentColorIndex("Claude"));
+  assert.ok(agentColorIndex("Codex") >= 0 && agentColorIndex("Codex") < 8);
+});
 
 test("safe timeline Markdown preserves useful structure without allowing scriptable markup", () => {
   const rendered = renderSafeMarkdown(`# Plan\n\n- item\n- [x] done\n\n\`inline\` and **bold**\n\n[docs](https://example.com/path)\n\n\`\`\`js\nalert('text only')\n\`\`\`\n<img src=x onerror=alert(1)>\n[bad](javascript:alert(1))`);

@@ -1041,6 +1041,206 @@
 
 .assignment-actions:empty { display: none; }
 
+/* Agent colour is an identity, not task state. The palette is derived from the existing theme so
+   the same name can be reused on the board, roster and conversation without another source of truth. */
+.agent-color-0 { --agent-color: var(--blue); }
+.agent-color-1 { --agent-color: var(--green); }
+.agent-color-2 { --agent-color: var(--amber); }
+.agent-color-3 { --agent-color: var(--red); }
+.agent-color-4 { --agent-color: color-mix(in srgb, var(--blue) 58%, var(--red)); }
+.agent-color-5 { --agent-color: color-mix(in srgb, var(--green) 52%, var(--blue)); }
+.agent-color-6 { --agent-color: color-mix(in srgb, var(--red) 56%, var(--amber)); }
+.agent-color-7 { --agent-color: color-mix(in srgb, var(--green) 58%, var(--amber)); }
+
+.agent.agent-color-0 .avatar,
+.agent.agent-color-1 .avatar,
+.agent.agent-color-2 .avatar,
+.agent.agent-color-3 .avatar,
+.agent.agent-color-4 .avatar,
+.agent.agent-color-5 .avatar,
+.agent.agent-color-6 .avatar,
+.agent.agent-color-7 .avatar,
+.event[class*="agent-color-"] .avatar {
+  border: 1px solid color-mix(in srgb, var(--agent-color) 48%, var(--line));
+  background: color-mix(in srgb, var(--agent-color) 16%, var(--panel2));
+  color: var(--agent-color);
+}
+
+.agent-swatch {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 2px;
+  background: var(--agent-color, var(--muted));
+}
+
+.reconnect-row[class*="agent-color-"] { grid-template-columns: 7px minmax(0, 1fr) auto; }
+
+/* The dependency graph is deliberately wider than the panel for three or more lanes. Keeping the
+   overflow inside this scroller preserves legible notes instead of shrinking their text to fit. */
+.assignment-board {
+  position: relative;
+  min-height: 68px;
+  margin-top: 12px;
+  overflow: auto hidden;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+}
+
+.assignment-board-empty { margin: 12px 0 0; }
+
+.assignment-board-canvas {
+  position: relative;
+  min-width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--panel2) 72%, transparent);
+}
+
+.assignment-lanes,
+.assignment-edges,
+.assignment-nodes { position: absolute; inset: 0; }
+.assignment-lanes,
+.assignment-edges { pointer-events: none; }
+.assignment-edges { width: 100%; height: 100%; overflow: visible; }
+
+.assignment-lane {
+  position: absolute;
+  inset-block: 0;
+  border-inline: 1px dashed color-mix(in srgb, var(--line) 70%, transparent);
+  background: linear-gradient(to bottom, color-mix(in srgb, var(--blue) 5%, transparent), transparent 45%);
+}
+
+.assignment-lane > span {
+  position: absolute;
+  top: 8px;
+  left: 6px;
+  max-width: calc(100% - 12px);
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.09em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.assignment-edge {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.5;
+  opacity: 0.72;
+}
+.assignment-edge.review { stroke: var(--amber); stroke-dasharray: 5 4; opacity: 0.8; }
+.dependency-arrow { fill: var(--muted); }
+.review-arrow { fill: var(--amber); }
+
+.assignment-node {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  gap: 5px;
+  overflow: hidden;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--agent-color) 62%, var(--line));
+  border-left-width: 4px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--agent-color) 11%, var(--panel2));
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: 0 5px 14px color-mix(in srgb, var(--bg) 65%, transparent);
+  transition: transform 220ms ease, background-color 220ms ease, border-color 220ms ease, opacity 220ms ease;
+}
+
+.assignment-node.is-unclaimed { --agent-color: var(--muted); }
+
+.assignment-node:hover,
+.assignment-node:focus-visible,
+.assignment-node.selected {
+  border-color: var(--agent-color);
+  outline: 2px solid color-mix(in srgb, var(--agent-color) 28%, transparent);
+  outline-offset: 2px;
+}
+
+.assignment-node.status-done { opacity: 0.7; }
+.assignment-node.status-done:hover,
+.assignment-node.status-done:focus-visible,
+.assignment-node.status-done.selected { opacity: 1; }
+.assignment-node.status-blocked { border-style: solid; box-shadow: inset 0 0 0 1px var(--red); }
+.assignment-node.has-rework { box-shadow: inset 0 3px 0 var(--red), 0 5px 14px color-mix(in srgb, var(--bg) 65%, transparent); }
+
+.assignment-node-title {
+  display: -webkit-box;
+  overflow: hidden;
+  font-size: 11.5px;
+  font-weight: 700;
+  line-height: 1.3;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.assignment-node-meta,
+.assignment-node-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.assignment-status {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.status-claimed .assignment-status { color: var(--text); }
+.status-done .assignment-status { color: var(--green); }
+.status-blocked .assignment-status { color: var(--red); }
+
+.assignment-holder {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--agent-color);
+  font-size: 10px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.assignment-holder.unclaimed { color: var(--muted); font-weight: 500; }
+.assignment-rework { color: var(--red); font-size: 9px; font-weight: 750; white-space: nowrap; }
+
+.assignment-detail { margin-top: 10px; }
+.assignment-detail .assignment { border-color: color-mix(in srgb, var(--blue) 34%, var(--line)); }
+.assignment-detail-close {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+}
+.assignment-detail-close:hover { background: color-mix(in srgb, var(--line) 55%, transparent); color: var(--text); }
+.assignment-description { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+@media (prefers-reduced-motion: reduce) {
+  .assignment-node { transition: none; }
+}
+
 #task-description.collapsed {
   display: -webkit-box;
   -webkit-box-orient: vertical;
