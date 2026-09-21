@@ -35,7 +35,7 @@ export const CHECKLIST_RULE_MAX = 220;
 export const DEFAULT_CHECKLIST_DIRNAME = "checklists";
 
 const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/u;
-const HEADING = /^#{2,3}\s+(.+?)\s*$/u;
+const HEADING = /^(#{2,3})\s+(.+?)\s*$/u;
 const BULLET = /^\s*[-*]\s*\[( |x|X|-)\]\s*(.+?)\s*$/u;
 const CRITICAL = /^\(\*\)\s*/u;
 // Files in the directory that document it rather than define a domain.
@@ -61,15 +61,22 @@ export function parseChecklist(text, domain = null) {
     }
   }
   const body = front ? raw.slice(front[0].length) : raw;
+  // `group` is the `##` heading a section sits under: its own title for a `##`, the enclosing one for
+  // a `###`. Reviewers report sections by `##` name, so that is what a report is checked against.
   const sections = [];
   let section = null;
-  const push = (title) => { section = { title, items: [] }; sections.push(section); };
+  let group = null;
+  const push = (title, level) => {
+    if (level === 2) group = title;
+    section = { title, level, group, items: [] };
+    sections.push(section);
+  };
   for (const line of body.split(/\r?\n/u)) {
     const heading = line.match(HEADING);
-    if (heading) { push(heading[1].replace(/[-\s]+$/u, "").trim().slice(0, 80) || "General"); continue; }
+    if (heading) { push(heading[2].replace(/[-\s]+$/u, "").trim().slice(0, 80) || "General", heading[1].length); continue; }
     const bullet = line.match(BULLET);
     if (!bullet) continue;
-    if (!section) push("General");
+    if (!section) push("General", 2);
     section.items.push({
       text: bullet[2].replace(CRITICAL, "").trim().slice(0, CHECKLIST_RULE_MAX),
       critical: CRITICAL.test(bullet[2]),

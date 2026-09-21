@@ -1,11 +1,11 @@
 import { EventEmitter } from "node:events";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync, statSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, statSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { applySchema } from "./schema.mjs";
 import { DOMAIN_NAME_PATTERN, normalizeDomains } from "./domains.mjs";
-import { DEFAULT_CHECKLIST_DIRNAME, listChecklistDomains, loadChecklist } from "./checklists.mjs";
+import { DEFAULT_CHECKLIST_DIRNAME, listChecklistDomains, loadChecklist, resolveChecklists } from "./checklists.mjs";
 
 export { normalizeDomains };
 import { fromJson, json, now } from "./util.mjs";
@@ -160,6 +160,7 @@ export class DevTeamStore extends EventEmitter {
     if (exclusive) this.#claimDataDirectory();
     this.knowledge = new KnowledgeVault(this.db, knowledge);
     this.knowledgeErrors = new Map();
+    this.#rebuildVaultPagesOnce();
     this.codegraph = new CodeGraph(this.db, codegraph);
     this.codegraphErrors = new Map();
     this.briefHealth = new Map();
@@ -190,6 +191,27 @@ export class DevTeamStore extends EventEmitter {
   // how a safety measure becomes the thing people turn off.
   static INSTANCE_LOCK_STALE_MS = 120_000;
   static INSTANCE_HEARTBEAT_MS = 30_000;
+
+  // The per-note files are gone, and a project's old ones only disappear when something touches
+  // that project. Nobody would touch an archived project again, so its repository would keep a
+  // thousand files DevTeam no longer writes. One rebuild on the first start after the change puts
+  // every project on the new shape — the pages are derived from history, so rebuilding costs a
+  // little work and loses nothing.
+  //
+  // It is marked done only when every project was rebuilt. A root that is unreadable today (a drive
+  // not mounted, a folder mid-move) is retried on the next start instead of being skipped for good;
+  // re-exporting the projects that did succeed is idempotent. With knowledge disabled nothing ran,
+  // so nothing is marked either.
+  #rebuildVaultPagesOnce() {
+    if (!this.knowledge.enabled) return;
+    if (this.db.prepare("SELECT value FROM metadata WHERE key = 'vault_pages_rebuilt'").get()) return;
+    let failed = 0;
+    for (const project of this.db.prepare("SELECT id FROM projects").all()) {
+      try { this.knowledge.exportProject(project.id); } catch { failed += 1; }
+    }
+    if (failed) return;
+    this.db.prepare("INSERT OR REPLACE INTO metadata (key, value) VALUES ('vault_pages_rebuilt', ?)").run(now());
+  }
 
   #claimDataDirectory() {
     const existing = this.db.prepare("SELECT value FROM metadata WHERE key = 'server_instance'").get();
@@ -607,30 +629,59 @@ export class DevTeamStore extends EventEmitter {
   //
   // The one addition is names already used by existing tasks: a task tagged before its file was
   // renamed or deleted keeps its tag and stays editable, rather than failing validation on a name it
-  // already carries. Those trail the live ones and show an item count of zero.
-  _domainVocabulary() {
+  // already carries. Those trail the live ones and show an item count of zero. With a project they
+  // are that project's tasks only: another project's retired names are not this project's domains.
+  _domainVocabulary(projectId = null) {
     const names = [];
     const add = (value) => {
       const name = String(value || "").toLowerCase();
       if (DOMAIN_NAME_PATTERN.test(name) && !names.includes(name)) names.push(name);
     };
-    for (const name of listChecklistDomains(this._checklistDir())) add(name);
-    for (const row of this.db.prepare("SELECT DISTINCT j.value AS name FROM tasks t, json_each(t.domains) j").all()) add(row.name);
+    for (const name of listChecklistDomains(this._checklistDir(projectId))) add(name);
+    for (const row of this._taskDomainRows("SELECT DISTINCT j.value AS name", "", projectId)) add(row.name);
     return names;
   }
 
-  _checklistDir() {
-    return this.checklistDir || path.join(process.cwd(), DEFAULT_CHECKLIST_DIRNAME);
+  // Task-domain rows, narrowed to one project when one is given.
+  _taskDomainRows(select, tail, projectId) {
+    const where = projectId ? " WHERE t.project_id = ?" : "";
+    const sql = `${select} FROM tasks t, json_each(t.domains) j${where}${tail}`;
+    return projectId ? this.db.prepare(sql).all(projectId) : this.db.prepare(sql).all();
+  }
+
+  // A project's own `checklists/` wins over the one DevTeam was launched from. Without this the
+  // folder was whatever directory the server happened to start in — one global list for every
+  // project on the machine, which is why a project could not keep the checklist for its own kind of
+  // software next to its own code. The launch directory stays as the fallback, so a project with no
+  // folder of its own still sees the checklists shipped with DevTeam.
+  _checklistDir(projectId = null) {
+    const fallback = this.checklistDir || path.join(process.cwd(), DEFAULT_CHECKLIST_DIRNAME);
+    if (!projectId) return fallback;
+    const root = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId)?.root;
+    if (!root) return fallback;
+    const own = path.join(root, DEFAULT_CHECKLIST_DIRNAME);
+    return existsSync(own) ? own : fallback;
+  }
+
+  // Every `##` section heading the owner's checklists offer this assignment, or none when it carries
+  // no checklist — an implementer, a task with no domain ticked, or a domain whose file is gone. A
+  // `###` counts toward the `##` above it rather than being a name a report can cite on its own.
+  _checklistSectionsFor(assignment) {
+    if (!assignment?.verifies) return [];
+    const task = this.db.prepare("SELECT project_id FROM tasks WHERE id = ?").get(assignment.task_id);
+    const domains = fromJson(assignment.domains, []);
+    if (!Array.isArray(domains) || !domains.length) return [];
+    const files = resolveChecklists(this._checklistDir(task?.project_id), domains, assignment.role);
+    return [...new Set(files.flatMap((file) => file.sections.map((section) => section.group).filter(Boolean)))];
   }
 
   // `checklistItems` is the number of live lines in that domain's file. Zero means the file is gone
   // and only old tasks still name it.
-  listDomains() {
-    const dir = this._checklistDir();
-    const taskCounts = new Map(this.db.prepare(`
-      SELECT j.value AS name, COUNT(*) AS n FROM tasks t, json_each(t.domains) j GROUP BY j.value
-    `).all().map((row) => [row.name, Number(row.n)]));
-    return this._domainVocabulary().map((name) => {
+  listDomains(projectId = null) {
+    const dir = this._checklistDir(projectId);
+    const taskCounts = new Map(this._taskDomainRows("SELECT j.value AS name, COUNT(*) AS n", " GROUP BY j.value", projectId)
+      .map((row) => [row.name, Number(row.n)]));
+    return this._domainVocabulary(projectId).map((name) => {
       const checklist = loadChecklist(dir, name);
       return {
         name,
@@ -641,14 +692,14 @@ export class DevTeamStore extends EventEmitter {
     });
   }
 
-  domainNames() {
-    return this._domainVocabulary();
+  domainNames(projectId = null) {
+    return this._domainVocabulary(projectId);
   }
 
   createTask({ projectId, title, description, requiredApprovals = 2, domains = undefined }) {
     const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
     if (!project) throw new Error("Project not found.");
-    const taskDomains = normalizeDomains(domains, this.domainNames()) || [];
+    const taskDomains = normalizeDomains(domains, this.domainNames(projectId)) || [];
     const taskId = randomUUID();
     const plannerAssignmentId = randomUUID();
     const stamp = now();
@@ -761,7 +812,7 @@ export class DevTeamStore extends EventEmitter {
       : Math.max(1, Math.min(8, Number(requiredApprovals) || task.required_approvals));
     // Changing a task's domains affects only assignments created afterwards; work already queued keeps
     // the domains it was created under, the same rule its checklist follows.
-    const nextDomains = normalizeDomains(domains, this.domainNames()) ?? task.domains;
+    const nextDomains = normalizeDomains(domains, this.domainNames(task.project_id)) ?? task.domains;
     const domainsChanged = json(nextDomains) !== json(task.domains);
     if (nextTitle === task.title && nextDescription === task.description && nextApprovals === task.required_approvals
       && !domainsChanged) {
@@ -873,7 +924,7 @@ export class DevTeamStore extends EventEmitter {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     // An assignment inherits its task's domains unless the planner narrows or overrides them.
-    const assignmentDomains = normalizeDomains(domains, this.domainNames()) ?? task.domains;
+    const assignmentDomains = normalizeDomains(domains, this.domainNames(task.project_id)) ?? task.domains;
     if (["accepted", "blocked", "cancelled"].includes(task.status)) throw new Error(this.closedTaskError(task, "create an assignment on it"));
     if (agentId) { this.getAgent(agentId); this.assertMembership(agentId, taskId); }
     const assignment = {
@@ -1687,7 +1738,7 @@ export class DevTeamStore extends EventEmitter {
   // lease**. An agent that has to release its claim to reorganise the work will not do it — it will
   // grind on instead — and in the gap another agent can take the paths it was midway through
   // editing. So the parent stays claimed by the same agent, at the same generation, throughout.
-  async completeAssignment({ agentId, assignmentId, message, status = "done", changedFiles = [], checks = [], nextStatus = "waiting", claimToken = null, checklistSections = [] }) {
+  async completeAssignment({ agentId, assignmentId, message, status = "done", changedFiles = [], checks = [], nextStatus = "waiting", claimToken = null, checklistSections = [], learned = [] }) {
     const agent = this.getAgent(agentId);
     const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
     if (!assignment) throw new Error("Assignment not found.");
@@ -1755,6 +1806,36 @@ export class DevTeamStore extends EventEmitter {
         } : {}),
         checks: checkRecords,
       };
+    }
+    // A checklist the owner ticked on the task is the one thing in a brief that is not advice: it is
+    // a list they wrote because something once went wrong without it. It used to be delivered and
+    // then forgotten — `checklistSections` was free text nobody compared to anything, and in 245
+    // real reviews no failure to walk one was ever visible. So a review that carried a checklist and
+    // claims done has to name at least one section that actually exists in those files. The claim is
+    // still the agent's word; what changed is that the word is now checked against the file, and the
+    // lease is left alone so the answer is "go and walk it", not "you lost the work".
+    const expectedSections = this._checklistSectionsFor(assignment);
+    if (status !== "blocked" && expectedSections.length) {
+      const known = new Map(expectedSections.map((section) => [section.toLowerCase(), section]));
+      const walked = cleanSections.filter((section) => known.has(section.toLowerCase()));
+      if (!walked.length) {
+        this._event(assignment.task_id, agentId, "assignment.checklist_skipped",
+          `${agent.name} reported “${assignment.title}” as done without naming a checklist section walked.`,
+          { assignmentId, role: assignment.role, sections: expectedSections.slice(0, 20) });
+        this._changed("assignment.checklist_skipped", assignment.task_id);
+        return {
+          completed: false,
+          checklistMissed: {
+            assignmentId,
+            taskId: assignment.task_id,
+            sections: expectedSections,
+            named: cleanSections,
+            reason: cleanSections.length
+              ? "None of the sections you named are in this task's checklist files. Walk the sections your change touches and name them exactly as they appear, then report again."
+              : "This task carries a checklist the owner selected. Walk the sections your change touches, then report again naming them in checklistSections.",
+          },
+        };
+      }
     }
     const unverifiedFiles = this.#unverifiedChangedFiles(task?.project_root, cleanChanged);
     this.markMessagesSeen(agentId);
@@ -1841,12 +1922,28 @@ export class DevTeamStore extends EventEmitter {
       }
     });
     this._changed(status === "blocked" ? "assignment.blocked" : "assignment.completed", assignment.task_id);
+    // Memory is written where the work ends, not in a tool somebody has to remember. DevTeam used to
+    // mine the events for it instead and got 964 notes of transcript for 11 facts; asking for the
+    // facts on the call every agent already has to make is the same question put where it can be
+    // answered. The files the report named come with it, so the note knows what it is about.
+    const recorded = [];
+    for (const note of (Array.isArray(learned) ? learned : []).slice(0, 3)) {
+      if (!note?.title || !note?.body || !note?.category) continue;
+      try {
+        const written = this.knowledgeWrite({
+          agentId, taskId: assignment.task_id, category: note.category, title: note.title,
+          body: note.body, confidence: "high", relatedFiles: cleanChanged.slice(0, 20),
+        });
+        if (written?.written !== false) recorded.push(String(note.title).slice(0, 200));
+      } catch { /* a malformed lesson must never cost the agent its finished report */ }
+    }
     return {
       completed: true,
       taskId: assignment.task_id,
       assignmentId,
       status,
       version,
+      ...(recorded.length ? { learned: recorded } : {}),
       changedFiles: cleanChanged,
       checks: checkRecords,
       ...(regressions.length ? { regressions } : {}),

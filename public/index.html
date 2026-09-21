@@ -51,6 +51,47 @@
         <div class="blocked-banner-actions"><button id="close-blocked-task" class="secondary" type="button" title="Close this task as finished, without replanning it">Accept as finished</button><button id="resume-task" class="primary" type="button">Resume task</button></div>
       </section>
 
+      <section id="work-board" class="work-board hidden" aria-label="Work board">
+        <div class="work-board-head">
+          <h2>Work board</h2>
+          <div id="board-now" class="board-now"></div>
+          <div id="board-views" class="board-views" role="group" aria-label="Board view">
+            <button id="view-work" class="board-view" type="button" data-board-view="work" aria-pressed="true">Work</button>
+            <button id="view-map" class="board-view" type="button" data-board-view="map" aria-pressed="false">Map</button>
+          </div>
+          <div id="board-zoom" class="board-zoom" role="group" aria-label="Zoom">
+            <button class="board-zoom-step" type="button" data-board-zoom="out" aria-label="Zoom out" title="Zoom out">−</button>
+            <span id="board-zoom-level" class="board-zoom-level" aria-live="polite">100%</span>
+            <button class="board-zoom-step" type="button" data-board-zoom="in" aria-label="Zoom in" title="Zoom in — spreads the notes apart so their connections can be seen">+</button>
+            <button class="board-zoom-reset" type="button" data-board-zoom="reset" aria-label="Reset zoom" title="Back to 100%">Reset</button>
+          </div>
+          <span id="board-summary" class="board-summary"></span>
+          <button id="expand-board" class="board-expand" type="button" aria-pressed="false" aria-controls="work-board-body" title="Open the whole board">⤢</button>
+        </div>
+        <div id="regressions" class="regressions hidden"></div>
+        <div id="work-board-body" class="work-board-body">
+          <div id="assignment-board" class="assignment-board" aria-label="Assignment dependency board">
+            <p class="hint assignment-board-empty">Waiting for the plan</p>
+            <div class="assignment-board-canvas hidden">
+              <div class="assignment-lanes" aria-hidden="true"></div>
+              <svg class="assignment-edges" aria-hidden="true"></svg>
+              <div class="assignment-nodes"></div>
+            </div>
+          </div>
+          <div id="code-map" class="code-map hidden" aria-label="Project code map">
+            <div id="code-map-head" class="code-map-head">
+              <span id="code-map-summary" class="code-map-summary">Reading the project…</span>
+              <div id="code-map-legend" class="code-map-legend"></div>
+            </div>
+            <div id="code-map-canvas" class="code-map-canvas">
+              <svg id="code-map-svg" class="code-map-svg" role="img" aria-label="Files in this project and what imports what"></svg>
+              <div id="code-map-detail" class="code-map-detail hidden"></div>
+            </div>
+          </div>
+          <div id="assignment-detail" class="assignment-detail hidden"></div>
+        </div>
+      </section>
+
       <section id="empty-state" class="empty-state">
         <div class="orb"><span>⌁</span></div>
         <h2>Your team room is ready</h2>
@@ -59,19 +100,9 @@
       </section>
 
       <section id="conversation" class="conversation hidden">
-        <div class="timeline-toolbar">
-          <div id="timeline-filters" class="timeline-filters" role="toolbar" aria-label="Filter timeline">
-            <button class="active" type="button" data-timeline-filter="all" aria-pressed="true">All</button>
-            <button type="button" data-timeline-filter="chat" aria-pressed="false">Chat</button>
-            <button type="button" data-timeline-filter="work" aria-pressed="false">Work</button>
-            <button type="button" data-timeline-filter="decisions" aria-pressed="false">Decisions</button>
-            <button type="button" data-timeline-filter="findings" aria-pressed="false">Findings</button>
-            <button type="button" data-timeline-filter="system" aria-pressed="false">System</button>
-          </div>
-          <button id="jump-latest" class="jump-latest hidden" type="button">Jump to latest</button>
-        </div>
         <div id="event-list" class="event-list" role="log" aria-label="Team chat history"></div>
         <form id="message-form" class="composer">
+          <button id="jump-latest" class="jump-latest hidden" type="button" aria-label="Jump to latest" title="Jump to latest">↓</button>
           <div class="composer-head">
             <span class="composer-title">Message the team</span>
             <label class="target-field">To
@@ -94,18 +125,6 @@
       <div id="reconnect-list" class="reconnect-list"></div>
       <div id="room-members" class="room-members hidden"></div>
       <div class="divider"></div>
-      <div class="panel-title"><h3>Work board</h3><span id="assignment-count" class="count">0</span></div>
-      <div id="regressions" class="regressions hidden"></div>
-      <div id="assignment-board" class="assignment-board" aria-label="Assignment dependency board">
-        <p class="hint assignment-board-empty">Waiting for the plan</p>
-        <div class="assignment-board-canvas hidden">
-          <div class="assignment-lanes" aria-hidden="true"></div>
-          <svg class="assignment-edges" aria-hidden="true"></svg>
-          <div class="assignment-nodes"></div>
-        </div>
-      </div>
-      <div id="assignment-detail" class="assignment-detail hidden"></div>
-      <div class="divider"></div>
       <div id="project-blackboard-section" class="blackboard-section hidden">
         <div class="panel-title"><h3>Project memory</h3><span id="project-blackboard-count" class="count">0</span></div>
         <p class="memory-scope">Shared by every DevTeam task in this project.</p>
@@ -126,15 +145,9 @@
       </div>
       <div id="knowledge-section" class="blackboard-section hidden">
         <div class="panel-title"><h3>Knowledge vault</h3><span id="knowledge-count" class="count">0</span></div>
-        <p class="memory-scope">Automatically maintained as Obsidian-compatible Markdown.</p>
-        <select id="knowledge-filter" class="knowledge-filter" aria-label="Filter knowledge lifecycle">
-          <option value="current">Current</option>
-          <option value="inferred">Inferred</option>
-          <option value="disputed">Disputed</option>
-          <option value="stale">Stale</option>
-          <option value="archived">Archived</option>
-        </select>
+        <p class="memory-scope">Notes the team wrote down, with <code>devteam_memory write</code> or <code>learned</code> on a report.</p>
         <div id="knowledge-list" class="knowledge-list"></div>
+        <p id="knowledge-set-aside" class="memory-scope hidden"></p>
         <div class="divider"></div>
       </div>
       <div id="blackboard-section" class="blackboard-section hidden">
@@ -154,12 +167,12 @@
     </aside>
   </div>
 
-  <dialog id="task-dialog">
+  <dialog id="task-dialog" class="task-dialog">
     <form id="task-form" method="dialog">
       <div class="dialog-head"><div><span class="eyebrow">NEW WORK</span><h2>Give the team a mission</h2></div><button type="button" class="close">×</button></div>
       <label>Project<select name="projectId" id="project-select" required></select></label>
       <label>Task title<input name="title" maxlength="120" placeholder="Add password reset flow" required></label>
-      <label>What should the team deliver?<textarea name="description" rows="5" placeholder="Describe the outcome, constraints, and definition of done…" required></textarea></label>
+      <label>What should the team deliver?<textarea name="description" rows="14" placeholder="Describe the outcome, constraints, and definition of done…" required></textarea></label>
       <label>Independent approvals<select name="requiredApprovals"><option value="2">2 reviewers (recommended)</option><option value="1">1 reviewer</option><option value="3">3 reviewers</option></select></label>
       <fieldset class="domain-picker" data-domain-picker><legend>Domains <span class="hint">optional · one per file in checklists/ · add a domain by writing its .md</span></legend></fieldset>
       <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Start task</button></div>

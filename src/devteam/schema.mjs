@@ -305,8 +305,12 @@ export function applySchema(db) {
   // proposals/proposal_votes/proposal_voters held a room's open questions and the votes on them.
   // Roles are fixed now, so there is nothing to appoint anyone to; a handoff is a planner creating
   // the work again for someone else, and a decision is a note on the board.
+  // assignment_usage, runtime_decisions, agent_runtime_profiles and session_checkpoints belonged to
+  // the model ladder and the session policy. Both were deleted; their tables were not, so every
+  // database carried them with nothing reading or writing a single row.
   for (const table of ["checklist_deliveries", "checklist_items", "domains", "project_check_commands", "jobs", "complexity_assessments",
-    "proposal_votes", "proposal_voters", "proposals"]) {
+    "proposal_votes", "proposal_voters", "proposals",
+    "assignment_usage", "runtime_decisions", "agent_runtime_profiles", "session_checkpoints"]) {
     try { db.exec(`DROP TABLE IF EXISTS ${table}`); } catch { /* an older engine without the table */ }
   }
   // Baselines used to be keyed by the argv DevTeam ran; they are now keyed by the reported label.
@@ -318,6 +322,29 @@ export function applySchema(db) {
   if (!db.prepare("SELECT value FROM metadata WHERE key = 'check_key_migrated'").get()) {
     db.exec("DELETE FROM check_baselines; DELETE FROM check_regressions;");
     db.prepare("INSERT INTO metadata (key, value) VALUES ('check_key_migrated', ?)").run(new Date().toISOString());
+  }
+  // The vault used to mint a note per completed assignment, per decision and per finding. One real
+  // project ended up with 964 notes, 947 of them captured transcript and 11 written on purpose —
+  // and the transcript was never lost, because events and assignments are searchable in their own
+  // right. Nothing captures any more, so the captured rows are deleted once: they cannot be
+  // regenerated, they were never read, and leaving them would keep every brief and every search
+  // answering out of a pile nobody wrote. Notes somebody meant — `agent.note`, a project memory key,
+  // and the owner's own imported files — are kept, whatever else a note's provenance also records.
+  if (!db.prepare("SELECT value FROM metadata WHERE key = 'captured_notes_purged'").get()) {
+    const deliberate = "'agent.note', 'blackboard.updated', 'legacy.memory'";
+    try {
+      db.exec(`
+        DELETE FROM knowledge_notes WHERE id IN (
+          SELECT n.id FROM knowledge_notes n WHERE NOT EXISTS (
+            SELECT 1 FROM json_each(n.provenance) source
+            WHERE json_extract(source.value, '$.type') IN (${deliberate})
+          )
+        )
+      `);
+      db.exec("DELETE FROM knowledge_fts WHERE note_id NOT IN (SELECT id FROM knowledge_notes)");
+      db.exec("DELETE FROM knowledge_links WHERE from_note_id NOT IN (SELECT id FROM knowledge_notes)");
+    } catch { /* a database with no vault yet, or an engine without json_each */ }
+    db.prepare("INSERT INTO metadata (key, value) VALUES ('captured_notes_purged', ?)").run(new Date().toISOString());
   }
   // Rows written before role behaviour was a column carry the software role names that used to be
   // hardcoded. Backfill them from exactly those names, once, so an existing database schedules

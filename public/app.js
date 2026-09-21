@@ -1,4 +1,4 @@
-import { agentColorIndex, blockedBannerCopy, escapeHtml, eventMatchesTimelineFilter, layoutAssignmentBoard, renderSafeMarkdown, unreadTimelineCount } from "/ui-utils.js";
+import { agentColorIndex, blockedBannerCopy, boardSummary, currentWork, escapeHtml, layoutAssignmentBoard, layoutCodeMap, renderSafeMarkdown, unreadTimelineCount } from "/ui-utils.js";
 
 const $ = (selector) => document.querySelector(selector);
 const time = (stamp) => new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date(stamp));
@@ -20,7 +20,8 @@ const freshness = (stamp) => {
   if (seconds < 120) return "stale";
   return "cold";
 };
-const initials = (name = "AI") => name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase();
+// Agent names are agent-chosen, so the result is HTML-escaped: callers interpolate it into markup.
+const initials = (name) => escapeHtml(String(name || "AI").trim().split(/\s+/).map((part) => [...part][0] || "").slice(0, 2).join("").toUpperCase());
 // Only the software defaults get a nicer present-participle label; a project that defines its own
 // vocabulary falls back to the role name itself, which reads fine ("Ana · fact-checker").
 const ROLE_VERB = { planner: "planning", implementer: "implementing", reviewer: "reviewing", "security-reviewer": "security review", tester: "testing", researcher: "researching" };
@@ -78,7 +79,6 @@ let refreshGeneration = 0;
 let pendingAttachments = [];
 let renderedTaskId = null;
 let messageSending = false;
-let timelineFilter = "all";
 let pendingSends = [];
 let pendingJumpEventId = null;
 let searchGeneration = 0;
@@ -190,7 +190,7 @@ function latestReadableEventId(task) {
 }
 
 function markTimelineRead(task = state?.selectedTask) {
-  if (!task || timelineFilter !== "all") return;
+  if (!task) return;
   const latest = latestReadableEventId(task);
   if (latest) storageSet(readKey(task.id), String(latest));
   const button = $("#jump-latest");
@@ -238,6 +238,7 @@ function render() {
 
   $("#empty-state").classList.toggle("hidden", Boolean(task));
   $("#conversation").classList.toggle("hidden", !task);
+  $("#work-board").classList.toggle("hidden", !task);
   $("#copy-task-invite").classList.toggle("hidden", !task);
   $("#edit-task").classList.toggle("hidden", !task || task.status === "cancelled");
   $("#block-task").classList.toggle("hidden", !task || ["accepted", "blocked", "cancelled"].includes(task.status));
@@ -332,10 +333,9 @@ function renderTimeline(task, { taskChanged = false, wasNearBottom = false } = {
     storageSet(readKey(task.id), String(latest));
   }
   const unread = unreadTimelineCount(task.events, marker);
-  const visible = task.events.filter((event) => eventMatchesTimelineFilter(event, timelineFilter));
   const parts = [];
   let separatorAdded = false;
-  for (const event of visible) {
+  for (const event of task.events) {
     if (!separatorAdded && unread && event.agent_id && Number(event.id) > (marker || 0)) {
       parts.push(`<div id="unread-separator" class="unread-separator"><span>${unread} unread</span></div>`);
       separatorAdded = true;
@@ -343,17 +343,12 @@ function renderTimeline(task, { taskChanged = false, wasNearBottom = false } = {
     const rendered = renderEvent(event);
     if (rendered) parts.push(rendered);
   }
-  if (["all", "chat"].includes(timelineFilter)) {
-    parts.push(...pendingSends.filter((item) => item.taskId === task.id).map(renderPendingSend));
-  }
-  eventList.innerHTML = parts.join("") || `<p class="timeline-empty">No ${timelineFilter === "all" ? "timeline" : timelineFilter} items yet.</p>`;
-  for (const button of $("#timeline-filters").querySelectorAll("[data-timeline-filter]")) {
-    const active = button.dataset.timelineFilter === timelineFilter;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-pressed", String(active));
-  }
+  parts.push(...pendingSends.filter((item) => item.taskId === task.id).map(renderPendingSend));
+  eventList.innerHTML = parts.join("") || `<p class="timeline-empty">No timeline items yet.</p>`;
   const jump = $("#jump-latest");
-  jump.textContent = unread ? `${unread} unread · Jump to latest` : "Jump to latest";
+  jump.textContent = unread ? `↓ ${unread} new` : "↓";
+  jump.classList.toggle("has-unread", Boolean(unread));
+  jump.setAttribute("aria-label", unread ? `${unread} unread, jump to latest` : "Jump to latest");
   jump.classList.toggle("hidden", !unread && (taskChanged || wasNearBottom));
   requestAnimationFrame(() => {
     if (pendingJumpEventId) {
@@ -438,6 +433,24 @@ function assignmentDetailMarkup(item) {
   return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><button class="assignment-detail-close" type="button" data-assignment-close aria-label="Close assignment details">×</button></div><span class="role">${escapeHtml(item.role)}</span><p>${escapeHtml(`${holder}${item.status}`)}${item.requires_write && leaseIsLive ? " · write lease" : ""}</p>${description}${rework}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${sendBack}${release}</div></div>`;
 }
 
+// The closed strip. Every chip opens the board on that note, so the one-line answer to "what is
+// happening" and the whole graph are one click apart in either direction.
+function renderCurrentWork(task) {
+  const strip = $("#board-now");
+  const { items, more } = currentWork(task.assignments || []);
+  const chips = items.map((item) => {
+    const colorClass = item.agent_name ? `agent-color-${agentColorIndex(item.agent_name)}` : "is-unclaimed";
+    // Only a holder earns space here. "Unclaimed" on three chips in a row is three copies of what
+    // the pale border already says, and it is the half of the chip that truncates the title.
+    const holder = item.agent_name
+      ? `<span class="board-chip-meta"><span class="agent-swatch"></span>${escapeHtml(item.agent_name)}</span>`
+      : "";
+    return `<button class="board-chip status-${escapeHtml(item.status)} ${colorClass}" type="button" data-board-chip="${escapeHtml(item.id)}" title="${escapeHtml(item.title)} · ${escapeHtml(item.role)} · ${escapeHtml(item.status)}${item.agent_name ? ` · ${escapeHtml(item.agent_name)}` : ""}"><span class="board-chip-title">${escapeHtml(item.title)}</span>${holder}</button>`;
+  });
+  if (more) chips.push(`<span class="board-more">+${more}</span>`);
+  strip.innerHTML = chips.join("");
+}
+
 function renderAssignmentBoard(task) {
   const board = $("#assignment-board");
   const empty = board.querySelector(".assignment-board-empty");
@@ -454,10 +467,16 @@ function renderAssignmentBoard(task) {
     return;
   }
 
-  const layout = layoutAssignmentBoard(assignments);
+  // Zoom widens the gaps, never the cards: the same notes in the same order, further apart, so the
+  // arrows between them get room to be read. The layout is plain arithmetic, so re-running it for a
+  // zoom step costs nothing and cannot reorder anything.
+  const layout = layoutAssignmentBoard(assignments, {
+    siblingGap: BOARD_SIBLING_GAP * boardZoom,
+    layerGap: BOARD_LAYER_GAP * boardZoom,
+  });
   canvas.style.width = `${layout.width}px`;
   canvas.style.height = `${layout.height}px`;
-  board.querySelector(".assignment-lanes").innerHTML = layout.lanes.map((lane) => `<div class="assignment-lane" style="left:${lane.x}px;width:${lane.width}px"><span>${escapeHtml(lane.label)}</span></div>`).join("");
+  board.querySelector(".assignment-lanes").innerHTML = layout.lanes.map((lane) => `<div class="assignment-lane" style="top:${lane.y}px;height:${lane.height}px"><span>${escapeHtml(lane.label)}</span></div>`).join("");
   const svg = board.querySelector(".assignment-edges");
   svg.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
   svg.innerHTML = `<defs><marker id="dependency-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path class="dependency-arrow" d="M0,0 L7,3.5 L0,7 Z"></path></marker><marker id="review-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path class="review-arrow" d="M0,0 L7,3.5 L0,7 Z"></path></marker></defs>${layout.edges.map((edge) => `<path class="assignment-edge ${edge.type}" d="${edge.path}" marker-end="url(#${edge.type === "review" ? "review" : "dependency"}-arrow)"></path>`).join("")}`;
@@ -497,9 +516,443 @@ function renderAssignmentBoard(task) {
   detail.innerHTML = focused ? assignmentDetailMarkup(focused) : "";
 }
 
+// The map: the same board, showing the code instead of the plan.
+//
+// The work board answers "what is the team doing"; the map answers "where in the project is it
+// happening". Both are drawn from what was already recorded — the code graph indexes the files,
+// notes name the files they are about, and completed assignments report the files they changed —
+// so nothing here asks an agent to do anything new.
+//
+// The data is fetched once per task rather than ridden along with the dashboard snapshot: 310
+// modules is ~78 KB, it changes only when the code does, and most of the time nobody is looking.
+const MAP_STALE_MS = 60_000;
+let mapState = { taskId: null, data: null, layout: null, size: "", loading: false, error: null, fetchedAt: 0 };
+let mapSelected = null;
+let mapGroupFilter = null;
+
+// Zoom, for both views. It spreads positions and leaves sizes alone (see paintCodeMap and
+// renderAssignmentBoard), and it is purely a view: nothing here re-runs the map's simulation.
+const ZOOM_MIN = 1;
+const ZOOM_MAX = 4;
+const ZOOM_STEP = 1.25;
+const MAP_LABEL_ALL_ZOOM = 2.5;
+const BOARD_SIBLING_GAP = 26;
+const BOARD_LAYER_GAP = 46;
+const MAP_VIEW_HOME = Object.freeze({ k: 1, tx: 0, ty: 0 });
+let boardZoom = 1;
+// Screen = layout × k + t. At k = 1 the map fills its box exactly, so the pan is clamped to keep the
+// zoomed picture covering the box rather than sliding off into empty space.
+let mapView = { ...MAP_VIEW_HOME };
+const clampZoom = (k) => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Number(k) || ZOOM_MIN));
+function clampMapView(view, width, height) {
+  const k = clampZoom(view.k);
+  return {
+    k,
+    tx: Math.min(0, Math.max(width - width * k, view.tx)),
+    ty: Math.min(0, Math.max(height - height * k, view.ty)),
+  };
+}
+
+async function loadCodeMap(taskId, { force = false } = {}) {
+  if (!taskId) return;
+  const fresh = mapState.taskId === taskId && mapState.data && Date.now() - mapState.fetchedAt < MAP_STALE_MS;
+  if (!force && (fresh || mapState.loading)) return;
+  if (mapState.taskId !== taskId) {
+    mapState = { taskId, data: null, layout: null, size: "", loading: true, error: null, fetchedAt: 0 };
+    mapSelected = null;
+    mapGroupFilter = null;
+    mapView = { ...MAP_VIEW_HOME };
+  } else {
+    mapState.loading = true;
+  }
+  renderCodeMap();
+  try {
+    const data = await api(`/api/tasks/${taskId}/map`);
+    // The task can change while the request is in flight; a late answer must not overwrite the
+    // map of whatever the person is looking at now.
+    if (mapState.taskId !== taskId) return;
+    mapState = { ...mapState, data, layout: null, size: "", loading: false, error: null, fetchedAt: Date.now() };
+  } catch (error) {
+    if (mapState.taskId !== taskId) return;
+    mapState = { ...mapState, loading: false, error: error.message || "The map could not be read." };
+  }
+  renderCodeMap();
+}
+
+function mapSummaryLine(data, layout) {
+  const files = data.modules.length;
+  const noted = new Set((data.notes || []).flatMap((note) => note.files || [])).size;
+  const parts = [`${files} file${files === 1 ? "" : "s"}`, `${data.edges.length} import${data.edges.length === 1 ? "" : "s"}`];
+  if (data.touched.length) parts.push(`${data.touched.length} touched by this task`);
+  if (noted) parts.push(`${noted} with notes`);
+  if (layout?.dropped) parts.push(`${layout.dropped} leaf files hidden`);
+  if (data.truncated) parts.push("index truncated");
+  if (data.indexedAt) parts.push(`indexed ${relativeTime(data.indexedAt)}`);
+  return parts.join(" · ");
+}
+
+// Markup only — the layout is cached, so selecting a file or a folder repaints without running
+// the simulation again.
+function paintCodeMap() {
+  const svg = $("#code-map-svg");
+  const layout = mapState.layout;
+  if (!svg || !layout) return;
+  const groupColour = new Map(layout.groups.map((group) => [group.name, group.index % 8]));
+  const neighbours = new Set();
+  if (mapSelected) {
+    neighbours.add(mapSelected);
+    for (const edge of layout.edges) {
+      if (edge.from === mapSelected) neighbours.add(edge.to);
+      if (edge.to === mapSelected) neighbours.add(edge.from);
+    }
+  }
+  const dimmed = (node) => {
+    if (mapSelected) return !neighbours.has(node.path);
+    if (mapGroupFilter) return node.group !== mapGroupFilter;
+    return false;
+  };
+  // Two different emphases, and they must not be confused: `lit` is the file you are reading and
+  // what it connects to, `live` is where this task has been working. Selection wins, because while
+  // one file is selected that is the only question being asked.
+  // Zoom moves positions and nothing else. Radii, strokes and labels are drawn at their own size, so
+  // zooming in pulls a cluster apart instead of magnifying it into one bigger blob.
+  const { k, tx, ty } = mapView;
+  const sx = (x) => (x * k + tx).toFixed(1);
+  const sy = (y) => (y * k + ty).toFixed(1);
+  const edgeMarkup = layout.edges.map((edge) => {
+    const lit = mapSelected && (edge.from === mapSelected || edge.to === mapSelected);
+    const live = !mapSelected && edge.live;
+    const faded = mapSelected ? !lit : Boolean(mapGroupFilter);
+    return `<line class="map-edge${lit ? " lit" : ""}${live ? " live" : ""}${faded ? " dim" : ""}" x1="${sx(edge.x1)}" y1="${sy(edge.y1)}" x2="${sx(edge.x2)}" y2="${sy(edge.y2)}"></line>`;
+  }).join("");
+  const nodeMarkup = layout.nodes.map((node) => {
+    const classes = [`map-node`, `map-group-${groupColour.get(node.group) ?? 0}`];
+    if (node.touched) classes.push("touched");
+    if (node.notes.length) classes.push("noted");
+    if (mapSelected === node.path) classes.push("selected");
+    if (dimmed(node)) classes.push("dim");
+    // The native SVG tooltip is the hover label for the ~290 files too small to carry one.
+    const tip = `${node.path}${node.degree ? ` — ${node.degree} link${node.degree === 1 ? "" : "s"}` : ""}${node.touched ? ` — changed ${node.touched}× by this task` : ""}${node.notes.length ? ` — ${node.notes.length} note${node.notes.length === 1 ? "" : "s"}` : ""}`;
+    return `<g class="${classes.join(" ")}" data-map-node="${escapeHtml(node.path)}" tabindex="0" role="button" aria-label="${escapeHtml(tip)}"><circle cx="${sx(node.x)}" cy="${sy(node.y)}" r="${node.r.toFixed(1)}"></circle>${node.notes.length ? `<circle class="map-note-ring" cx="${sx(node.x)}" cy="${sy(node.y)}" r="${(node.r + 3.2).toFixed(1)}"></circle>` : ""}<title>${escapeHtml(tip)}</title></g>`;
+  }).join("");
+  // Spread far enough apart, every file has room for its name, not just the ones the layout picked.
+  const labelAll = k >= MAP_LABEL_ALL_ZOOM;
+  const labelMarkup = layout.nodes.filter((node) => (node.labelled || labelAll) && !dimmed(node)).map((node) =>
+    `<text class="map-label${node.touched ? " touched" : ""}" x="${sx(node.x)}" y="${(node.y * k + ty - node.r - 5).toFixed(1)}">${escapeHtml(node.name)}</text>`).join("");
+  svg.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
+  svg.innerHTML = `<g class="map-edges">${edgeMarkup}</g><g class="map-nodes">${nodeMarkup}</g><g class="map-labels" aria-hidden="true">${labelMarkup}</g>`;
+
+  const legend = $("#code-map-legend");
+  legend.innerHTML = layout.groups.map((group) =>
+    `<button class="map-legend-chip map-group-${group.index % 8}${mapGroupFilter === group.name ? " active" : ""}" type="button" data-map-group="${escapeHtml(group.name)}" title="${escapeHtml(group.name)} — ${group.count} file${group.count === 1 ? "" : "s"}${group.touched ? `, ${group.touched} touched by this task` : ""}"><span class="map-legend-dot"></span>${escapeHtml(group.name)}<span class="map-legend-count">${group.count}</span></button>`).join("");
+
+  const detail = $("#code-map-detail");
+  const node = mapSelected ? layout.nodes.find((candidate) => candidate.path === mapSelected) : null;
+  detail.classList.toggle("hidden", !node);
+  if (!node) { detail.innerHTML = ""; return; }
+  const imports = layout.edges.filter((edge) => edge.from === node.path).length;
+  const importedBy = layout.edges.filter((edge) => edge.to === node.path).length;
+  const facts = [
+    node.language || "file",
+    node.loc ? `${node.loc} lines` : null,
+    `imports ${imports}`,
+    `imported by ${importedBy}`,
+  ].filter(Boolean).join(" · ");
+  const touched = node.touched
+    ? `<p class="map-detail-touched">Changed ${node.touched}× while this task ran.</p>`
+    : "";
+  const notes = node.notes.length
+    ? `<div class="map-detail-notes"><span class="section-label">What the team knows</span>${node.notes.map((note) =>
+        `<div class="map-detail-note"><span class="role">${escapeHtml(note.category)}</span><span>${escapeHtml(note.title)}</span></div>`).join("")}</div>`
+    : "";
+  detail.innerHTML = `<div class="map-detail-top"><strong>${escapeHtml(node.name)}</strong><button class="assignment-detail-close" type="button" data-map-close aria-label="Close file details">×</button></div><code class="map-detail-path">${escapeHtml(node.path)}</code><p class="map-detail-facts">${escapeHtml(facts)}</p>${touched}${notes}`;
+}
+
+function renderCodeMap({ relayout = false } = {}) {
+  const panel = $("#code-map");
+  if (!panel || panel.classList.contains("hidden")) return;
+  const summary = $("#code-map-summary");
+  const canvas = $("#code-map-canvas");
+  const svg = $("#code-map-svg");
+  if (mapState.error) {
+    summary.textContent = mapState.error;
+    svg.innerHTML = "";
+    return;
+  }
+  if (!mapState.data) {
+    summary.textContent = mapState.loading ? "Reading the project…" : "No map yet.";
+    svg.innerHTML = "";
+    return;
+  }
+  if (!mapState.data.modules.length) {
+    summary.textContent = mapState.data.automated
+      ? "Nothing indexed yet — the map fills in once the code graph has read this project."
+      : "The code graph is switched off, so there is nothing to map.";
+    svg.innerHTML = "";
+    $("#code-map-legend").innerHTML = "";
+    return;
+  }
+  // The simulation costs ~130ms on a 310-file project, so it runs when the data or the box
+  // actually changes and never on a repaint.
+  const width = Math.max(320, Math.round(canvas.clientWidth) || 900);
+  const height = Math.max(260, Math.round(canvas.clientHeight) || 620);
+  const size = `${width}x${height}`;
+  if (relayout || !mapState.layout || mapState.size !== size) {
+    mapState.layout = layoutCodeMap(mapState.data, { width, height });
+    mapState.size = size;
+    // A resize keeps the zoom the person chose; only the pan is pulled back inside the new box.
+    mapView = clampMapView(mapView, width, height);
+  }
+  summary.textContent = mapSummaryLine(mapState.data, mapState.layout);
+  paintCodeMap();
+}
+
+$("#code-map-svg").addEventListener("click", (event) => {
+  const node = event.target.closest("[data-map-node]");
+  const path = node?.dataset.mapNode || null;
+  mapSelected = mapSelected === path ? null : path;
+  if (mapSelected) mapGroupFilter = null;
+  paintCodeMap();
+});
+$("#code-map-svg").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const node = event.target.closest("[data-map-node]");
+  if (!node) return;
+  event.preventDefault();
+  mapSelected = mapSelected === node.dataset.mapNode ? null : node.dataset.mapNode;
+  paintCodeMap();
+});
+$("#code-map-legend").addEventListener("click", (event) => {
+  const chip = event.target.closest("[data-map-group]");
+  if (!chip) return;
+  mapGroupFilter = mapGroupFilter === chip.dataset.mapGroup ? null : chip.dataset.mapGroup;
+  mapSelected = null;
+  paintCodeMap();
+});
+$("#code-map-detail").addEventListener("click", (event) => {
+  if (!event.target.closest("[data-map-close]")) return;
+  mapSelected = null;
+  paintCodeMap();
+});
+
+// The map is laid out to the box it is drawn in, so the box changing is the one thing that has to
+// re-run the simulation. Debounced, and only when the size really moved.
+let mapResizeTimer = null;
+if (typeof ResizeObserver === "function") {
+  new ResizeObserver(() => {
+    clearTimeout(mapResizeTimer);
+    mapResizeTimer = setTimeout(() => renderCodeMap(), 180);
+  }).observe($("#code-map-canvas"));
+}
+
+// ---- Zoom and pan ----
+//
+// One control for whichever view is showing. Wheel zoom keeps the point under the pointer still;
+// the buttons zoom around the selected note or file when there is one, so the thing being read
+// stays in front of you, and around the middle otherwise.
+
+let zoomFrame = 0;
+function repaintZoomed() {
+  if (zoomFrame) return;
+  zoomFrame = requestAnimationFrame(() => {
+    zoomFrame = 0;
+    if (boardView === "map") paintCodeMap();
+    updateZoomControls();
+  });
+}
+
+function currentZoom() {
+  return boardView === "map" ? mapView.k : boardZoom;
+}
+
+function updateZoomControls() {
+  const k = currentZoom();
+  $("#board-zoom-level").textContent = `${Math.round(k * 100)}%`;
+  for (const button of document.querySelectorAll("[data-board-zoom]")) {
+    const action = button.dataset.boardZoom;
+    button.disabled = action === "in" ? k >= ZOOM_MAX : k <= ZOOM_MIN;
+  }
+  $("#code-map-canvas").classList.toggle("is-zoomed", mapView.k > ZOOM_MIN);
+  $("#assignment-board").classList.toggle("is-zoomed", boardZoom > ZOOM_MIN);
+}
+
+// `point` is in the map's own units (the SVG viewBox); omitted, it is the selected file or the middle.
+function zoomMap(factor, point = null) {
+  const layout = mapState.layout;
+  if (!layout) return;
+  let focus = point;
+  if (!focus) {
+    const selected = mapSelected ? layout.nodes.find((node) => node.path === mapSelected) : null;
+    focus = selected
+      ? { x: selected.x * mapView.k + mapView.tx, y: selected.y * mapView.k + mapView.ty }
+      : { x: layout.width / 2, y: layout.height / 2 };
+  }
+  const k = factor === null ? ZOOM_MIN : clampZoom(mapView.k * factor);
+  const worldX = (focus.x - mapView.tx) / mapView.k;
+  const worldY = (focus.y - mapView.ty) / mapView.k;
+  mapView = clampMapView({ k, tx: focus.x - worldX * k, ty: focus.y - worldY * k }, layout.width, layout.height);
+  repaintZoomed();
+}
+
+// `client` is a pointer position on screen; omitted, it is the selected note or the middle. The
+// board scrolls, so keeping a point still means re-rendering and then scrolling it back under you.
+function zoomBoard(factor, client = null) {
+  const board = $("#assignment-board");
+  const canvas = board.querySelector(".assignment-board-canvas");
+  const k = factor === null ? ZOOM_MIN : clampZoom(boardZoom * factor);
+  if (k === boardZoom || !state?.selectedTask) return;
+  const box = board.getBoundingClientRect();
+  const anchor = !client && focusedAssignmentId
+    ? board.querySelector(`[data-assignment-focus="${CSS.escape(String(focusedAssignmentId))}"]`)
+    : null;
+  const centre = (element) => {
+    const rect = element.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  };
+  const before = anchor ? centre(anchor) : client || { x: box.left + board.clientWidth / 2, y: box.top + board.clientHeight / 2 };
+  const view = { x: before.x - box.left, y: before.y - box.top };
+  // Where that point sits in the canvas, as a fraction — the gaps grow, so this is the stable way to
+  // say "the same place" when there is no single note to hold on to.
+  const fraction = {
+    x: (board.scrollLeft + view.x) / Math.max(1, canvas.offsetWidth),
+    y: (board.scrollTop + view.y) / Math.max(1, canvas.offsetHeight),
+  };
+  boardZoom = k;
+  renderAssignmentBoard(state.selectedTask);
+  if (anchor?.isConnected) {
+    const after = centre(anchor);
+    board.scrollLeft += after.x - before.x;
+    board.scrollTop += after.y - before.y;
+  } else {
+    board.scrollLeft = fraction.x * canvas.offsetWidth - view.x;
+    board.scrollTop = fraction.y * canvas.offsetHeight - view.y;
+  }
+  updateZoomControls();
+}
+
+function zoomCurrent(factor, point = null) {
+  if (boardView === "map") zoomMap(factor, point);
+  else zoomBoard(factor, point);
+}
+
+function resetZoom() {
+  const changed = boardZoom !== ZOOM_MIN;
+  boardZoom = ZOOM_MIN;
+  mapView = { ...MAP_VIEW_HOME };
+  if (changed && state?.selectedTask) renderAssignmentBoard(state.selectedTask);
+  if (mapState.layout) paintCodeMap();
+  updateZoomControls();
+}
+
+$("#board-zoom").addEventListener("click", (event) => {
+  const action = event.target.closest("[data-board-zoom]")?.dataset.boardZoom;
+  if (action === "in") zoomCurrent(ZOOM_STEP);
+  else if (action === "out") zoomCurrent(1 / ZOOM_STEP);
+  else if (action === "reset") zoomCurrent(null);
+});
+
+// A wheel notch is ~100px of deltaY; line-mode wheels report lines, so they are scaled to match.
+const wheelFactor = (event) => Math.exp(-event.deltaY * (event.deltaMode === 1 ? 16 : 1) * 0.0015);
+
+// The map has nothing to scroll, so the wheel is its zoom.
+$("#code-map-canvas").addEventListener("wheel", (event) => {
+  const svg = $("#code-map-svg");
+  const layout = mapState.layout;
+  if (!layout || event.target.closest("#code-map-detail")) return;
+  event.preventDefault();
+  const rect = svg.getBoundingClientRect();
+  zoomMap(wheelFactor(event), {
+    x: (event.clientX - rect.left) * (layout.width / Math.max(1, rect.width)),
+    y: (event.clientY - rect.top) * (layout.height / Math.max(1, rect.height)),
+  });
+}, { passive: false });
+
+// The board scrolls, and a sixty-note plan needs its wheel for that — so it zooms on Ctrl/⌘+wheel,
+// which is also what a trackpad pinch sends.
+$("#assignment-board").addEventListener("wheel", (event) => {
+  if (!(event.ctrlKey || event.metaKey) || !boardExpanded) return;
+  event.preventDefault();
+  zoomBoard(wheelFactor(event), { x: event.clientX, y: event.clientY });
+}, { passive: false });
+
+// Drag to pan, once zoomed. Nothing moves until the pointer has travelled a few pixels, and only
+// then is the pointer captured — so an ordinary click still lands on the note or file under it,
+// and a drag that ends over one does not also select it.
+const PAN_THRESHOLD = 4;
+function enablePan(surface, { canPan, begin, move }) {
+  let drag = null;
+  let swallowClick = false;
+  surface.addEventListener("pointerdown", (event) => {
+    // A drag that was cancelled never produces its click, so a stale "swallow" must not eat this one.
+    swallowClick = false;
+    if (event.button !== 0 || !canPan(event)) return;
+    drag = { id: event.pointerId, x: event.clientX, y: event.clientY, origin: begin(), moved: false };
+  });
+  surface.addEventListener("pointermove", (event) => {
+    if (!drag || event.pointerId !== drag.id) return;
+    const dx = event.clientX - drag.x;
+    const dy = event.clientY - drag.y;
+    if (!drag.moved) {
+      if (Math.hypot(dx, dy) < PAN_THRESHOLD) return;
+      drag.moved = true;
+      surface.setPointerCapture(event.pointerId);
+      surface.classList.add("is-panning");
+    }
+    move(drag.origin, dx, dy);
+  });
+  const end = (event) => {
+    if (!drag || event.pointerId !== drag.id) return;
+    if (drag.moved) {
+      swallowClick = event.type === "pointerup";
+      surface.classList.remove("is-panning");
+      if (surface.hasPointerCapture(event.pointerId)) surface.releasePointerCapture(event.pointerId);
+    }
+    drag = null;
+  };
+  surface.addEventListener("pointerup", end);
+  surface.addEventListener("pointercancel", end);
+  surface.addEventListener("click", (event) => {
+    if (!swallowClick) return;
+    swallowClick = false;
+    event.stopPropagation();
+    event.preventDefault();
+  }, true);
+}
+
+enablePan($("#code-map-canvas"), {
+  canPan: (event) => mapView.k > ZOOM_MIN && Boolean(mapState.layout) && !event.target.closest("#code-map-detail"),
+  begin: () => ({ ...mapView }),
+  move: (origin, dx, dy) => {
+    const layout = mapState.layout;
+    const rect = $("#code-map-svg").getBoundingClientRect();
+    const scale = layout.width / Math.max(1, rect.width);
+    mapView = clampMapView({ k: origin.k, tx: origin.tx + dx * scale, ty: origin.ty + dy * scale }, layout.width, layout.height);
+    repaintZoomed();
+  },
+});
+
+enablePan($("#assignment-board"), {
+  canPan: () => boardZoom > ZOOM_MIN,
+  begin: () => {
+    const board = $("#assignment-board");
+    return { left: board.scrollLeft, top: board.scrollTop };
+  },
+  move: (origin, dx, dy) => {
+    const board = $("#assignment-board");
+    board.scrollLeft = origin.left - dx;
+    board.scrollTop = origin.top - dy;
+  },
+});
+
 function renderTask(task) {
   const taskChanged = renderedTaskId !== task.id;
-  if (taskChanged) focusedAssignmentId = null;
+  if (taskChanged) {
+    focusedAssignmentId = null;
+    // Another task is another picture; a zoom chosen for the last one means nothing here.
+    boardZoom = ZOOM_MIN;
+    mapView = { ...MAP_VIEW_HOME };
+    updateZoomControls();
+  }
   document.title = `DevTeam — ${task.title}`;
   $("#project-name").textContent = task.project_name;
   $("#task-status").textContent = task.status;
@@ -516,8 +969,14 @@ function renderTask(task) {
   if (taskChanged) restoreMessageDraft(task.id);
   renderMembers(task);
   const openAssignments = task.assignments.filter((item) => ["queued", "claimed"].includes(item.status)).length;
-  $("#assignment-count").textContent = openAssignments;
+  // Collapsed, this line is the whole board. It has to say enough that nobody opens it to find out
+  // that nothing has changed — which a bare count of open notes never did, since a board of six
+  // blocked notes counted zero.
+  $("#board-summary").textContent = boardSummary(task.assignments);
+  renderCurrentWork(task);
   renderAssignmentBoard(task);
+  // A different task means a different set of touched files, and possibly a different project.
+  if (boardView === "map") loadCodeMap(task.id, { force: taskChanged });
   renderRegressions(task);
   renderBlackboard(task);
   const approvals = task.approvals.length;
@@ -637,8 +1096,16 @@ function renderKnowledge(task) {
   const section = $("#knowledge-section");
   if (!section) return;
   const notes = task.knowledge || [];
-  const filter = $("#knowledge-filter")?.value || "current";
-  const visible = notes.filter((note) => filter === "current" ? ["verified", "inferred"].includes(note.status) : note.status === filter);
+  // The notes the team can rely on, and nothing else. The rest are one quiet line: set aside, not
+  // hidden, and not worth a filter nobody has a reason to open.
+  const visible = notes.filter((note) => ["verified", "inferred"].includes(note.status));
+  const setAside = ["archived", "disputed", "stale"]
+    .map((status) => [status, notes.filter((note) => note.status === status).length])
+    .filter(([, count]) => count > 0)
+    .map(([status, count]) => `${count} ${status}`);
+  const setAsideLine = $("#knowledge-set-aside");
+  setAsideLine.classList.toggle("hidden", !setAside.length);
+  setAsideLine.textContent = setAside.length ? `Set aside: ${setAside.join(" · ")}` : "";
   const notesById = new Map(notes.map((note) => [note.id, note]));
   section.classList.toggle("hidden", !task.knowledgeVault?.automated && notes.length === 0);
   $("#knowledge-count").textContent = visible.length;
@@ -650,7 +1117,7 @@ function renderKnowledge(task) {
       <small>${escapeHtml(note.link)} · r${note.revision} · ${relativeTime(note.updated_at)}</small>
       ${note.stale_reason ? `<small class="knowledge-reason">${escapeHtml(note.stale_reason)}</small>` : ""}
       ${note.superseded_by ? `<small class="knowledge-reason">Superseded by ${escapeHtml(notesById.get(note.superseded_by)?.title || note.superseded_by)}</small>` : ""}
-    </div>`).join("") || '<p class="memory-scope">Ready — notes appear as the team completes work.</p>'}`;
+    </div>`).join("") || '<p class="memory-scope">Nothing written down yet. Notes are never captured automatically — an agent has to record one.</p>'}`;
 }
 
 function renderMemoryScope(prefix, notes) {
@@ -773,11 +1240,17 @@ function populateMessageTargets(connected) {
 
 
 document.addEventListener("click", async (event) => {
+  const chip = event.target.closest("[data-board-chip]");
+  if (chip && state?.selectedTask) {
+    focusedAssignmentId = chip.dataset.boardChip;
+    applyBoardMode(true);
+    renderAssignmentBoard(state.selectedTask);
+    return;
+  }
   const assignmentButton = event.target.closest("[data-assignment-focus]");
   if (assignmentButton && state?.selectedTask) {
     focusedAssignmentId = focusedAssignmentId === assignmentButton.dataset.assignmentFocus ? null : assignmentButton.dataset.assignmentFocus;
     renderAssignmentBoard(state.selectedTask);
-    if (focusedAssignmentId) $("#assignment-detail").scrollIntoView({ block: "nearest", behavior: "smooth" });
     return;
   }
   if (event.target.closest("[data-assignment-close]")) {
@@ -797,7 +1270,6 @@ document.addEventListener("click", async (event) => {
     if (!taskId) { toast("That knowledge note is not attached to a task yet"); return; }
     selectedTaskId = taskId;
     selectedProjectId = searchResult.dataset.searchProject || null;
-    timelineFilter = "all";
     pendingJumpEventId = Number(searchResult.dataset.searchEvent) || null;
     $("#search-dialog").close();
     await refresh();
@@ -814,7 +1286,12 @@ document.addEventListener("click", async (event) => {
     return;
   }
   const dialogButton = event.target.closest("[data-dialog]");
-  if (dialogButton) $("#" + dialogButton.dataset.dialog).showModal();
+  if (dialogButton) {
+    $("#" + dialogButton.dataset.dialog).showModal();
+    // The checklists on offer belong to the project, so re-read them as the dialog opens rather
+    // than showing whatever the last project had.
+    if (dialogButton.dataset.dialog === "task-dialog") loadDomainChoices($("#project-select").value || selectedProjectId);
+  }
   if (event.target.closest(".close")) event.target.closest("dialog").close();
   const deleteTaskButton = event.target.closest("[data-delete-task]");
   if (deleteTaskButton) {
@@ -961,9 +1438,11 @@ function renderDomainPickers() {
     }
   }
 }
-async function loadDomainChoices() {
+// The list is the selected project's own `checklists/` folder when it has one, so it reloads when
+// the dialog's project changes rather than once at boot.
+async function loadDomainChoices(projectId = selectedProjectId) {
   try {
-    const domains = await api("/api/domains");
+    const domains = await api(`/api/domains${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`);
     // An empty answer is a real answer: the checklists directory has no files yet.
     if (Array.isArray(domains)) {
       domainChoices = domains.map((domain) => ({
@@ -977,6 +1456,7 @@ async function loadDomainChoices() {
 }
 renderDomainPickers();
 loadDomainChoices();
+$("#project-select").addEventListener("change", (event) => loadDomainChoices(event.target.value || null));
 const taskDomains = (task) => {
   if (Array.isArray(task?.domains)) return task.domains;
   try { return JSON.parse(task?.domains || "[]"); } catch { return []; }
@@ -1226,20 +1706,8 @@ $("#copy-task-invite").addEventListener("click", async () => {
   catch { toast(agentInvite()); }
 });
 
-$("#knowledge-filter")?.addEventListener("change", () => {
-  if (state?.selectedTask) renderKnowledge(state.selectedTask);
-});
-
-$("#timeline-filters").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-timeline-filter]");
-  if (!button || !state?.selectedTask) return;
-  timelineFilter = button.dataset.timelineFilter;
-  renderTimeline(state.selectedTask, { wasNearBottom: false });
-});
-
 $("#jump-latest").addEventListener("click", () => {
   if (!state?.selectedTask) return;
-  timelineFilter = "all";
   renderTimeline(state.selectedTask, { wasNearBottom: true });
 });
 
@@ -1441,4 +1909,73 @@ document.addEventListener("click", (event) => {
   if (!toggle) return;
   const section = toggle.dataset.collapse;
   applyNavCollapse(section, toggle.getAttribute("aria-expanded") === "true");
+});
+
+// The board has two sizes, because a human only ever wants one of two things from it: what is
+// happening right now, or the whole shape of the work. The strip answers the first in one line;
+// expanding gives the graph the page. Both are the same #assignment-board element and the same
+// render path — only the box around it changes.
+let boardExpanded = false;
+// Two views of the same board: Work is the dependency graph of what the team is doing, Map is the
+// project those notes land in. The toggle only exists when the board is open, because the closed
+// strip is one line about right now and a map has nothing to say in one line.
+let boardView = "work";
+
+function applyBoardView(view, { expand = true } = {}) {
+  boardView = view === "map" ? "map" : "work";
+  for (const button of document.querySelectorAll("[data-board-view]")) {
+    button.setAttribute("aria-pressed", String(button.dataset.boardView === boardView));
+  }
+  resetZoom();
+  $("#assignment-board").classList.toggle("hidden", boardView === "map");
+  $("#code-map").classList.toggle("hidden", boardView !== "map");
+  if (boardView === "map") {
+    $("#assignment-detail").classList.add("hidden");
+    if (expand && !boardExpanded) applyBoardMode(true);
+    // Reading the map means having the map: fetch on arrival, and re-render once it lands.
+    if (renderedTaskId) loadCodeMap(renderedTaskId);
+    renderCodeMap();
+  }
+  try { localStorage.setItem("devteam.boardView", boardView); } catch { /* ignore */ }
+}
+
+function applyBoardMode(expanded) {
+  boardExpanded = Boolean(expanded);
+  const expand = $("#expand-board");
+  $("#work-board").classList.toggle("is-full", boardExpanded);
+  document.querySelector(".workspace").classList.toggle("board-full", boardExpanded);
+  expand.setAttribute("aria-pressed", String(boardExpanded));
+  expand.setAttribute("aria-expanded", String(boardExpanded));
+  expand.title = boardExpanded ? "Back to the current work" : "Open the whole board";
+  expand.textContent = boardExpanded ? "⤡" : "⤢";
+  // Collapsing keeps the strip's job: what is happening now, which is the work board's answer.
+  if (!boardExpanded && boardView === "map") applyBoardView("work", { expand: false });
+  if (boardExpanded && boardView === "map") renderCodeMap();
+  // A private convenience, so it is fine for this to be unavailable or to throw.
+  try { localStorage.setItem("devteam.board", boardExpanded ? "full" : "strip"); } catch { /* ignore */ }
+}
+
+try { applyBoardMode(localStorage.getItem("devteam.board") === "full"); } catch { applyBoardMode(false); }
+try { applyBoardView(boardExpanded && localStorage.getItem("devteam.boardView") === "map" ? "map" : "work", { expand: false }); } catch { applyBoardView("work", { expand: false }); }
+
+$("#expand-board").addEventListener("click", () => applyBoardMode(!boardExpanded));
+$("#board-views").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-board-view]");
+  if (button) applyBoardView(button.dataset.boardView);
+});
+
+// Escape is the way out of anything full-screen. Dialogs handle their own, so only take it when
+// one is not open and the person is not typing. On the map, the first Escape drops the file you
+// were reading rather than throwing away the whole view.
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !boardExpanded) return;
+  if (document.querySelector("dialog[open]")) return;
+  if (event.target.closest("input, textarea, select")) return;
+  if (boardView === "map" && (mapSelected || mapGroupFilter)) {
+    mapSelected = null;
+    mapGroupFilter = null;
+    paintCodeMap();
+    return;
+  }
+  applyBoardMode(false);
 });

@@ -1,4 +1,7 @@
-Plan --> Implement --> Check --> Again
+Work in separate turns. Complete only your assigned role, then stop so the next model can continue.
 
-Claude → Implementer + Tester + Researche
-Codex → Planner + Reviewer + Security Reviewer
+**Codex — Planner + Reviewer + Security Reviewer:** First, inspect the project and create a clear implementation plan. Do not implement anything during the planning stage. Then stop. After Claude finishes the implementation and testing, Codex returns to review all changes, check code quality, security, possible bugs, missing edge cases, and whether the original plan was followed. Fix only small review/security issues if necessary. If larger problems are found, clearly report them and create a new plan for the next implementation round, then stop.
+
+**Claude — Implementer + Tester + Researcher:** Read Codex's implementation plan first. Research documentation, libraries, APIs, or technical details when necessary. Implement the planned changes carefully without unnecessarily changing unrelated parts of the project. After implementation, run appropriate tests, builds, linting, type checks, or other verification. Fix problems discovered during testing when possible. Clearly summarize what was implemented, what was tested, and any remaining issues, then stop so Codex can perform the final review.
+
+The workflow should always follow this order: **Codex plans → Claude researches, implements, and tests → Codex reviews and performs the security check.** Each model should finish its assigned task and stop instead of continuing into the other model's responsibilities.

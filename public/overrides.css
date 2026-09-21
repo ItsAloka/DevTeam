@@ -623,12 +623,6 @@
   margin-top: 10px;
 }
 
-.knowledge-filter {
-  margin: 0 0 9px;
-  padding: 6px 8px;
-  font-size: 11px;
-}
-
 .knowledge-note {
   border: 1px solid var(--line);
   background: #11151b;
@@ -904,6 +898,8 @@
   .app-shell { height: 100dvh; overflow: hidden; }
   .workspace { height: 100dvh; min-height: 0; }
   .composer { width: calc(100% - 28px); margin-bottom: 12px; }
+  .work-board { padding: 12px 14px 0; }
+  .assignment-detail { flex-basis: 200px; }
   .header-actions { flex-wrap: wrap; justify-content: flex-end; }
   #copy-task-invite { display: inline-flex; }
 }
@@ -1006,7 +1002,7 @@
 
 /* A check that used to pass and now does not. Above the assignments, because a broken shared check
    belongs to the team rather than to whichever assignment happened to run it. */
-.regressions { display: grid; gap: 6px; margin-top: 14px; }
+.regressions { display: grid; flex: 0 0 auto; gap: 6px; }
 
 .regression {
   display: grid;
@@ -1052,6 +1048,17 @@
 .agent-color-6 { --agent-color: color-mix(in srgb, var(--red) 56%, var(--amber)); }
 .agent-color-7 { --agent-color: color-mix(in srgb, var(--green) 58%, var(--amber)); }
 
+/* The map's folders borrow the same eight, for the same reason: one palette in the product, and a
+   folder reads as an identity rather than as a state. */
+.map-group-0 { --agent-color: var(--blue); }
+.map-group-1 { --agent-color: var(--green); }
+.map-group-2 { --agent-color: var(--amber); }
+.map-group-3 { --agent-color: var(--red); }
+.map-group-4 { --agent-color: color-mix(in srgb, var(--blue) 58%, var(--red)); }
+.map-group-5 { --agent-color: color-mix(in srgb, var(--green) 52%, var(--blue)); }
+.map-group-6 { --agent-color: color-mix(in srgb, var(--red) 56%, var(--amber)); }
+.map-group-7 { --agent-color: color-mix(in srgb, var(--green) 58%, var(--amber)); }
+
 .agent.agent-color-0 .avatar,
 .agent.agent-color-1 .avatar,
 .agent.agent-color-2 .avatar,
@@ -1077,14 +1084,230 @@
 
 .reconnect-row[class*="agent-color-"] { grid-template-columns: 7px minmax(0, 1fr) auto; }
 
-/* The dependency graph is deliberately wider than the panel for three or more lanes. Keeping the
+/* The board is the product, so it sits in the widest column rather than in the team panel, where a
+   graph could never be read. Two sizes, because a human wants one of two things from it: the strip
+   answers "what is happening right now" in one line, and expanding gives the whole graph the page.
+   One instance, one render path — only the box around #assignment-board changes. */
+.work-board {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  padding: 12px 34px 0;
+}
+
+.work-board-head {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.work-board-head h2 {
+  flex: 0 0 auto;
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+/* The current work itself, not a count of it. Chips truncate rather than wrap: the strip is one
+   line tall at every width, so the timeline underneath keeps its room. */
+.board-now {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.board-chip {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+  max-width: 340px;
+  padding: 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--agent-color, var(--muted)) 46%, var(--line));
+  border-left-width: 3px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--agent-color, var(--muted)) 10%, var(--panel2));
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.board-chip.is-unclaimed { --agent-color: var(--muted); }
+.board-chip.status-blocked { border-color: color-mix(in srgb, var(--red) 55%, var(--line)); }
+.board-chip:hover { border-color: var(--agent-color, var(--muted)); }
+.board-chip:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+
+.board-chip-title {
+  flex: 1 1 auto;
+  min-width: 72px;
+  overflow: hidden;
+  font-size: 11.5px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The title is the chip. The holder shrinks away first, and at narrow widths it goes entirely —
+   knowing which note is moving beats knowing whose hands are on it. */
+.board-chip-meta {
+  display: flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--agent-color, var(--muted));
+  font-size: 10px;
+  white-space: nowrap;
+}
+.board-chip.status-blocked .board-chip-meta { color: var(--red); }
+
+.board-more { flex: 0 0 auto; color: var(--muted); font-size: 10.5px; }
+
+@media (max-width: 1180px) {
+  .board-chip-meta { display: none; }
+  .board-summary { display: none; }
+}
+
+.board-summary {
+  flex: 0 0 auto;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board-expand {
+  flex: 0 0 auto;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.board-expand:hover { background: #1a2029; color: var(--text); }
+.board-expand:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.board-expand[aria-pressed="true"] { background: #1a2029; color: var(--text); }
+
+/* Work or Map — the same board, showing the plan or the code it lands in. Only offered when the
+   board is open: the closed strip is one line about what is moving right now, and a map cannot be
+   said in one line. */
+.board-views { display: none; }
+.work-board.is-full .board-views {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel2);
+}
+
+.board-view {
+  padding: 4px 11px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.board-view:hover { color: var(--text); }
+.board-view[aria-pressed="true"] { background: #1a2029; color: var(--text); }
+.board-view:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+
+/* Zoom spreads the picture rather than magnifying it: cards, circles, lines and labels stay their
+   size while the space between them grows, so a cluster opens up into its connections. Like the
+   view switch, it exists only when the board is open. */
+.board-zoom { display: none; }
+.work-board.is-full .board-zoom {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel2);
+}
+.board-zoom-step,
+.board-zoom-reset {
+  min-width: 24px;
+  padding: 4px 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1;
+  cursor: pointer;
+}
+.board-zoom-step:hover:not(:disabled),
+.board-zoom-reset:hover:not(:disabled) { color: var(--text); }
+.board-zoom-step:disabled,
+.board-zoom-reset:disabled { opacity: 0.4; cursor: default; }
+.board-zoom-step:focus-visible,
+.board-zoom-reset:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+.board-zoom-level {
+  min-width: 38px;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+/* Drag-to-pan, once zoomed. */
+.code-map-canvas.is-zoomed,
+.assignment-board.is-zoomed { cursor: grab; }
+.code-map-canvas.is-panning,
+.assignment-board.is-panning { cursor: grabbing; user-select: none; }
+
+/* Closed, the board is its header and nothing else. */
+.work-board-body { display: none; }
+
+/* Open, it takes the column the timeline was using. The timeline is hidden rather than squeezed,
+   because a 90px-tall chat log helps nobody. */
+.work-board.is-full { flex: 1 1 auto; min-height: 0; }
+.work-board.is-full .board-now { display: none; }
+.work-board.is-full .work-board-body {
+  display: flex;
+  flex: 1 1 auto;
+  gap: 12px;
+  min-height: 0;
+  padding-bottom: 14px;
+}
+/* A three-note plan centres in the page instead of hugging the left edge; "safe" keeps a graph
+   wider than the column scrollable from its first column rather than centring it out of reach. */
+.work-board.is-full .assignment-board { display: grid; justify-content: safe center; }
+.workspace.board-full > #conversation { display: none; }
+
+/* The dependency graph is deliberately wider than its box for four or more lanes. Keeping the
    overflow inside this scroller preserves legible notes instead of shrinking their text to fit. */
 .assignment-board {
   position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
   min-height: 68px;
-  margin-top: 12px;
-  overflow: auto hidden;
-  overscroll-behavior-inline: contain;
+  overflow: auto;
+  overscroll-behavior: contain;
   scrollbar-width: thin;
 }
 
@@ -1105,18 +1328,20 @@
 .assignment-edges { pointer-events: none; }
 .assignment-edges { width: 100%; height: 100%; overflow: visible; }
 
+/* Lanes are rows now: the role that owns each step of the work, named down the left gutter. */
 .assignment-lane {
   position: absolute;
-  inset-block: 0;
-  border-inline: 1px dashed color-mix(in srgb, var(--line) 70%, transparent);
-  background: linear-gradient(to bottom, color-mix(in srgb, var(--blue) 5%, transparent), transparent 45%);
+  inset-inline: 0;
+  border-block: 1px dashed color-mix(in srgb, var(--line) 62%, transparent);
+  background: linear-gradient(to right, color-mix(in srgb, var(--blue) 6%, transparent), transparent 40%);
 }
 
 .assignment-lane > span {
   position: absolute;
-  top: 8px;
-  left: 6px;
-  max-width: calc(100% - 12px);
+  top: 50%;
+  left: 10px;
+  max-width: 88px;
+  transform: translateY(-50%);
   overflow: hidden;
   color: var(--muted);
   font-size: 9px;
@@ -1125,6 +1350,170 @@
   text-overflow: ellipsis;
   text-transform: uppercase;
   white-space: nowrap;
+}
+
+/* The map. A file is a circle, an import is a line, and a folder is a colour — the three things
+   the code graph already records. Size is how many other files touch it, which is the one thing a
+   picture can say at a glance that a file tree cannot. Everything the team has been near is picked
+   out on top of that: a ring for a file a note is about, a filled accent for a file this task
+   changed. Drawn as plain SVG, like the dependency board, with nothing installed. */
+.code-map {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.code-map-head {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.code-map-summary {
+  flex: 0 1 auto;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.code-map-legend {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  gap: 5px;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.map-legend-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--panel2);
+  color: var(--muted);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+.map-legend-chip:hover { color: var(--text); }
+.map-legend-chip.active { border-color: var(--agent-color, var(--muted)); color: var(--text); }
+.map-legend-chip:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+.map-legend-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--agent-color, var(--muted));
+}
+.map-legend-count { color: #5c6673; }
+
+.code-map-canvas {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 220px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--panel2) 72%, transparent);
+}
+
+.code-map-svg { display: block; width: 100%; height: 100%; }
+
+/* Imports have to be visible or the map is a field of dots. They are still the quietest thing on
+   it: hundreds of lines at full strength would be a net thrown over the picture. */
+.map-edge {
+  stroke: #4c5866;
+  stroke-width: 0.9;
+  opacity: 0.75;
+}
+/* An import touching a file this task changed. The work is the reason the map is open. */
+.map-edge.live { stroke: var(--green2); stroke-width: 1.2; opacity: 0.8; }
+/* The file being read, and what it connects to. Selection outranks everything else on screen. */
+.map-edge.lit { stroke: var(--blue); stroke-width: 1.5; opacity: 1; }
+.map-edge.dim { opacity: 0.07; }
+
+.map-node { cursor: pointer; }
+.map-node > circle {
+  fill: color-mix(in srgb, var(--agent-color, var(--muted)) 62%, var(--bg));
+  stroke: color-mix(in srgb, var(--agent-color, var(--muted)) 80%, var(--bg));
+  stroke-width: 1;
+}
+.map-node:hover > circle { fill: var(--agent-color, var(--muted)); }
+.map-node:focus-visible { outline: none; }
+.map-node:focus-visible > circle { stroke: var(--blue); stroke-width: 2.4; }
+.map-node.dim { opacity: 0.13; }
+.map-node.touched > circle {
+  fill: var(--green2);
+  stroke: var(--green);
+  stroke-width: 1.6;
+}
+.map-node.selected > circle { stroke: var(--text); stroke-width: 2.4; }
+.map-note-ring {
+  fill: none;
+  stroke: var(--amber);
+  stroke-width: 1.1;
+  opacity: 0.85;
+}
+
+.map-label {
+  fill: var(--muted);
+  font-size: 9.5px;
+  font-weight: 650;
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 3;
+  stroke-linejoin: round;
+  text-anchor: middle;
+  pointer-events: none;
+}
+.map-label.touched { fill: var(--green); }
+
+/* Clicking a file: what it is, what it touches, and anything the team wrote down about it. Sits
+   over the map rather than beside it, so choosing a file does not reflow the picture. */
+.code-map-detail {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  width: min(330px, calc(100% - 24px));
+  max-height: calc(100% - 24px);
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  box-shadow: 0 18px 50px #0009;
+}
+
+.map-detail-top { display: flex; justify-content: space-between; gap: 8px; }
+.map-detail-top strong { font-size: 12.5px; overflow-wrap: anywhere; }
+.map-detail-path {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  color: #7c8794;
+  font-size: 10.5px;
+}
+.map-detail-facts { margin: 7px 0 0; color: var(--muted); font-size: 11px; }
+.map-detail-touched { margin: 7px 0 0; color: var(--green); font-size: 11px; }
+.map-detail-notes { margin-top: 9px; }
+.map-detail-notes .section-label { margin: 0 0 5px; }
+.map-detail-note {
+  display: grid;
+  gap: 2px;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .assignment-edge {
@@ -1220,7 +1609,15 @@
 .assignment-holder.unclaimed { color: var(--muted); font-weight: 500; }
 .assignment-rework { color: var(--red); font-size: 9px; font-weight: 750; white-space: nowrap; }
 
-.assignment-detail { margin-top: 10px; }
+/* Beside the graph, not below it: in a band there is no room underneath, and clicking a note must
+   never scroll the note you clicked out of view. */
+.assignment-detail {
+  flex: 0 0 clamp(240px, 26%, 340px);
+  min-width: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
 .assignment-detail .assignment { border-color: color-mix(in srgb, var(--blue) 34%, var(--line)); }
 .assignment-detail-close {
   width: 22px;
@@ -1530,50 +1927,33 @@ body.resizing-panel .panel-resizer::after { background: color-mix(in srgb, var(-
 .team-resizer { left: 0; }
 body.resizing-panel { cursor: col-resize; user-select: none; }
 
-.timeline-toolbar {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 34px 0;
-  background: var(--bg);
-}
-
 .conversation { position: relative; }
 
-.timeline-filters {
-  display: flex;
-  gap: 5px;
-  min-width: 0;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-
-.timeline-filters::-webkit-scrollbar { display: none; }
-.timeline-filters button,
+/* No timeline filters: the six chips were a toolbar nobody used, and every one of them was a way
+   of seeing less of the room. Jump-to-latest is a round arrow riding just above the composer, where
+   the eye already is when reading the newest messages, and it moves with the composer as it grows. */
 .jump-latest {
-  border: 1px solid var(--line);
+  position: absolute;
+  bottom: calc(100% + 12px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 4;
+  display: grid;
+  place-items: center;
+  min-width: 36px;
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid #2c343e;
   border-radius: 999px;
-  background: #11161c;
-  color: #7f8a98;
-  padding: 5px 10px;
+  background: #151a21;
+  color: var(--text);
   cursor: pointer;
-  font: 10px inherit;
+  font: 600 16px/1 inherit;
   white-space: nowrap;
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--bg) 80%, transparent);
 }
-
-.timeline-filters button:hover,
-.timeline-filters button.active {
-  border-color: color-mix(in srgb, var(--blue) 48%, var(--line));
-  background: color-mix(in srgb, var(--blue) 11%, #11161c);
-  color: var(--blue);
-}
-
-.jump-latest {
-  color: var(--green);
-  border-color: color-mix(in srgb, var(--green) 35%, var(--line));
-}
+.jump-latest:hover { border-color: color-mix(in srgb, var(--green) 45%, #2c343e); }
+.jump-latest.has-unread { color: var(--green); font-size: 12px; }
 
 .timeline-empty {
   padding: 34px 12px;
@@ -1628,6 +2008,9 @@ body.resizing-panel { cursor: col-resize; user-select: none; }
 .draft-status:empty { display: none; }
 
 .task-brief-dialog { width: min(780px, calc(100vw - 30px)); }
+/* Defining a task is where the whole brief gets written, so the dialog is a workspace, not a form. */
+.task-dialog { width: min(1040px, calc(100vw - 40px)); max-height: calc(100vh - 40px); overflow-y: auto; padding: 28px 32px; }
+.task-dialog textarea[name="description"] { min-height: min(46vh, 480px); resize: vertical; line-height: 1.5; }
 .task-brief-content {
   max-height: min(62vh, 620px);
   padding: 16px 18px;
@@ -1681,8 +2064,7 @@ body.resizing-panel { cursor: col-resize; user-select: none; }
 
 @media (max-width: 720px) {
   .search-trigger { margin-top: -8px; }
-  .timeline-toolbar { padding: 8px 14px 0; }
-  .jump-latest { position: absolute; right: 14px; bottom: 130px; z-index: 4; box-shadow: 0 5px 20px #0008; }
+  .work-board { padding: 10px 14px 0; }
   .search-result { grid-template-columns: auto minmax(0, 1fr); }
   .search-result time { display: none; }
   .search-scope { align-items: flex-start; flex-direction: column; }

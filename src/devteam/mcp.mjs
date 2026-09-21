@@ -342,6 +342,12 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       disconnectAfter: z.boolean().default(false),
       claimToken: z.string().max(200).optional().describe("The claimToken from the assignment you claimed (or from devteam_join when you resumed). Lets the server fence a stale report if your lease has since moved."),
       checklistSections: z.array(z.string().max(80)).max(20).default([]).describe("If your brief carried checklistFiles, name the sections of those files you actually walked (the `## ` headings). Walk the ones your change touches, not all of them. This is recorded in the task timeline as your claim about what you checked."),
+      learned: z.array(z.object({
+        category: z.enum(["architecture", "decisions", "components", "conventions", "pitfalls", "workflows"])
+          .describe("architecture (how it fits together), decisions (a choice and its reason), components (what one part does), conventions (a rule the project follows), pitfalls (what will bite the next person), workflows (how a recurring job is done)"),
+        title: z.string().min(1).max(200).describe("The fact as a statement, not a topic — 'The billing API rate-limits at 30 requests/minute', not 'Billing API'"),
+        body: z.string().min(1).max(4000).describe("The fact with enough context for the next person to act on it"),
+      })).max(3).default([]).describe("What this work taught you that the next person would otherwise rediscover: an API limit, why the obvious approach fails here, a convention the code follows but never states. Recorded as project memory and delivered in future briefs. Omit it when the work taught you nothing durable — most work does not, and an empty list is the honest answer."),
     },
   }, safe(async ({ disconnectAfter, ...args }) => {
     requireIdentity(args.agentId);

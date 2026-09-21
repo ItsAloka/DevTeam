@@ -7,6 +7,7 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -39,54 +40,6 @@ export function vaultOwner(vaultRoot) {
   }
 }
 const MAX_NOTE_BODY = 24_000;
-// `conventions/` had no automatic source: every generated note came from the event stream, which can
-// only ever say what was *done*. A convention is different — it is something the project keeps
-// having to be told, and the honest evidence for it is a reviewer saying the same thing on separate
-// pieces of work.
-//
-// The source is `assignment_findings` — the structured findings attached to a request for changes —
-// and deliberately NOT `agent.finding` events, which look like a bigger corpus (102 of them) but are
-// free-form narrative: status reports, handoff checklists, arguments between agents. Clustering
-// those produces confident nonsense, which is worse than an empty folder.
-//
-// The thresholds below are meant to under-fire. Three findings is not much, but requiring two
-// distinct tasks is the part that matters: three bullets in one review is one reviewer being
-// thorough, whereas the same objection raised on separate work is a rule the project has and has
-// never written down.
-const CONVENTION_MIN_FINDINGS = 3;
-export const CONVENTION_MIN_TASKS = 2;
-const CONVENTION_SIGNATURE_WORDS = 6;
-const CONVENTION_MIN_SIGNATURE_WORDS = 3;
-// Words that carry no subject matter. Kept small on purpose: an aggressive list starts deciding what
-// a finding is about, and that judgement is the thing this feature must not make.
-const FINDING_STOPWORDS = new Set([
-  "this", "that", "these", "those", "there", "then", "than", "with", "without", "from", "into",
-  "have", "has", "had", "been", "being", "does", "did", "not", "but", "and", "the", "for", "are",
-  "was", "were", "will", "would", "should", "could", "must", "can", "should", "when", "what",
-  "which", "while", "here", "still", "also", "only", "just", "very", "more", "most", "some", "any",
-  "each", "every", "your", "you", "its", "it", "they", "them", "their", "please", "needs", "need",
-]);
-
-// Crude stemming, and crude on purpose: `clamp` and `clamped` are the same objection, and a real
-// stemmer is a dependency and a whole class of surprises for a gain of one word ending.
-const stem = (word) => word.replace(/(ing|ed|es|s)$/u, "") || word;
-
-// A stable key for "the same objection". Two findings match only when their significant vocabulary
-// matches exactly, which is strict — this is designed to miss real repetitions rather than to invent
-// one. Returns null for anything too short to be about a subject at all.
-export function findingSignature(detail) {
-  const words = String(detail || "")
-    .toLowerCase()
-    .replace(/`[^`]*`/gu, " ")
-    .replace(/https?:\/\/\S+/gu, " ")
-    .replace(/[^\p{L}\s]+/gu, " ")
-    .split(/\s+/u)
-    .map((word) => stem(word))
-    .filter((word) => word.length > 3 && !FINDING_STOPWORDS.has(word));
-  const unique = [...new Set(words)].sort();
-  if (unique.length < CONVENTION_MIN_SIGNATURE_WORDS) return null;
-  return unique.slice(0, CONVENTION_SIGNATURE_WORDS).join(" ");
-}
 const MAX_LEGACY_FILES = 20;
 const MAX_LEGACY_BYTES = 100_000;
 
@@ -291,34 +244,6 @@ export function rankKnowledgeNotes(notes, context = {}, limit = 12) {
   return selected;
 }
 
-function frontmatter(note) {
-  const files = parseJson(note.related_files, []);
-  const provenance = parseJson(note.provenance, []);
-  return [
-    "---",
-    "generated_by: DevTeam",
-    `title: ${yamlString(short(note.title, 200))}`,
-    `category: ${note.category}`,
-    `status: ${note.status}`,
-    `confidence: ${note.confidence}`,
-    `created: ${yamlString(note.created_at)}`,
-    `updated: ${yamlString(note.updated_at)}`,
-    `verified: ${note.verified_at ? yamlString(note.verified_at) : "null"}`,
-    `last_validated: ${note.last_validated_at ? yamlString(note.last_validated_at) : "null"}`,
-    `last_validated_version: ${note.last_validated_version ?? "null"}`,
-    `status_changed: ${note.status_changed_at ? yamlString(note.status_changed_at) : "null"}`,
-    `stale_reason: ${note.stale_reason ? yamlString(note.stale_reason) : "null"}`,
-    `superseded_by: ${note.superseded_by ? yamlString(note.superseded_by) : "null"}`,
-    `revision: ${note.revision}`,
-    `source_task: ${note.source_task_id ? yamlString(note.source_task_id) : "null"}`,
-    `source_event: ${note.source_event_id ?? "null"}`,
-    "related_files:",
-    ...(files.length ? files.map((file) => `  - ${yamlString(file)}`) : ["  []"]),
-    `provenance_count: ${provenance.length}`,
-    "---",
-  ].join("\n");
-}
-
 export function atomicWrite(filePath, content) {
   mkdirSync(path.dirname(filePath), { recursive: true });
   const temp = `${filePath}.tmp-${process.pid}`;
@@ -516,10 +441,8 @@ export class KnowledgeVault {
   initializeProject(projectId) {
     if (!this.enabled) return null;
     this.db.prepare("INSERT OR IGNORE INTO knowledge_state (project_id, last_event_id) VALUES (?, 0)").run(projectId);
-    this.#restoreMissingEventIndex(projectId);
     this.#importLegacy(projectId);
     this.#syncProjectEvents(projectId);
-    this.#syncConventions(projectId);
     return this.exportProject(projectId);
   }
 
@@ -530,103 +453,9 @@ export class KnowledgeVault {
     `).get(taskId);
     if (!task) return null;
     this.db.prepare("INSERT OR IGNORE INTO knowledge_state (project_id, last_event_id) VALUES (?, 0)").run(task.project_id);
-    this.#restoreMissingEventIndex(task.project_id);
     this.#importLegacy(task.project_id);
     this.#syncProjectEvents(task.project_id);
-    this.#syncConventions(task.project_id);
     return this.exportProject(task.project_id);
-  }
-
-  // The markdown vault is derived from the event history, but it deliberately survives a local
-  // database reset. A cursor without its corresponding notes then says every old event has already
-  // been ingested, leaving a populated vault and an empty DB index (and therefore an empty brief).
-  // Resetting the cursor is safe only when the index is completely empty: replaying events restores
-  // the canonical rows and their generated files without overwriting any live indexed knowledge.
-  //
-  // At most once per database: a project whose history legitimately produces no notes would
-  // otherwise look "empty" on every sync and replay its whole event log each time. The marker lives
-  // in this database, so a genuine reset clears it along with the index it is protecting.
-  #restoreMissingEventIndex(projectId) {
-    const markerKey = `knowledge_index_restored:${projectId}`;
-    if (this.db.prepare("SELECT 1 FROM metadata WHERE key = ?").get(markerKey)) return false;
-    const state = this.db.prepare("SELECT last_event_id FROM knowledge_state WHERE project_id = ?").get(projectId);
-    if (!state || Number(state.last_event_id) <= 0) return false;
-    const notes = Number(this.db.prepare("SELECT COUNT(*) AS count FROM knowledge_notes WHERE project_id = ?").get(projectId)?.count || 0);
-    if (notes > 0) return false;
-    const hasEvents = this.db.prepare(`
-      SELECT 1 FROM events event
-      JOIN tasks task ON task.id = event.task_id
-      WHERE task.project_id = ? LIMIT 1
-    `).get(projectId);
-    if (!hasEvents) return false;
-    this.db.prepare("UPDATE knowledge_state SET last_event_id = 0 WHERE project_id = ?").run(projectId);
-    this.db.prepare("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)").run(markerKey, new Date().toISOString());
-    return true;
-  }
-
-  // Recompute the whole project's recurring-finding conventions. Cheap enough to redo wholesale
-  // rather than maintain incrementally: request-for-changes is a rare event, and recomputing means a
-  // note can never drift from the findings that justify it — including downwards, when a note that
-  // no longer clears the threshold is archived rather than left standing as a rule nobody agreed to.
-  #syncConventions(projectId) {
-    const rows = this.db.prepare(`
-      SELECT f.id, f.detail, f.path, f.requested_by_name, f.created_at, f.task_id
-      FROM assignment_findings f
-      JOIN tasks t ON t.id = f.task_id
-      WHERE t.project_id = ?
-      ORDER BY f.created_at ASC
-    `).all(projectId);
-    const groups = new Map();
-    for (const row of rows) {
-      const signature = findingSignature(row.detail);
-      if (!signature) continue;
-      if (!groups.has(signature)) groups.set(signature, []);
-      groups.get(signature).push(row);
-    }
-    for (const [signature, findings] of groups) {
-      const slug = `recurring-${createHash("sha256").update(signature).digest("hex").slice(0, 10)}`;
-      const distinctTasks = new Set(findings.map((finding) => finding.task_id)).size;
-      const qualifies = findings.length >= CONVENTION_MIN_FINDINGS && distinctTasks >= CONVENTION_MIN_TASKS;
-      const existing = this.db.prepare("SELECT id, status FROM knowledge_notes WHERE id = ?")
-        .get(KnowledgeVault.noteId(projectId, "conventions", slug));
-      if (!qualifies) {
-        // Never invent a rule, and never leave one standing once its evidence stops meeting the bar.
-        if (existing && existing.status !== "archived") {
-          this.db.prepare("UPDATE knowledge_notes SET status = 'archived', status_changed_at = ? WHERE id = ?")
-            .run(new Date().toISOString(), existing.id);
-        }
-        continue;
-      }
-      const latest = findings[findings.length - 1];
-      // The body is quotation, not summary. DevTeam has no opinion about what the rule *is* — it
-      // reports that the same objection keeps being raised and hands over the evidence, so a reader
-      // draws the conclusion rather than trusting one this file invented.
-      const quoted = findings.map((finding) => {
-        const where = finding.path ? ` (\`${finding.path}\`)` : "";
-        return `- “${short(String(finding.detail).replace(/\s+/gu, " "), 400)}”${where}\n  — ${finding.requested_by_name}, ${String(finding.created_at).slice(0, 10)}`;
-      }).join("\n");
-      const body = [
-        `Reviewers have raised the same objection **${findings.length} times across ${distinctTasks} separate tasks**.`,
-        "That makes it a convention this project has and has not written down.",
-        "",
-        "## The findings",
-        "",
-        quoted,
-        "",
-        "Recorded automatically from requests for changes. If this is not a real convention, dispute the note;",
-        "if it is, writing it down properly here is better than being told again.",
-      ].join("\n");
-      this.#upsert({
-        projectId, category: "conventions", slug,
-        title: `Recurring review finding: ${signature}`,
-        body, status: "proposed", confidence: "medium",
-        sourceTaskId: latest.task_id, sourceEventId: null,
-        sourceAuthor: "DevTeam (recurring review findings)",
-        provenance: { type: "knowledge.recurring_finding", taskId: latest.task_id, at: latest.created_at },
-        createdAt: findings[0].created_at,
-        relatedFiles: findings.map((finding) => finding.path).filter(Boolean),
-      });
-    }
   }
 
   #syncProjectEvents(projectId) {
@@ -676,103 +505,13 @@ export class KnowledgeVault {
       return;
     }
 
-    if (["assignment.completed", "assignment.blocked"].includes(event.type)) {
-      const role = String(metadata.role || "contributor").toLowerCase();
-      const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
-      const changedFiles = project ? normalizeProjectFiles(project.root, metadata.changedFiles) : [];
-      // Prefer the graded records over the bare labels. The vault is what agents read back as
-      // ground truth and what gets exported into the repo, so it is the last place that should blur
-      // "DevTeam ran this" into "an agent said this".
-      const records = Array.isArray(metadata.checkRecords) ? metadata.checkRecords : null;
-      const checks = records
-        ? records.slice(0, 50).map((record) => {
-          const label = clip(String(record?.label ?? ""), 500);
-          if (!label) return "";
-          if (record?.status === "passed") return `${label} — verified by DevTeam (exit 0)`;
-          if (record?.status === "failed") return `${label} — verified failure${record.exitCode == null ? "" : ` (exit ${record.exitCode})`}`;
-          if (record?.status === "unavailable") return `${label} — not run`;
-          return `${label} — agent-asserted, unverified`;
-        }).filter(Boolean)
-        : (Array.isArray(metadata.checks) ? metadata.checks.map((item) => `${clip(item, 500)} — agent-asserted, unverified`).filter(Boolean).slice(0, 50) : []);
-      // Note: the note's own status field is this vault's lifecycle state (verified / disputed /
-      // superseded), which is a different question from whether a check was executed. That
-      // distinction lives in the check lines above, where it belongs.
-      const assignment = metadata.assignmentId
-        ? this.db.prepare("SELECT title FROM assignments WHERE id = ?").get(metadata.assignmentId)
-        : null;
-      const blocked = event.type === "assignment.blocked";
-      const category = blocked ? "pitfalls"
-        : ["reviewer", "tester", "security-reviewer"].includes(role) ? "workflows"
-          : changedFiles.length ? "components" : "workflows";
-      const body = [
-        event.message,
-        changedFiles.length ? `## Related files\n\n${changedFiles.map((file) => `- \`${file}\``).join("\n")}` : "",
-        checks.length ? `## Checks\n\n${checks.map((check) => `- ${check}`).join("\n")}` : "",
-      ].filter(Boolean).join("\n\n");
-      const staleIds = changedFiles.length ? this.#staleFileLinkedNotes(projectId, event, changedFiles) : [];
-      const noteId = this.#upsert({ ...common, category, slug: `${blocked ? "blocker" : "work"}-${event.id}-${slugify(assignment?.title || role)}`,
-        title: assignment?.title || `${role} ${blocked ? "blocker" : "result"}`, body: clip(body),
-        status: blocked ? "disputed" : "verified", confidence: blocked ? "medium" : "high",
-        relatedFiles: changedFiles, verifiedAt: blocked ? null : event.created_at });
-      if (staleIds.length) this.#recordLifecycleEvent(event, staleIds, !blocked && category === "components" ? noteId : null, changedFiles);
-      return;
-    }
-
-    if (["task.blocked", "agent.finding"].includes(event.type)) {
-      this.#upsert({ ...common, category: "pitfalls", slug: `${event.type.replace(".", "-")}-${event.id}`,
-        title: event.type === "task.blocked" ? `Blocked: ${event.task_title}` : `Finding: ${short(event.message, 90)}`,
-        body: clip(event.message), status: event.type === "task.blocked" ? "verified" : "inferred",
-        confidence: event.type === "task.blocked" ? "high" : "medium", verifiedAt: event.type === "task.blocked" ? event.created_at : null });
-      return;
-    }
-
-    if (event.type === "agent.decision") {
-      this.#upsert({ ...common, category: "decisions", slug: `agent-decision-${event.id}`,
-        title: `Proposed decision: ${short(event.message, 90)}`, body: clip(event.message), status: "inferred", confidence: "medium" });
-    }
-  }
-
-  #staleFileLinkedNotes(projectId, event, changedFiles) {
-    const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
-    if (!project) return [];
-    const rows = this.db.prepare(`
-      SELECT id, related_files FROM knowledge_notes
-      WHERE project_id = ? AND category = 'components' AND status NOT IN ('stale', 'archived')
-        AND (source_event_id IS NULL OR source_event_id < ?)
-      ORDER BY updated_at ASC, id ASC
-    `).all(projectId, event.id);
-    const affected = rows.filter((row) => {
-      const related = normalizeProjectFiles(project.root, parseJson(row.related_files, []));
-      return related.some((known) => changedFiles.some((changed) => pathsIntersect(known, changed)));
-    });
-    if (!affected.length) return [];
-    const reason = clip(`Files changed in task event ${event.id}: ${changedFiles.join(", ")}`, 1_000);
-    const update = this.db.prepare(`
-      UPDATE knowledge_notes SET status = 'stale', stale_reason = ?, status_changed_at = ?,
-        superseded_by = NULL, updated_at = ?, revision = revision + 1 WHERE id = ?
-    `);
-    for (const row of affected) update.run(reason, event.created_at, event.created_at, row.id);
-    return affected.map((row) => row.id);
-  }
-
-  #recordLifecycleEvent(sourceEvent, noteIds, supersededBy, relatedFiles) {
-    if (supersededBy) {
-      const link = this.db.prepare("UPDATE knowledge_notes SET superseded_by = ? WHERE id = ? AND status = 'stale'");
-      for (const noteId of noteIds) link.run(supersededBy, noteId);
-    }
-    const type = supersededBy ? "knowledge.superseded" : "knowledge.staled";
-    const message = supersededBy
-      ? `${noteIds.length} earlier knowledge note${noteIds.length === 1 ? " was" : "s were"} superseded by current file evidence.`
-      : `${noteIds.length} earlier knowledge note${noteIds.length === 1 ? " became" : "s became"} stale after file changes.`;
-    this.db.prepare(`
-      INSERT INTO events (task_id, agent_id, type, message, metadata, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(sourceEvent.task_id, sourceEvent.agent_id || null, type, message, JSON.stringify({
-      sourceEventId: sourceEvent.id,
-      noteIds: noteIds.slice(0, 100),
-      supersededBy: supersededBy || null,
-      relatedFiles: relatedFiles.slice(0, 100),
-    }), sourceEvent.created_at);
+    // Nothing else becomes a note. DevTeam used to mint one per completed assignment, per decision
+    // and per finding: 964 notes for one project, of which 947 were captured transcript and 11 were
+    // written by somebody who meant to. The events themselves were never lost — workspace search
+    // queries events and assignments in their own right — so the capture bought nothing and cost
+    // every brief, every search and 1,289 files in the repository. A note now exists because a
+    // person or an agent decided it should: `devteam_memory write`, a `learned` line on a report,
+    // or a project memory key.
   }
 
   #upsert(note) {
@@ -852,85 +591,113 @@ export class KnowledgeVault {
       .run(new Date().toISOString(), projectId);
   }
 
+  // What the vault is on disk: one file per task, plus CURRENT.md. Nothing else.
+  //
+  // It used to be one Markdown file per note — 1,289 of them in one project, rewritten in full on
+  // every export, in a layout shaped for Obsidian. Neither project that has one was ever opened in
+  // Obsidian (no `.obsidian` anywhere), nothing ever read an edit back, and the reconciler would
+  // have deleted a file the owner added. It was a one-way dump for a reader that never arrived.
+  // A task's file is what that task decided, learned, changed and got stuck on, and the notes
+  // somebody deliberately wrote while doing it — which is the part worth keeping and the part worth
+  // reading.
   exportProject(projectId) {
     if (!this.enabled) return null;
     const { project, vault } = this.#projectRoot(projectId);
-    for (const folder of [...CATEGORIES, "sessions", "archive"]) mkdirSync(path.join(vault, folder), { recursive: true });
-    const notes = this.db.prepare("SELECT * FROM knowledge_notes WHERE project_id = ? ORDER BY updated_at DESC, title ASC")
-      .all(projectId);
-    const expected = new Set(["CURRENT.md", "INDEX.md"]);
-    for (const note of notes) {
-      const folder = note.status === "archived" || note.category === "archive" ? "archive" : note.category;
-      const provenance = parseJson(note.provenance, []);
-      const sourceLines = provenance.map((source) => {
-        const parts = [source.type, source.taskId ? `task ${source.taskId}` : null,
-          source.eventId ? `event ${source.eventId}` : null, source.author ? `by ${source.author}` : null,
-          source.file || null, source.at].filter(Boolean);
-        return `- ${parts.join(" · ")}`;
-      });
-      const content = `${frontmatter(note)}\n\n# ${short(note.title, 200)}\n\n${note.body}\n\n## Provenance\n\n${sourceLines.join("\n") || "- DevTeam automated knowledge"}\n`;
-      const relative = `${folder}/${note.slug}.md`;
-      expected.add(relative);
-      atomicWrite(path.join(vault, ...relative.split("/")), content);
-    }
-    for (const relative of this.#writeCurrent(project, vault)) expected.add(relative);
-    this.#writeIndex(project, vault, notes);
-    // A vault belongs to exactly one project. When it belongs to somebody else, refreshing the notes
-    // is still right — but deleting is not, because "this file is not in my database" no longer means
-    // "this file is obsolete". Leaving a stale file behind is a far cheaper mistake than deleting
-    // someone's memory, so an unowned vault loses only its cleanup.
+    const noteCount = () => Number(this.db.prepare("SELECT COUNT(*) AS count FROM knowledge_notes WHERE project_id = ?")
+      .get(projectId)?.count || 0);
+    // A vault belongs to exactly one project, and the claim is checked before anything is written.
+    // Another project's vault is left exactly as it is: CURRENT.md and the session pages are named
+    // the same for every project, so "refreshing" them from this database overwrites the owner's with
+    // ours — and deleting would be worse, because "this file is not in my database" no longer means
+    // "this file is obsolete".
     const owner = vaultOwner(vault);
-    const ownsVault = !owner || owner.projectId === projectId;
+    if (owner && owner.projectId !== projectId) {
+      return {
+        path: vault,
+        noteCount: noteCount(),
+        updatedAt: null,
+        reconciled: false,
+        foreignVault: { project: owner.project || null, projectId: owner.projectId || null },
+      };
+    }
+    mkdirSync(path.join(vault, "sessions"), { recursive: true });
     if (!owner) {
       atomicWrite(path.join(vault, VAULT_MARKER),
-        `${JSON.stringify({ projectId, project: project.name, claimedAt: new Date().toISOString() }, null, 2)}\n`);
+        `${JSON.stringify({ projectId, project: project.name, claimedAt: new Date().toISOString() }, null, 2)}
+`);
     }
-    if (ownsVault) this.#reconcileGeneratedFiles(vault, expected);
+    const expected = new Set(["CURRENT.md"]);
+    for (const relative of this.#writeCurrent(project, vault)) expected.add(relative);
+    this.#reconcileGeneratedFiles(vault, expected);
     this.db.prepare("UPDATE knowledge_state SET exported_at = ? WHERE project_id = ?").run(new Date().toISOString(), projectId);
-    return {
-      path: vault,
-      noteCount: notes.length,
-      updatedAt: new Date().toISOString(),
-      reconciled: ownsVault,
-      ...(ownsVault ? {} : { foreignVault: { project: owner.project || null, projectId: owner.projectId || null } }),
-    };
+    return { path: vault, noteCount: noteCount(), updatedAt: new Date().toISOString(), reconciled: true };
   }
 
   #writeCurrent(project, vault) {
     const tasks = this.db.prepare(`
       SELECT id, title, description, status, version, created_at, updated_at FROM tasks
-      WHERE project_id = ? ORDER BY updated_at DESC LIMIT 12
+      WHERE project_id = ? ORDER BY updated_at DESC LIMIT 40
     `).all(project.id);
     const active = tasks.filter((task) => !["accepted", "cancelled"].includes(task.status));
-    const recent = this.db.prepare(`
-      SELECT e.id, e.task_id, e.type, e.message, e.created_at
-      FROM events e JOIN tasks t ON t.id = e.task_id
-      WHERE t.project_id = ? AND e.type IN ('human.message','assignment.completed','assignment.blocked','task.blocked','task.unblocked','task.accepted')
-      ORDER BY e.id DESC LIMIT 12
+    const sessionPath = (task) => `sessions/${stampDate(task.created_at)}-${slugify(task.title)}-${task.id.slice(0, 8)}`;
+    const notes = this.db.prepare(`
+      SELECT category, title, body, confidence, source_task_id, related_files, created_at
+      FROM knowledge_notes WHERE project_id = ? ORDER BY created_at ASC
     `).all(project.id);
     const lines = [
       "---", `project: ${yamlString(project.name)}`, "generated_by: DevTeam", `updated: ${yamlString(new Date().toISOString())}`, "---", "",
-      `# Current — ${project.name}`, "", "> Automatically regenerated from DevTeam's transactional history. Do not store secrets here.", "",
+      `# Current — ${project.name}`, "", "> One file per task, written from DevTeam's history. Do not store secrets here.", "",
       "## Active tasks", "",
-      ...(active.length ? active.map((task) => `- **${task.title}** — ${task.status}, v${task.version} ([[sessions/${stampDate(task.created_at)}-${slugify(task.title)}-${task.id.slice(0, 8)}]])`) : ["- No active tasks."]),
-      "", "## Recent verified activity", "",
-      ...(recent.length ? recent.map((event) => `- ${event.created_at} · ${event.type} · ${clip(event.message, 300)}`) : ["- No recorded activity yet."]), "",
-      "## Navigation", "", "- [[INDEX]]", "- [[architecture]]", "- [[decisions]]", "- [[components]]", "- [[conventions]]", "- [[pitfalls]]", "- [[workflows]]", "",
+      ...(active.length ? active.map((task) => `- **${task.title}** — ${task.status}, v${task.version} ([[${sessionPath(task)}]])`) : ["- No active tasks."]),
+      "", "## What this project has learned", "",
+      ...(notes.length
+        ? notes.slice(-40).reverse().map((note) => `- **${short(note.title, 160)}** — ${note.category}, ${note.confidence} confidence`)
+        : ["- Nothing recorded yet. Notes come from `devteam_memory write`, a `learned` line on a report, or a project memory key."]),
+      "",
     ];
     atomicWrite(path.join(vault, "CURRENT.md"), lines.join("\n"));
     const generated = [];
     for (const task of tasks) {
-      const events = this.db.prepare("SELECT type, message, created_at FROM events WHERE task_id = ? ORDER BY id DESC LIMIT 30").all(task.id).reverse();
-      const content = [
-        "---", `task_id: ${yamlString(task.id)}`, `status: ${task.status}`, `version: ${task.version}`,
-        `updated: ${yamlString(task.updated_at)}`, "generated_by: DevTeam", "---", "", `# ${task.title}`, "", task.description, "",
-        "## Timeline summary", "", ...events.map((event) => `- ${event.created_at} · **${event.type}** · ${clip(event.message, 500)}`), "",
-      ].join("\n");
-      const relative = `sessions/${stampDate(task.created_at)}-${slugify(task.title)}-${task.id.slice(0, 8)}.md`;
+      const relative = `${sessionPath(task)}.md`;
       generated.push(relative);
-      atomicWrite(path.join(vault, ...relative.split("/")), content);
+      atomicWrite(path.join(vault, ...relative.split("/")), this.#sessionFile(task, notes));
     }
     return generated;
+  }
+
+  // A task's page. Not its transcript — the transcript is in DevTeam and in search, and dumping the
+  // last thirty events here is how the old vault filled a repository with prose nobody read. What
+  // belongs on the page is what somebody would need to pick this work up cold: what it was for,
+  // what was decided, what was learned, what changed on disk, and where it stopped.
+  #sessionFile(task, projectNotes) {
+    const events = this.db.prepare(`
+      SELECT type, message, metadata, created_at FROM events
+      WHERE task_id = ? AND type IN ('agent.decision', 'assignment.blocked', 'task.blocked', 'assignment.completed')
+      ORDER BY id ASC
+    `).all(task.id);
+    const decisions = events.filter((event) => event.type === "agent.decision");
+    const stops = events.filter((event) => ["assignment.blocked", "task.blocked"].includes(event.type));
+    // safeFiles, not the raw list: a report naming `.env` or `secrets/token.txt` must not put those
+    // paths on a page that lands in the repository.
+    const changed = safeFiles(events
+      .filter((event) => event.type === "assignment.completed")
+      .flatMap((event) => parseJson(event.metadata, {})?.changedFiles || [])).slice(0, 60);
+    const learned = projectNotes.filter((note) => note.source_task_id === task.id);
+    const section = (heading, items, empty) => ["", `## ${heading}`, "", ...(items.length ? items : [empty])];
+    return [
+      "---", `task_id: ${yamlString(task.id)}`, `status: ${task.status}`, `version: ${task.version}`,
+      `updated: ${yamlString(task.updated_at)}`, "generated_by: DevTeam", "---", "",
+      `# ${task.title}`, "", clip(task.description, 2_000),
+      // `short`, not `clip`: one line each. A decision here is an index entry — the argument itself
+      // is in the room, and pasting 400 characters of it per bullet is the transcript dump this
+      // page replaced.
+      ...section("Learned", learned.map((note) => `- **${short(note.title, 160)}** — ${short(KnowledgeVault.headline(note.body), 240)}`),
+        "- Nothing was recorded as learned here."),
+      ...section("Decisions", decisions.map((event) => `- ${short(event.message, 240)}`), "- No decisions were recorded."),
+      ...section("Where it stopped", stops.map((event) => `- ${short(event.message, 240)}`), "- Nothing was reported blocked."),
+      ...section("Files changed", changed.map((file) => `- \`${file}\``), "- No file changes were reported."),
+      "",
+    ].join("\n");
   }
 
   // T3.6 — cross-project memory.
@@ -1160,13 +927,18 @@ export class KnowledgeVault {
     };
   }
 
+  // Only files this exporter would write are candidates, and only when they still carry its own
+  // header — a file somebody hand-wrote in here is not DevTeam's to delete. The category folders are
+  // swept because they are where the old per-note files live; once one is empty it goes too, so a
+  // repository that upgrades is left with `sessions/` and `CURRENT.md` rather than seven empty
+  // directories nothing will ever fill again.
   #reconcileGeneratedFiles(vault, expected) {
-    for (const folder of [...CATEGORIES, "sessions", "archive"]) {
-      const directory = path.join(vault, folder);
-      if (!existsSync(directory)) continue;
+    const sweep = (folder) => {
+      const directory = folder ? path.join(vault, folder) : vault;
+      if (!existsSync(directory)) return;
       for (const entry of readdirSync(directory, { withFileTypes: true })) {
         if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
-        const relative = `${folder}/${entry.name}`;
+        const relative = folder ? `${folder}/${entry.name}` : entry.name;
         if (expected.has(relative)) continue;
         const file = path.join(directory, entry.name);
         const info = lstatSync(file);
@@ -1174,23 +946,14 @@ export class KnowledgeVault {
         const header = readFileSync(file, "utf8").slice(0, 4_096);
         if (/^generated_by:\s*DevTeam\s*$/m.test(header)) unlinkSync(file);
       }
+    };
+    sweep(null);
+    for (const folder of [...CATEGORIES, "sessions", "archive"]) {
+      sweep(folder);
+      const directory = path.join(vault, folder);
+      if (folder === "sessions" || !existsSync(directory)) continue;
+      try { if (!readdirSync(directory).length) rmdirSync(directory); } catch { /* not empty, or in use */ }
     }
-  }
-
-  #writeIndex(project, vault, notes) {
-    const lines = [
-      "---", `project: ${yamlString(project.name)}`, "generated_by: DevTeam", `updated: ${yamlString(new Date().toISOString())}`, "---", "",
-      `# ${project.name} knowledge`, "", "Start with [[CURRENT]]. This vault is maintained automatically from DevTeam events.", "",
-    ];
-    for (const category of [...CATEGORIES, "archive"]) {
-      const categoryNotes = notes.filter((note) => (category === "archive" ? note.status === "archived" || note.category === "archive" : note.category === category && note.status !== "archived"));
-      lines.push(`## ${category[0].toUpperCase()}${category.slice(1)}`, "");
-      lines.push(...(categoryNotes.length
-        ? categoryNotes.map((note) => `- [[${category}/${note.slug}|${short(note.title, 140)}]] — ${note.status}, ${note.confidence} confidence`)
-        : ["- No notes yet."]));
-      lines.push("");
-    }
-    atomicWrite(path.join(vault, "INDEX.md"), lines.join("\n"));
   }
 
   list(projectId, { limit = 20 } = {}) {

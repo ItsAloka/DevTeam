@@ -71,6 +71,27 @@ test("a domain whose file is deleted stays valid for tasks already using it", as
   assert.deepEqual(store.updateTask(task.id, { title: "Chain v2" }).domains, ["blockchain"]);
 });
 
+// The deleted-file allowance is per project: a name one project's old tasks carry must not leak into
+// another project's picker, its task counts, or what it accepts.
+test("names kept for old tasks stay in their own project", async (t) => {
+  const { store, project, checklistDir, writeChecklist } = await fixture(t);
+  const otherRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-domains-other-"));
+  t.after(() => rm(otherRoot, { recursive: true, force: true }));
+  const other = store.ensureProject("Other", otherRoot);
+
+  await writeChecklist("blockchain");
+  store.createTask({ projectId: project.id, title: "Chain", description: "d", domains: ["blockchain", "web"] });
+  await rm(path.join(checklistDir, "blockchain.md"));
+  clearChecklistCache();
+
+  assert.equal(store.domainNames(project.id).includes("blockchain"), true, "still valid where it is used");
+  assert.equal(store.domainNames(other.id).includes("blockchain"), false, "not another project's domain");
+  assert.equal(store.listDomains(other.id).find((domain) => domain.name === "web").tasks, 0,
+    "task counts are this project's");
+  assert.equal(store.listDomains(project.id).find((domain) => domain.name === "web").tasks, 1);
+  assert.throws(() => store.createTask({ projectId: other.id, title: "C", description: "d", domains: ["blockchain"] }), /Unknown domain/);
+});
+
 test("file names that are not domains are ignored", async (t) => {
   const { store, checklistDir, writeChecklist } = await fixture(t);
   await writeChecklist("README");

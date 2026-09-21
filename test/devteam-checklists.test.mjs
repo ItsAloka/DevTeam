@@ -285,6 +285,81 @@ test("listDomains counts items from the files, and a report records the sections
   assert.deepEqual(JSON.parse(event.metadata).checklistSections, ["UI states", "Auth"]);
 });
 
+// The checklist was delivered and then forgotten: `checklistSections` was free text compared to
+// nothing, and across 245 real reviews no failure to walk one was ever visible. The claim is still
+// the agent's word — what changed is that the word is checked against the file.
+test("a review that carried a checklist cannot claim done without naming a section of it", async (t) => {
+  const { store, project } = await fixture(t);
+  const { task, reviewer, claim } = await reviewerClaim(store, project, { domains: ["web"] });
+
+  const empty = await store.completeAssignment({ agentId: reviewer.id, assignmentId: claim.id, message: "Looks fine." });
+  assert.equal(empty.completed, false);
+  assert.deepEqual(empty.checklistMissed.sections, ["UI states", "Performance"]);
+  assert.match(empty.checklistMissed.reason, /Walk the sections/);
+
+  const invented = await store.completeAssignment({
+    agentId: reviewer.id, assignmentId: claim.id, message: "Looks fine.", checklistSections: ["Everything"],
+  });
+  assert.equal(invented.completed, false, "a section that is not in the file is not a section walked");
+  assert.match(invented.checklistMissed.reason, /None of the sections you named/);
+
+  // The lease is untouched throughout, so the answer is "go and walk it", not "you lost the work".
+  assert.equal(store.db.prepare("SELECT status FROM assignments WHERE id = ?").get(claim.id).status, "claimed");
+
+  const walked = await store.completeAssignment({
+    agentId: reviewer.id, assignmentId: claim.id, message: "Walked the states.", checklistSections: ["ui states"],
+  });
+  assert.equal(walked.completed, true, "a real section, named in any case, is accepted");
+
+  // Reporting a blocker is always allowed: a stuck reviewer must be able to say so.
+  const { reviewer: second, claim: blocked } = await reviewerClaim(store, project, { domains: ["web"] });
+  const stuck = await store.completeAssignment({
+    agentId: second.id, assignmentId: blocked.id, message: "Cannot run the app.", status: "blocked",
+  });
+  assert.equal(stuck.completed, true);
+  assert.ok(task);
+});
+
+// checklistSections are the `##` headings. A `###` subsection belongs to the `##` above it: naming
+// the subsection alone is not a section walked, naming its parent is — even when the parent's
+// only lines live in the subsection.
+test("a report is checked against level-2 headings, not subsections", async (t) => {
+  const { store, project } = await fixture(t);
+  await writeFile(path.join(store.checklistDir, "web.md"), [
+    "## Data", "### Migrations", "- [ ] (*) reversible", "", "## UI states", "- [ ] empty state", "",
+  ].join("\n"), "utf8");
+  clearChecklistCache();
+  const { reviewer, claim } = await reviewerClaim(store, project, { domains: ["web"] });
+
+  const sub = await store.completeAssignment({
+    agentId: reviewer.id, assignmentId: claim.id, message: "Walked.", checklistSections: ["Migrations"],
+  });
+  assert.equal(sub.completed, false, "a ### heading is not a section a report can cite");
+  assert.deepEqual(sub.checklistMissed.sections, ["Data", "UI states"]);
+  assert.equal(store.db.prepare("SELECT status FROM assignments WHERE id = ?").get(claim.id).status, "claimed");
+
+  const parent = await store.completeAssignment({
+    agentId: reviewer.id, assignmentId: claim.id, message: "Walked.", checklistSections: ["Data"],
+  });
+  assert.equal(parent.completed, true, "the ## above it is, though its lines sit under the ###");
+});
+
+test("a project's own checklists win over the directory DevTeam was launched from", async (t) => {
+  const { store, project, projectRoot } = await fixture(t);
+  assert.deepEqual(store.listDomains(project.id).map((domain) => domain.name), ["security", "web"],
+    "a project with no folder of its own still sees the launch directory's checklists");
+
+  await mkdir(path.join(projectRoot, "checklists"), { recursive: true });
+  await writeFile(path.join(projectRoot, "checklists", "embedded.md"), "---\ndomain: embedded\n---\n\n## Timing\n- [ ] (*) no allocation in the ISR\n", "utf8");
+  clearChecklistCache();
+
+  assert.deepEqual(store.listDomains(project.id).map((domain) => domain.name), ["embedded"],
+    "once it has one, the project's own folder is the whole vocabulary");
+  const { task, reviewer, claim } = await reviewerClaim(store, project, { domains: ["embedded"] });
+  const brief = store.taskBrief(reviewer.id, task.id, { currentAssignment: claim });
+  assert.match(brief.currentAssignment.checklistFiles[0].path, /embedded\.md$/);
+});
+
 test("the server resolves checklistDir onto the store and leaves it untouched", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-cl-server-"));
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-cl-root-"));

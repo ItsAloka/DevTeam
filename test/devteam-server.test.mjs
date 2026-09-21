@@ -17,11 +17,12 @@ test("dashboard API and authenticated MCP endpoint work together", async (t) => 
   const homeHtml = await home.text();
   assert.match(homeHtml, /DevTeam/);
   assert.match(homeHtml, /Memory health/);
-  assert.match(homeHtml, /knowledge-filter/);
+  assert.match(homeHtml, /id="knowledge-list"/);
+  assert.doesNotMatch(homeHtml, /knowledge-filter|Obsidian/, "no lifecycle filter, and no promise of an Obsidian vault");
   assert.match(homeHtml, /role="log" aria-label="Team chat history"/, "chat history has accessible log semantics");
   assert.match(homeHtml, /Shift \+ Enter<\/kbd> new line/, "multiline drafting shortcut is visible");
   assert.match(homeHtml, /id="task-brief-dialog"/, "long task briefs have a dedicated dialog");
-  assert.match(homeHtml, /data-timeline-filter="decisions"/, "timeline categories are directly filterable");
+  assert.match(homeHtml, /id="board-now"/, "the closed board still says what is being worked on");
   assert.match(homeHtml, /data-resize-panel="sidebar"/, "workspace panels expose an accessible resize separator");
   assert.match(homeHtml, /id="search-dialog"/, "workspace search is available from the dashboard");
   const dashboardScript = await fetch(`${instance.url}/app.js`).then((response) => response.text());
@@ -552,3 +553,36 @@ test("the scheduler explains a held assignment over REST and over MCP", async (t
   assert.match(single.reasons.find((reason) => reason.code === "awaiting_writer").detail, /Ship the feature/);
 });
 
+
+test("the map endpoint serves the project's files and where this task landed", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-map-server-"));
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
+  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
+
+  const homeHtml = await fetch(instance.url).then((response) => response.text());
+  assert.match(homeHtml, /data-board-view="map"/, "the board offers the map as a second view");
+  assert.match(homeHtml, /id="code-map-svg"/, "and has a canvas to draw it on");
+  const dashboardScript = await fetch(`${instance.url}/app.js`).then((response) => response.text());
+  // The map is large and changes only when the code does, so it must not ride along with every
+  // dashboard snapshot; it is fetched when somebody asks to look at it.
+  assert.match(dashboardScript, /\/api\/tasks\/\$\{taskId\}\/map/, "the map is fetched on demand");
+  assert.doesNotMatch(await fetch(`${instance.url}/api/state`).then((response) => response.text()), /"modules"/, "and never rides along with the dashboard snapshot");
+
+  const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
+  const created = await fetch(`${instance.url}/api/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` },
+    body: JSON.stringify({ projectId: state.projects[0].id, title: "Map this", description: "Draw the project.", requiredApprovals: 1 }),
+  }).then((response) => response.json());
+
+  const map = await fetch(`${instance.url}/api/tasks/${created.id}/map`).then((response) => response.json());
+  assert.equal(map.taskId, created.id);
+  assert.ok(Array.isArray(map.modules) && Array.isArray(map.edges));
+  assert.deepEqual(map.touched, [], "a task that has completed nothing has touched nothing");
+  // The workspace root is DevTeam's own checkout, so the indexer has a real project to read.
+  assert.ok(map.modules.some((module) => module.path === "src/devteam/store.mjs"), "the map covers the project it was pointed at");
+  assert.ok(map.edges.every((edge) => edge.from !== edge.to), "a file is never drawn importing itself");
+
+  const missing = await fetch(`${instance.url}/api/tasks/does-not-exist/map`);
+  assert.equal(missing.status, 400);
+});

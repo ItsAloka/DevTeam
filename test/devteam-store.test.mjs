@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, mkdir, symlink, writeFile, readFile, readdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DevTeamStore } from "../src/devteam/store.mjs";
 
-test("automatic knowledge vault exports safe Obsidian notes and feeds task briefings", async (t) => {
+test("the vault is one page per task: what it learned, decided and changed, with secrets kept out", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-knowledge-data-"));
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-knowledge-project-"));
   await mkdir(path.join(projectRoot, "memory"), { recursive: true });
@@ -22,111 +23,48 @@ test("automatic knowledge vault exports safe Obsidian notes and feeds task brief
   const agent = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
   const plan = store.claimNextAssignment(agent.id);
   store.noteSet({ agentId: agent.id, taskId: task.id, scope: "project", key: "architecture/runtime", value: "SQLite is the source of truth; Markdown is the exported view." });
-  store.postMessage({ agentId: agent.id, taskId: task.id, message: "Use one serialized knowledge exporter", type: "agent.decision" });
+  store.postMessage({ agentId: agent.id, taskId: task.id, message: "Use one serialized knowledge exporter; the staging box still has password=hunter2", type: "agent.decision" });
   await store.completeAssignment({
     agentId: agent.id,
     assignmentId: plan.id,
     message: "Implemented exporter. password=hunter2",
     changedFiles: ["src/knowledge.mjs", ".env", "secrets/token.txt"],
     checks: ["node --test"],
+    learned: [{ category: "pitfalls", title: "The exporter must stay serialized", body: "Two exporters racing on one vault delete each other's files." }],
   });
 
   const vault = path.join(projectRoot, "knowledge");
-  const index = await readFile(path.join(vault, "INDEX.md"), "utf8");
+  const sessions = await readdir(path.join(vault, "sessions"));
+  assert.equal(sessions.length, 1, "one page per task");
+  const page = await readFile(path.join(vault, "sessions", sessions[0]), "utf8");
   const current = await readFile(path.join(vault, "CURRENT.md"), "utf8");
-  const componentFiles = await readdir(path.join(vault, "components"));
-  const decisionFiles = await readdir(path.join(vault, "decisions"));
-  const archiveFiles = await readdir(path.join(vault, "archive"));
-  const exported = await Promise.all([...componentFiles.map((file) => path.join(vault, "components", file)), ...archiveFiles.map((file) => path.join(vault, "archive", file))].map((file) => readFile(file, "utf8")));
 
-  assert.match(index, /\[\[CURRENT\]\]/);
-  assert.match(index, /\[\[decisions\//);
   assert.match(current, /Add durable memory/);
-  assert.ok(componentFiles.length >= 1, "completed implementation becomes component knowledge");
-  assert.ok(decisionFiles.length >= 1, "a recorded decision becomes a durable note");
-  assert.ok(archiveFiles.length >= 1, "legacy Shorekeeper memory is imported without deleting it");
-  assert.equal(await readFile(path.join(projectRoot, "memory", "INDEX.md"), "utf8"), "# Old memory\n\nAPI_KEY=super-secret-value");
-  assert.doesNotMatch(exported.join("\n"), /hunter2|super-secret-value|secrets\/token|\.env/);
-  assert.match(exported.join("\n"), /\[REDACTED\]/);
+  assert.match(page, /## Learned[\s\S]*exporter must stay serialized/, "a lesson reported with the work is on the page");
+  assert.match(page, /## Decisions[\s\S]*serialized knowledge exporter/);
+  assert.match(page, /src\/knowledge\.mjs/, "the files the work touched");
+  assert.doesNotMatch(page, /hunter2|super-secret-value|secrets\/token|\.env/, "and never a secret");
+  assert.match(page, /\[REDACTED\]/);
 
+  // No per-note files, no index: 1,289 of those in one project bought nothing a reader ever opened.
+  for (const folder of ["components", "decisions", "pitfalls", "workflows"]) {
+    assert.equal(existsSync(path.join(vault, folder)), false, `${folder}/ is not a folder any more`);
+  }
+  assert.equal(existsSync(path.join(vault, "INDEX.md")), false);
+  assert.equal(await readFile(path.join(projectRoot, "memory", "INDEX.md"), "utf8"), "# Old memory\n\nAPI_KEY=super-secret-value");
+
+  // A note exists because somebody wrote it: the project memory key, and the lesson on the report.
+  // The decision and the completed assignment are events, and stay events.
   const detail = store.taskDetail(task.id);
-  assert.ok(detail.knowledge.length >= 3);
+  assert.deepEqual(detail.knowledge.map((note) => note.title).sort(),
+    ["Legacy Shorekeeper: INDEX.md", "The exporter must stay serialized", "architecture/runtime"],
+    "the project memory key, the lesson on the report, and the owner's own imported memory — nothing else");
   const brief = store.taskBrief(agent.id, task.id);
-  assert.ok(brief.projectKnowledge.length >= 3);
-  // Only the leading notes carry a body; the rest are a headline and a wikilink, so the brief can
-  // surface many more of them for the same bytes. Every note must still say what it claims.
   assert.ok(brief.projectKnowledge.every((note) => note.headline && note.headline.length <= 220));
-  assert.ok(brief.projectKnowledge.every((note) => note.body === undefined || note.body.length <= 1_300));
-  assert.ok(brief.projectKnowledge.some((note) => note.body), "the most relevant notes still arrive in full");
-  const search = store.knowledgeSearch({ agentId: agent.id, taskId: task.id, query: "serialized", category: "decisions" });
+  const search = store.knowledgeSearch({ agentId: agent.id, taskId: task.id, query: "serialized" });
   assert.equal(search.automated, true);
   assert.equal(search.notes.length, 1);
-  assert.match(search.notes[0].title, /serialized knowledge exporter/i);
-});
-
-test("file-linked knowledge becomes stale or superseded without affecting unrelated notes", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-lifecycle-data-"));
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-lifecycle-project-"));
-  await mkdir(path.join(projectRoot, "src"), { recursive: true });
-  await writeFile(path.join(projectRoot, "src", "shared.js"), "export const shared = 1;\n", "utf8");
-  await writeFile(path.join(projectRoot, "src", "unrelated.js"), "export const unrelated = 1;\n", "utf8");
-  const store = new DevTeamStore(dataDir, { knowledge: { enabled: true }, codegraph: { enabled: false } });
-  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); await rm(projectRoot, { recursive: true, force: true }); });
-  const lifecycleColumns = new Set(store.db.prepare("PRAGMA table_info(knowledge_notes)").all().map((column) => column.name));
-  for (const column of ["superseded_by", "stale_reason", "status_changed_at", "last_validated_at", "last_validated_version"]) {
-    assert.equal(lifecycleColumns.has(column), true, `knowledge migration adds ${column}`);
-  }
-  const project = store.ensureProject("Lifecycle", projectRoot);
-  const task = store.createTask({ projectId: project.id, title: "Refresh implementation facts", description: "Change the same file twice." });
-  const agent = store.connectAgent({ name: "Writer", provider: "test", freshTaskId: task.id });
-  const planner = store.claimNextAssignment(agent.id);
-  const firstWork = store.createAssignment({ agentId: agent.id, taskId: task.id, title: "First shared implementation", description: "Implement shared.", role: "implementer", requiresWrite: true, paths: ["src/shared.js"] });
-  await store.completeAssignment({ agentId: agent.id, assignmentId: planner.id, claimToken: planner.claimToken, message: "Planned." });
-  const firstClaim = store.claimNextAssignment(agent.id);
-  assert.equal(firstClaim.id, firstWork.id);
-  await store.completeAssignment({ agentId: agent.id, assignmentId: firstClaim.id, claimToken: firstClaim.claimToken, message: "First shared behavior.", changedFiles: ["src/shared.js"] });
-
-  const secondWork = store.createAssignment({ agentId: agent.id, taskId: task.id, title: "Replace shared implementation", description: "Replace shared.", role: "implementer", requiresWrite: true, paths: ["src/shared.js"] });
-  const secondClaim = store.claimNextAssignment(agent.id);
-  assert.equal(secondClaim.id, secondWork.id);
-  await store.completeAssignment({ agentId: agent.id, assignmentId: secondClaim.id, claimToken: secondClaim.claimToken, message: "Current shared behavior.", changedFiles: ["src/shared.js"] });
-
-  const thirdWork = store.createAssignment({ agentId: agent.id, taskId: task.id, title: "Unrelated implementation", description: "Change an unrelated module.", role: "implementer", requiresWrite: true, paths: ["src/unrelated.js"] });
-  const thirdClaim = store.claimNextAssignment(agent.id);
-  assert.equal(thirdClaim.id, thirdWork.id);
-  await store.completeAssignment({ agentId: agent.id, assignmentId: thirdClaim.id, claimToken: thirdClaim.claimToken, message: "Unrelated behavior.", changedFiles: ["src/unrelated.js"] });
-
-  const escapedWork = store.createAssignment({ agentId: agent.id, taskId: task.id, title: "Escaped report", description: "A malformed changed path must not invalidate knowledge.", role: "implementer", requiresWrite: true, paths: ["src"] });
-  const escapedClaim = store.claimNextAssignment(agent.id);
-  assert.equal(escapedClaim.id, escapedWork.id);
-  await store.completeAssignment({ agentId: agent.id, assignmentId: escapedClaim.id, claimToken: escapedClaim.claimToken, message: "Malformed report.", changedFiles: ["../outside.js"] });
-
-  const componentNotes = store.db.prepare(`
-    SELECT * FROM knowledge_notes WHERE project_id = ? AND category = 'components' ORDER BY source_event_id ASC
-  `).all(project.id);
-  assert.equal(componentNotes.length, 3);
-  assert.equal(componentNotes[0].status, "stale");
-  assert.equal(componentNotes[0].superseded_by, componentNotes[1].id);
-  assert.match(componentNotes[0].stale_reason, /src\/shared\.js/);
-  assert.equal(componentNotes[1].status, "verified", "an unrelated change does not stale current shared knowledge");
-  assert.equal(componentNotes[2].status, "verified");
-  const lifecycleEvent = store.taskDetail(task.id).events.find((event) => event.type === "knowledge.superseded");
-  assert.equal(lifecycleEvent.metadata.supersededBy, componentNotes[1].id);
-
-  const brief = store.taskBrief(agent.id, task.id);
-  assert.equal(brief.projectKnowledge.some((note) => note.id === componentNotes[0].id), false);
-  const staleSearch = store.knowledgeSearch({ agentId: agent.id, taskId: task.id, status: "stale" });
-  assert.equal(staleSearch.notes.some((note) => note.id === componentNotes[0].id), true);
-  const staleExport = await readFile(path.join(projectRoot, "knowledge", "components", `${componentNotes[0].slug}.md`), "utf8");
-  assert.match(staleExport, /status: stale/);
-  assert.match(staleExport, new RegExp(`superseded_by: "${componentNotes[1].id}"`));
-
-  const sessions = path.join(projectRoot, "knowledge", "sessions");
-  const generatedSession = (await readdir(sessions)).find((name) => name.endsWith(`${task.id.slice(0, 8)}.md`));
-  await writeFile(path.join(sessions, "human-note.md"), "# Keep this human note\n", "utf8");
-  store.deleteTask(task.id, task.id);
-  assert.equal((await readdir(sessions)).includes(generatedSession), false, "deleted task session view is reconciled");
-  assert.equal(await readFile(path.join(sessions, "human-note.md"), "utf8"), "# Keep this human note\n");
+  assert.match(search.notes[0].title, /exporter must stay serialized/i);
 });
 
 test("DevTeam coordinates plan, write lease, review, versioning, and consensus", async (t) => {

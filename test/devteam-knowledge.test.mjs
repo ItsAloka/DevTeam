@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { findingSignature, KnowledgeVault, rankKnowledgeNotes } from "../src/devteam/knowledge.mjs";
+import { KnowledgeVault, rankKnowledgeNotes } from "../src/devteam/knowledge.mjs";
 import { DevTeamStore } from "../src/devteam/store.mjs";
 
 const base = {
@@ -125,61 +126,22 @@ test("an agent can record what it learned, and it comes back through ordinary re
   assert.equal(written.note.confidence, "high");
   assert.match(written.note.link, /^\[\[pitfalls\//);
 
-  // It is a real vault note: searchable, and on disk in the Obsidian vault.
+  // It is a real note: searchable, and on disk in the task's own page — which is the only shape the
+  // vault has now. There is no per-note file to find, because 1,289 of those bought nothing.
   const found = store.knowledgeSearch({ agentId: agent.id, taskId: task.id, query: "rate-limits" });
   assert.equal(found.notes.length, 1);
   assert.match(found.notes[0].title, /30 requests per minute/);
-  const onDisk = await readdir(path.join(projectRoot, "knowledge", "pitfalls"));
-  assert.ok(onDisk.length >= 1, "a written note is exported to the vault like any other");
+  const sessions = await readdir(path.join(projectRoot, "knowledge", "sessions"));
+  assert.equal(sessions.length, 1, "one page per task, not one file per note");
+  const page = await readFile(path.join(projectRoot, "knowledge", "sessions", sessions[0]), "utf8");
+  assert.match(page, /## Learned/);
+  assert.match(page, /30 requests per minute/, "what was learned is on the page of the task that learned it");
+  assert.ok(!existsSync(path.join(projectRoot, "knowledge", "pitfalls")), "no per-note category folders");
 
   // The event trail says who claimed it, so the note and the timeline agree.
   const finding = store.taskDetail(task.id).events.find((event) => event.type === "agent.finding" && event.metadata?.knowledgeNote);
   assert.ok(finding);
   assert.equal(finding.author_name, "Scout");
-});
-
-test("an empty knowledge index replays its event history instead of reporting an empty vault", async (t) => {
-  const { store, project, task, agent } = await vaultFixture(t);
-  store.knowledgeWrite({
-    agentId: agent.id, taskId: task.id, category: "pitfalls",
-    title: "Recover the event-backed vault index", body: "The durable event history can rebuild generated knowledge.",
-  });
-  const lastEventId = store.db.prepare("SELECT MAX(id) AS id FROM events").get().id;
-  store.db.prepare("DELETE FROM knowledge_notes WHERE project_id = ?").run(project.id);
-  store.db.prepare("UPDATE knowledge_state SET last_event_id = ? WHERE project_id = ?").run(lastEventId, project.id);
-
-  store.knowledge.initializeProject(project.id);
-
-  for (let index = 0; index < 30; index += 1) {
-    store.knowledgeWrite({
-      agentId: agent.id, taskId: task.id, category: "pitfalls",
-      title: `Count every restored vault note ${index}`, body: "The state count must not be limited by the dashboard preview.",
-    });
-  }
-  const detail = store.taskDetail(task.id);
-  assert.equal(detail.knowledgeVault.noteCount, 31, "the state reports the full restored project total, not the 30-note display slice");
-  assert.equal(detail.knowledge.length, 30, "the dashboard preview remains bounded independently of the total");
-  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM knowledge_notes WHERE project_id = ? AND source_event_id = ?")
-    .get(project.id, lastEventId).count, 1, "the historical event was replayed into the restored index");
-});
-
-test("the index restore runs at most once, so a project with no notes does not replay on every sync", async (t) => {
-  const { store, project, task, agent } = await vaultFixture(t);
-  store.knowledgeWrite({ agentId: agent.id, taskId: task.id, category: "pitfalls", title: "Replay witness", body: "Proves whether history was replayed." });
-  const noteCount = () => Number(store.db.prepare("SELECT COUNT(*) AS count FROM knowledge_notes WHERE project_id = ?").get(project.id).count);
-  const emptyIndexAtHead = () => {
-    store.db.prepare("DELETE FROM knowledge_notes WHERE project_id = ?").run(project.id);
-    const head = Number(store.db.prepare("SELECT MAX(id) AS id FROM events").get().id);
-    store.db.prepare("UPDATE knowledge_state SET last_event_id = ? WHERE project_id = ?").run(head, project.id);
-  };
-
-  emptyIndexAtHead();
-  store.knowledge.syncTask(task.id);
-  assert.ok(noteCount() > 0, "the first empty index is rebuilt by replaying history");
-
-  emptyIndexAtHead();
-  store.knowledge.syncTask(task.id);
-  assert.equal(noteCount(), 0, "a second empty index in the same database is not replayed again");
 });
 
 test("a written note is redacted and validated exactly like a derived one", async (t) => {
@@ -455,32 +417,57 @@ test("a second database pointed at the same project root cannot delete the first
   });
 
   const ownerProject = owner.ensureProject("The real project", projectRoot);
-  owner.knowledge.write({
-    projectId: ownerProject.id, category: "pitfalls", title: "Never run the migration twice",
-    body: "The second run duplicates every historical grade.", author: "agent",
-  });
+  owner.createTask({ projectId: ownerProject.id, title: "Migrate the grades", description: "The task whose page must survive." });
   const firstExport = owner.knowledge.exportProject(ownerProject.id);
   assert.equal(firstExport.reconciled, true, "the first exporter claims the vault and cleans up after itself");
-  const afterOwner = await readdir(path.join(projectRoot, "knowledge", "pitfalls"));
-  assert.equal(afterOwner.length, 1, "the note is on disk");
+  const afterOwner = await readdir(path.join(projectRoot, "knowledge", "sessions"));
+  assert.equal(afterOwner.length, 1, "the task's page is on disk");
 
-  // A different database, same root, knowing nothing about that note.
+  const currentBefore = await readFile(path.join(projectRoot, "knowledge", "CURRENT.md"), "utf8");
+
+  // A different database, same root, knowing nothing about that note — and with a task of its own,
+  // so it has pages it would write if it were allowed to.
   const strangerProject = stranger.ensureProject("A test that used the wrong root", projectRoot);
+  stranger.createTask({ projectId: strangerProject.id, title: "Stranger work", description: "Must not land in the vault." });
   const strangerExport = stranger.knowledge.exportProject(strangerProject.id);
   assert.equal(strangerExport.reconciled, false, "the stranger is refused the right to delete");
   assert.equal(strangerExport.foreignVault.project, "The real project", "and is told whose vault it is");
 
-  const afterStranger = await readdir(path.join(projectRoot, "knowledge", "pitfalls"));
-  assert.deepEqual(afterStranger, afterOwner, "the note survives an export from a database that never knew it");
+  const afterStranger = await readdir(path.join(projectRoot, "knowledge", "sessions"));
+  assert.deepEqual(afterStranger, afterOwner, "the page survives, and the stranger adds none of its own");
+  assert.equal(await readFile(path.join(projectRoot, "knowledge", "CURRENT.md"), "utf8"), currentBefore,
+    "the owner's CURRENT.md is not overwritten with the stranger's");
 
   // The owner still cleans up its own obsolete files: the guard removes deletion for strangers, not
   // for the project the vault belongs to.
-  owner.knowledge.write({
-    projectId: ownerProject.id, category: "pitfalls", title: "Never run the migration twice",
-    body: "Superseded body.", author: "agent",
-  });
   const second = owner.knowledge.exportProject(ownerProject.id);
   assert.equal(second.reconciled, true, "the owner keeps its cleanup");
+});
+
+// The one-shot page rebuild must not be marked done over a project it could not reach, or that
+// project keeps its old per-note files for good. It retries on the next start and marks once all pass.
+test("the vault page rebuild is retried until every project root is readable", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-rebuild-data-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-rebuild-root-"));
+  const options = { knowledge: { enabled: true }, codegraph: { enabled: false } };
+  const marked = (store) => Boolean(store.db.prepare("SELECT value FROM metadata WHERE key = 'vault_pages_rebuilt'").get());
+  t.after(async () => { for (const dir of [dataDir, projectRoot]) await rm(dir, { recursive: true, force: true }); });
+
+  let store = new DevTeamStore(dataDir, options);
+  store.ensureProject("Moved away", projectRoot);
+  store.db.prepare("DELETE FROM metadata WHERE key = 'vault_pages_rebuilt'").run();
+  store.close();
+  await rm(projectRoot, { recursive: true, force: true });
+
+  store = new DevTeamStore(dataDir, options);
+  assert.equal(marked(store), false, "an unreadable root leaves the rebuild pending");
+  store.close();
+
+  await mkdir(projectRoot, { recursive: true });
+  store = new DevTeamStore(dataDir, options);
+  assert.equal(marked(store), true, "once the root is back, the rebuild runs and is marked");
+  assert.ok(existsSync(path.join(projectRoot, "knowledge", "CURRENT.md")));
+  store.close();
 });
 
 // One review cycle that ends in a request for changes, so findings are produced through the real
@@ -505,63 +492,6 @@ async function reviewCycle(store, project, label, findings) {
 const conventionNotes = (store, projectId) => store.db
   .prepare("SELECT * FROM knowledge_notes WHERE project_id = ? AND category = 'conventions' ORDER BY slug")
   .all(projectId);
-
-test("the same objection raised on separate tasks becomes a conventions note, quoting its evidence", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-conventions-data-"));
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-conventions-project-"));
-  const store = new DevTeamStore(dataDir, { knowledge: { enabled: true }, codegraph: { enabled: false } });
-  t.after(async () => {
-    store.close();
-    for (const dir of [dataDir, projectRoot]) await rm(dir, { recursive: true, force: true });
-  });
-  const project = store.ensureProject("Conventions", projectRoot);
-
-  // One thorough review raising the same point twice is one reviewer being thorough, not a rule.
-  const first = await reviewCycle(store, project, "First", [
-    { detail: "clamp the page size before the query runs", path: "src/list.mjs" },
-    { detail: "page size must be clamped before querying", path: "src/list.mjs" },
-    { detail: "rename helper", path: "src/list.mjs" },
-  ]);
-  assert.deepEqual(conventionNotes(store, project.id), [], "three findings inside one task write nothing");
-
-  // The same objection on separate work is the signal.
-  const second = await reviewCycle(store, project, "Second", [
-    { detail: "the page size is not clamped before the query", path: "src/report.mjs" },
-  ]);
-  const notes = conventionNotes(store, project.id);
-  assert.equal(notes.length, 1, "now it is a convention");
-  assert.match(notes[0].title, /^Recurring review finding: /);
-  assert.equal(notes[0].status, "proposed", "offered for confirmation, not asserted as settled");
-  assert.match(notes[0].body, /3 times across 2 separate tasks/);
-  assert.match(notes[0].body, /clamp the page size before the query runs/, "the body quotes the findings verbatim");
-  assert.match(notes[0].body, /Reviewer First/, "and says who raised each one");
-  const related = JSON.parse(notes[0].related_files);
-  assert.ok(related.includes("src/list.mjs") && related.includes("src/report.mjs"), "both files are linked");
-
-  // "rename helper" carries two significant words and no subject; it must never become a rule.
-  assert.equal(notes.filter((note) => /rename/.test(note.title)).length, 0, "a finding too short to be about anything is ignored");
-
-  const onDisk = await readdir(path.join(projectRoot, "knowledge", "conventions"));
-  assert.equal(onDisk.length, 1, "and it reaches the vault on disk");
-
-  // Evidence can go away — deleting a task takes its findings with it. A rule nobody can still
-  // point at is archived rather than left standing as something the project agreed to.
-  store.disconnectAgent(second.author.id, "Done.");
-  store.disconnectAgent(second.reviewer.id, "Done.");
-  store.deleteTask(second.task.id, second.task.id);
-  store.knowledge.syncTask(first.task.id);
-  assert.equal(conventionNotes(store, project.id)[0].status, "archived",
-    "the note is retired once its evidence no longer clears the bar");
-});
-
-test("a finding signature groups the same objection and separates different ones", () => {
-  const clamp = findingSignature("clamp the page size before the query runs");
-  assert.equal(findingSignature("page size must be clamped before querying"), clamp, "tense and word order do not matter");
-  assert.equal(findingSignature("the page size is not clamped before the query"), clamp);
-  assert.notEqual(findingSignature("the retry backoff grows without an upper bound"), clamp, "a different subject is a different rule");
-  assert.equal(findingSignature("rename helper"), null, "too few significant words to be about anything");
-  assert.equal(findingSignature(""), null);
-});
 
 test("a brief spends its knowledge budget on breadth, not on three long notes", async (t) => {
   // Measured against the real vault before this changed: the ranker chose the best 30 notes out of

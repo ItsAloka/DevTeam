@@ -236,7 +236,7 @@ export async function startDevTeamServer({
   });
   // Read-only: a domain is added by writing checklists/<name>.md, not through the API.
   app.get("/api/domains", (req, res) => {
-    res.json(store.listDomains());
+    res.json(store.listDomains(req.query.projectId || null));
   });
   app.post("/api/projects", (req, res) => {
     requireFields(req.body, ["name", "root"]);
@@ -359,6 +359,12 @@ export async function startDevTeamServer({
     const replay = store.taskReplay(req.params.taskId, { limit: Number(req.query.limit) || 1000 });
     if (String(req.query.format || "markdown") === "json") return res.json(replay);
     res.type("text/markdown; charset=utf-8").send(replay.markdown);
+  });
+  // The map view's data. Fetched when the board is switched to Map rather than ridden along with
+  // every dashboard snapshot — it is large, it changes only when the code does, and most of the
+  // time nobody is looking at it.
+  app.get("/api/tasks/:taskId/map", (req, res) => {
+    res.json(store.projectMap(req.params.taskId));
   });
   app.post("/api/tasks/:taskId/block", (req, res) => {
     requireFields(req.body, ["reason"]);
