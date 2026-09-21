@@ -528,6 +528,8 @@ function renderAssignmentBoard(task) {
 const MAP_STALE_MS = 60_000;
 let mapState = { taskId: null, data: null, layout: null, size: "", loading: false, error: null, fetchedAt: 0 };
 let mapSelected = null;
+// The file under the pointer. Kept across repaints, because zooming redraws every node.
+let mapHovered = null;
 let mapGroupFilter = null;
 
 // Zoom, for both views. It spreads positions and leaves sizes alone (see paintCodeMap and
@@ -630,10 +632,11 @@ function paintCodeMap() {
     if (node.touched) classes.push("touched");
     if (node.notes.length) classes.push("noted");
     if (mapSelected === node.path) classes.push("selected");
+    if (mapHovered === node.path) classes.push("hovered");
     if (dimmed(node)) classes.push("dim");
-    // The native SVG tooltip is the hover label for the ~290 files too small to carry one.
+    // The hover card (showMapHover) labels the files too small to carry a name; aria-label is for keyboards.
     const tip = `${node.path}${node.degree ? ` — ${node.degree} link${node.degree === 1 ? "" : "s"}` : ""}${node.touched ? ` — changed ${node.touched}× by this task` : ""}${node.notes.length ? ` — ${node.notes.length} note${node.notes.length === 1 ? "" : "s"}` : ""}`;
-    return `<g class="${classes.join(" ")}" data-map-node="${escapeHtml(node.path)}" tabindex="0" role="button" aria-label="${escapeHtml(tip)}"><circle cx="${sx(node.x)}" cy="${sy(node.y)}" r="${node.r.toFixed(1)}"></circle>${node.notes.length ? `<circle class="map-note-ring" cx="${sx(node.x)}" cy="${sy(node.y)}" r="${(node.r + 3.2).toFixed(1)}"></circle>` : ""}<title>${escapeHtml(tip)}</title></g>`;
+    return `<g class="${classes.join(" ")}" data-map-node="${escapeHtml(node.path)}" tabindex="0" role="button" aria-label="${escapeHtml(tip)}"><circle cx="${sx(node.x)}" cy="${sy(node.y)}" r="${node.r.toFixed(1)}"></circle>${node.notes.length ? `<circle class="map-note-ring" cx="${sx(node.x)}" cy="${sy(node.y)}" r="${(node.r + 3.2).toFixed(1)}"></circle>` : ""}</g>`;
   }).join("");
   // Spread far enough apart, every file has room for its name, not just the ones the layout picked.
   const labelAll = k >= MAP_LABEL_ALL_ZOOM;
@@ -707,13 +710,64 @@ function renderCodeMap({ relayout = false } = {}) {
   paintCodeMap();
 }
 
+// Most files are drawn as 6px dots, and zoom spreads them apart without growing them, so hitting
+// the circle itself is a game of precision. The pointer instead picks the file whose edge is
+// nearest, within a finger-sized reach on screen. Inside a circle the distance is negative, so a
+// hub still wins over a small file drawn just beside it.
+const MAP_REACH_PX = 14;
+function mapNodeAt(clientX, clientY) {
+  const svg = $("#code-map-svg");
+  const layout = mapState.layout;
+  const matrix = svg?.getScreenCTM();
+  if (!layout || !matrix) return null;
+  const point = new DOMPoint(clientX, clientY).matrixTransform(matrix.inverse());
+  const scale = Math.hypot(matrix.a, matrix.b) || 1;
+  const { k, tx, ty } = mapView;
+  let best = null;
+  let bestGap = MAP_REACH_PX / scale;
+  for (const node of layout.nodes) {
+    const gap = Math.hypot(node.x * k + tx - point.x, node.y * k + ty - point.y) - node.r;
+    if (gap < bestGap) { best = node; bestGap = gap; }
+  }
+  return best;
+}
+
+function showMapHover(node, event) {
+  const card = $("#code-map-hover");
+  const canvas = $("#code-map-canvas");
+  const svg = $("#code-map-svg");
+  const previous = mapHovered && svg.querySelector(`[data-map-node="${CSS.escape(mapHovered)}"]`);
+  if (previous) previous.classList.remove("hovered");
+  mapHovered = node?.path || null;
+  canvas.classList.toggle("over-node", Boolean(node));
+  if (!node) { card.classList.add("hidden"); return; }
+  svg.querySelector(`[data-map-node="${CSS.escape(node.path)}"]`)?.classList.add("hovered");
+  const links = node.degree ? `${node.degree} link${node.degree === 1 ? "" : "s"}` : "no imports";
+  const extra = [links, node.touched ? `changed ${node.touched}× by this task` : null, node.notes.length ? `${node.notes.length} note${node.notes.length === 1 ? "" : "s"}` : null].filter(Boolean).join(" · ");
+  card.innerHTML = `<strong>${escapeHtml(node.name)}</strong><code>${escapeHtml(node.path)}</code><span>${escapeHtml(extra)}</span>`;
+  card.classList.remove("hidden");
+  // Beside the pointer, flipped to the other side near the right or bottom edge.
+  const box = canvas.getBoundingClientRect();
+  const x = event.clientX - box.left;
+  const y = event.clientY - box.top;
+  const flipX = x + 16 + card.offsetWidth > box.width;
+  const flipY = y + 16 + card.offsetHeight > box.height;
+  card.style.left = `${Math.max(4, flipX ? x - 16 - card.offsetWidth : x + 16)}px`;
+  card.style.top = `${Math.max(4, flipY ? y - 16 - card.offsetHeight : y + 16)}px`;
+}
+
 $("#code-map-svg").addEventListener("click", (event) => {
-  const node = event.target.closest("[data-map-node]");
-  const path = node?.dataset.mapNode || null;
+  const path = mapNodeAt(event.clientX, event.clientY)?.path || null;
   mapSelected = mapSelected === path ? null : path;
   if (mapSelected) mapGroupFilter = null;
   paintCodeMap();
+  if (mapHovered) showMapHover(mapState.layout?.nodes.find((node) => node.path === mapHovered), event);
 });
+$("#code-map-svg").addEventListener("pointermove", (event) => {
+  if ($("#code-map-canvas").classList.contains("is-panning")) return showMapHover(null);
+  showMapHover(mapNodeAt(event.clientX, event.clientY), event);
+});
+$("#code-map-svg").addEventListener("pointerleave", () => showMapHover(null));
 $("#code-map-svg").addEventListener("keydown", (event) => {
   if (event.key !== "Enter" && event.key !== " ") return;
   const node = event.target.closest("[data-map-node]");

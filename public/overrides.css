@@ -1458,6 +1458,33 @@
   stroke-width: 1.6;
 }
 .map-node.selected > circle { stroke: var(--text); stroke-width: 2.4; }
+/* The file the pointer would pick, which is often not the dot under it: a wide ring makes a 6px
+   file visible as the target before the click. */
+.map-node.hovered > circle {
+  fill: var(--agent-color, var(--muted));
+  stroke: var(--text);
+  stroke-width: 3;
+  paint-order: stroke;
+}
+.map-node.hovered.dim { opacity: 0.6; }
+.code-map-canvas.over-node { cursor: pointer; }
+
+.code-map-hover {
+  position: absolute;
+  z-index: 5;
+  display: grid;
+  gap: 3px;
+  max-width: 320px;
+  padding: 8px 10px;
+  border: 1px solid #2c343e;
+  border-radius: 9px;
+  background: #151a21;
+  box-shadow: 0 10px 28px color-mix(in srgb, var(--bg) 80%, transparent);
+  pointer-events: none;
+}
+.code-map-hover strong { font-size: 13px; color: var(--text); }
+.code-map-hover code { font: 10.5px/1.35 ui-monospace, monospace; color: #8b95a2; overflow-wrap: anywhere; }
+.code-map-hover span { font-size: 11px; color: var(--muted); }
 .map-note-ring {
   fill: none;
   stroke: var(--amber);
