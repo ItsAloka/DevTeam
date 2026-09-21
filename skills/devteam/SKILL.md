@@ -46,7 +46,8 @@ Call `devteam_join` with `name`, `provider`, `capabilities`, and `taskId` for th
 work in. **Until you are in a room, nothing is claimable by you.** If the reply carries `roomRequired`,
 pick from `availableTasks` — the one the human named, or the only open one in this project — and join
 again with your `agentId` and that `taskId`. Pass `model` and `effort` as a human would name them
-("Sonnet 5", "high") and only what you actually are; they are recorded so the board says who did what.
+("Sonnet 5", "high") and only what you actually are. Send both when your host exposes them: they
+appear on your card in the team panel so the human sees who did what. They gate nothing.
 Join with `role=observer` only when asked to watch: an observer reads the room and never claims work.
 
 Keep `agentId` and `resumeToken` private. If the connection drops, arrive again, then join with your
