@@ -1634,6 +1634,8 @@
   white-space: nowrap;
 }
 .assignment-holder.unclaimed { color: var(--muted); font-weight: 500; }
+/* Ready work that only someone absent may take: amber, so it reads as "needs a person", not as broken. */
+.assignment-holder.waiting { color: var(--amber); font-weight: 600; }
 .assignment-rework { color: var(--red); font-size: 9px; font-weight: 750; white-space: nowrap; }
 
 /* Beside the graph, not below it: in a band there is no room underneath, and clicking a note must
@@ -2193,3 +2195,215 @@ nav.tasks-collapsed #task-current { display: block; }
 .domain-picker .domain-choice-empty { opacity: .62; }
 .domain-picker .domain-choice-empty .domain-count { color: var(--muted); }
 .domain-picker .domain-empty { flex-basis: 100%; }
+
+/* The project's team: who plans, builds and reviews. Three short fields in a row, then the solo switch. */
+.team-picker { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 12px; margin: 4px 0 12px; padding: 10px 12px; border: 1px solid var(--line, rgba(127,127,127,.3)); border-radius: 10px; }
+.team-picker legend { padding: 0 6px; font-size: 13px; }
+.team-picker legend .hint { display: inline; margin: 0 0 0 6px; }
+.team-picker label { margin: 0; }
+.team-picker .hint { grid-column: 1 / -1; margin: 0; }
+.solo-toggle { display: flex; align-items: flex-start; gap: 10px; margin: 0 0 12px; font-weight: 400; line-height: 1.45; }
+.solo-toggle input { width: auto; margin: 3px 0 0; flex: none; }
+@media (max-width: 560px) { .team-picker { grid-template-columns: 1fr; } }
+
+/* Shown when the dashboard files changed under a running page. Quiet, but it stays until acted on. */
+.update-banner { position: fixed; right: 18px; bottom: 18px; z-index: 60; display: flex; align-items: center; gap: 12px; padding: 10px 12px 10px 16px; border: 1px solid var(--line, rgba(127,127,127,.3)); border-radius: 12px; background: var(--panel, #161b22); font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+.update-banner.hidden { display: none; }
+.update-banner button { padding: 6px 14px; }
+
+/* ---- The work board as a flowchart -------------------------------------------------------------
+   Steps run down the page in the order the work happened. A card says what kind of step it is
+   (Plan, Build, Review), where it stands, and who has it; the colours carry only two meanings —
+   the agent's own colour for who holds it, amber for "waiting on a person", red for "needs a
+   decision". Finished work is calm, not faded to nothing: the flow is the record. */
+.assignment-node.flow-card {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 4px;
+  padding: 8px 11px 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--agent-color) 45%, var(--line));
+  border-left: 4px solid var(--agent-color);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--agent-color) 7%, #141920);
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--bg) 70%, transparent);
+}
+.assignment-node.flow-card.is-unclaimed { --agent-color: #4a5461; }
+.assignment-node.flow-card.status-done { opacity: 1; background: #12161c; border-color: #232a33; border-left-color: color-mix(in srgb, var(--agent-color) 70%, #232a33); }
+.assignment-node.flow-card.status-done .flow-title { color: #b9c2cd; }
+.assignment-node.flow-card.status-claimed { background: color-mix(in srgb, var(--agent-color) 13%, #141920); box-shadow: 0 0 0 1px color-mix(in srgb, var(--agent-color) 45%, transparent), 0 8px 22px color-mix(in srgb, var(--bg) 70%, transparent); }
+.assignment-node.flow-card.status-queued { border-style: dashed; border-left-style: solid; }
+.assignment-node.flow-card.is-waiting { --agent-color: var(--amber); }
+.assignment-node.flow-card.status-blocked { --agent-color: var(--red); background: color-mix(in srgb, var(--red) 9%, #141920); box-shadow: none; }
+.assignment-node.flow-card.kind-review { background: color-mix(in srgb, var(--agent-color) 5%, #11151b); }
+.assignment-node.flow-card.status-done.kind-review { background: #10141a; }
+
+.flow-card-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.flow-role {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: #1c232c;
+  color: var(--blue);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.role-planner .flow-role { color: #c7b4ff; }
+.role-reviewer .flow-role { color: var(--amber); }
+.flow-badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--amber) 16%, transparent);
+  color: var(--amber);
+  font-size: 9px;
+  font-weight: 700;
+}
+.flow-status {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 9.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.status-done .flow-status { color: var(--green2); }
+.status-claimed .flow-status { color: var(--text); }
+.status-blocked .flow-status { color: var(--red); }
+.flow-title {
+  display: -webkit-box;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.32;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.flow-foot { display: flex; align-items: center; justify-content: space-between; gap: 6px; min-width: 0; }
+.flow-holder {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--agent-color);
+  font-size: 10.5px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.flow-holder.unclaimed { color: var(--muted); font-weight: 500; }
+.flow-holder.waiting { color: var(--amber); }
+.flow-decision { color: var(--red); font-size: 10px; font-weight: 650; white-space: nowrap; }
+
+/* Arrows. A declared "after" is solid, the order the work merely happened in is quiet and dashed,
+   a build's own review hangs off it with a short solid drop, and a send-back is an amber loop. */
+.assignment-edge { fill: none; stroke: #5d6878; stroke-width: 1.6; opacity: 0.9; }
+.assignment-edge.sequence { stroke: #3a434f; stroke-dasharray: 4 5; }
+.assignment-edge.pair { stroke: #6f7b8b; }
+.assignment-edge.rework { stroke: var(--amber); stroke-width: 1.5; stroke-dasharray: none; opacity: 0.85; }
+.flow-arrow-head { fill: #5d6878; }
+.flow-arrow-head.quiet { fill: #3a434f; }
+.flow-arrow-head.rework { fill: var(--amber); }
+.flow-edge-label { fill: var(--amber); font-size: 9.5px; font-weight: 700; paint-order: stroke; stroke: var(--bg); stroke-width: 3; }
+
+/* Row labels: "Plan", "Step 1"… with the time the step started, so the board reads as a timeline. */
+.assignment-lane { background: none; border-block: 0; border-top: 1px dashed color-mix(in srgb, var(--line) 55%, transparent); }
+.assignment-lane:first-child { border-top: 0; }
+.assignment-lane > span { top: 14px; transform: none; color: #7d8795; font-size: 10px; letter-spacing: 0.05em; }
+.assignment-lane > small { position: absolute; top: 30px; left: 10px; color: #505a67; font-size: 10px; }
+
+/* Set aside: out of the flow, never out of reach. */
+.flow-set-aside { margin: 10px 0 4px; }
+.flow-set-aside:empty { display: none; }
+.flow-set-aside summary { cursor: pointer; color: var(--muted); font-size: 11.5px; font-weight: 650; }
+.flow-set-aside summary span { margin-left: 6px; color: #566170; font-weight: 500; }
+.flow-set-aside-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; margin-top: 10px; }
+.flow-set-aside-item {
+  display: grid;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid #222932;
+  border-radius: 9px;
+  background: #0f1318;
+  color: var(--muted);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.flow-set-aside-item strong { color: #a9b2bd; font-size: 11.5px; font-weight: 600; }
+.flow-set-aside-item small { color: #626d7a; font-size: 10.5px; line-height: 1.35; }
+.flow-set-aside-item .flow-role { justify-self: start; }
+.flow-set-aside-item:hover,
+.flow-set-aside-item.selected { border-color: #3a4552; color: var(--text); }
+
+.assignment-addressed { color: var(--amber) !important; }
+.mini.danger:hover { border-color: color-mix(in srgb, var(--red) 55%, transparent); color: var(--red); }
+.primary.danger-fill { background: #ff9b9b; color: #2a0b0b; }
+.card-dialog { width: min(760px, calc(100vw - 40px)); }
+.card-dialog textarea { resize: vertical; line-height: 1.45; }
+
+/* Open, the board keeps the chat beside it on a wide screen: watching the flow and talking to the
+   team are one activity. Narrower than that, the board takes the column as before. */
+@media (min-width: 1280px) {
+  .workspace.board-full {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) clamp(320px, 30%, 460px);
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+  .workspace.board-full > .task-header,
+  .workspace.board-full > .blocked-banner { grid-column: 1 / -1; }
+  .workspace.board-full > #work-board { grid-column: 1; grid-row: 3; min-height: 0; }
+  .workspace.board-full > #conversation {
+    display: flex;
+    grid-column: 2;
+    grid-row: 3;
+    min-height: 0;
+    border-left: 1px solid var(--line);
+  }
+  .workspace.board-full > #conversation .event-list { padding: 18px 18px 26px; }
+  .workspace.board-full > #conversation .event { max-width: none; }
+}
+
+/* The map's areas, named where they sit, and the file panel's own sentence about the file. */
+.map-area-label {
+  fill: color-mix(in srgb, var(--agent-color, var(--muted)) 75%, var(--text));
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  opacity: 0.8;
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 4;
+  stroke-linejoin: round;
+  text-anchor: middle;
+  pointer-events: none;
+}
+.map-area-label.dim { opacity: 0.18; }
+.map-tests-toggle { border-style: dashed; }
+.map-tests-toggle.active { border-style: solid; color: var(--text); }
+.code-map-hover em { font-style: normal; font-size: 11.5px; color: #c5ccd5; line-height: 1.4; }
+.map-detail-purpose { margin: 8px 0 0; color: #c5ccd5; font-size: 12px; line-height: 1.45; }
+.map-detail-links { display: grid; gap: 3px; margin-top: 10px; }
+.map-detail-links .section-label { margin: 0 0 3px; }
+.map-detail-link {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--blue);
+  font: inherit;
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.map-detail-link small { overflow: hidden; color: #5c6673; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.map-detail-link:hover { background: #1a2029; }
+.map-detail-more { color: var(--muted); font-size: 10.5px; padding-left: 6px; }
+.map-detail-more-notes summary { cursor: pointer; padding: 6px 0 2px; color: var(--muted); font-size: 11px; }
+/* One line of text beside the dot, wrapping as a sentence; an offline agent reads amber. */
+.delivery-text { min-width: 0; line-height: 1.45; }
+.delivery-offline { color: var(--amber); }

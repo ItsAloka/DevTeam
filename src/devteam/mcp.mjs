@@ -62,13 +62,9 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   // me in the room", and an agent had to get the order right before it could do anything at all.
   // Now one call covers a first arrival, joining a further room, and coming back after a dropped
   // session, and it answers with the project's own role vocabulary so nobody has to ask separately.
-  // Arriving. Four tools — connect, join, resume, roles — were four ways of saying "I am here, put
-  // me in the room", and an agent had to get the order right before it could do anything at all.
-  // Now one call covers a first arrival, joining a further room, and coming back after a dropped
-  // session, and it answers with the project's own role vocabulary so nobody has to ask separately.
   server.registerTool("devteam_join", {
     title: "Join the team",
-    description: "Call this first. With name and provider you arrive as a new session; add taskId to enter that task's room at the same time. Membership is always explicit — until you are in a room, nothing on the board is claimable by you, and the reply lists the rooms you could join. Keep the returned agentId and resumeToken privately: if the session drops, call again with your new agentId plus that resumeToken to reclaim the work, room and missed messages of the old one rather than leaving its claim stuck. Already connected and want another room? Pass your agentId and the taskId. The reply also carries the three roles work moves through: planner → implementer → reviewer. A reviewer reads work rather than changing it, so it waits for pending writers and earns the right to pass a verdict; a planner decides what the team does next. Security review is a reviewer assignment with the security domain selected, not a role of its own.",
+    description: "Call this first. With name and provider you arrive as a new session; add taskId to enter that task's room at the same time. Membership is always explicit — until you are in a room, nothing on the board is claimable by you, and the reply lists the rooms you could join. Keep the returned agentId and resumeToken privately: if the session drops, call again with your new agentId plus that resumeToken to reclaim the work, room and missed messages of the old one rather than leaving its claim stuck. Already connected and want another room? Pass your agentId and the taskId. The reply also carries the three roles work moves through: planner → implementer → reviewer. A reviewer reads work rather than changing it, so it waits for pending writers and earns the right to pass a verdict; a planner decides what the team does next. Security review is a reviewer assignment with the security domain selected, not a role of its own. When you enter a room the reply carries the project's team: the agents named for each role are the only ones handed that role's work (an empty list means anyone), and soloReview says whether an author may review its own work when nobody else can — when it is false, a review of your work waits for someone else.",
     inputSchema: {
       name: z.string().min(1).max(80).optional().describe("Your display name on a first arrival, for example Codex or Claude"),
       provider: z.string().min(1).max(80).optional().describe("Your host on a first arrival, for example OpenAI Codex or Anthropic Claude Code"),
@@ -97,6 +93,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       return withInbox(agentId, {
         ...joined,
         roles: task ? store.roleCatalogue() : null,
+        ...(task ? { team: store.teamSummary(task.project_id) } : {}),
       });
     }
     if (!name || !provider) throw new Error("A first arrival needs name and provider.");
@@ -110,7 +107,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       connected: true,
       agent: agentInfo,
       room,
-      ...(task ? { roles: store.roleCatalogue() } : {}),
+      ...(task ? { roles: store.roleCatalogue(), team: store.teamSummary(task.project_id) } : {}),
       ...(roomRequired ? { roomRequired: true, availableTasks: roomStatus.activeTasks } : {}),
       resumeToken: token,
       next: roomRequired
@@ -121,17 +118,24 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_next", {
     title: "Get your next piece of work, or look something up",
-    description: "Your main loop. With no arguments beyond agentId it blocks locally until DevTeam has an assignment or a message for you — no model tokens are spent while blocked — and returns everything you need to start: the task, your assignment with its claim token, write scope and checklist, the relevant project memory, a map of the code around it, recent decisions and open questions. Returns 'room_required' if you are in no room yet, 'assigned' or 'message' when something arrives, or 'idle' after the timeout. The other modes are lookups, and none of them blocks: want=state reads the compact current state of a task, want=brief re-reads the full briefing for a task you are already working, and want=module returns the one-hop neighbourhood of a file from the code graph (paths and symbols, never source).",
+    description: "Your main loop. With no arguments beyond agentId it blocks locally until DevTeam has an assignment or a message for you — no model tokens are spent while blocked — and returns everything you need to start: the task, your assignment with its claim token, write scope and checklist, the relevant project memory, a map of the code around it, recent decisions and open questions. Returns 'room_required' if you are in no room yet, 'assigned' or 'message' when something arrives, or 'idle' after the timeout. The other modes are lookups, and none of them blocks: want=board (with taskId) is the board as a short flowchart in text — every step, who has it, what it waits on, and the ids to act on — and is what to read to see where the work stands; want=state returns the whole task including every event, which is large, so use it only when you need an event id or the full history; want=brief re-reads the full briefing for a task you are already working; and want=module returns the one-hop neighbourhood of a file from the code graph (paths, purposes and symbols, never source).",
     inputSchema: {
       agentId: z.string().uuid(),
-      want: z.enum(["work", "state", "brief", "module"]).default("work"),
+      want: z.enum(["work", "board", "state", "brief", "module"]).default("work"),
       timeoutSeconds: z.number().int().min(1).max(50).default(45).describe("want=work only: how long to block before answering idle"),
-      taskId: z.string().uuid().optional().describe("Required for brief and module; optional for state to narrow it to one task"),
+      taskId: z.string().uuid().optional().describe("Required for board, brief and module; optional for state to narrow it to one task"),
       path: z.string().max(500).optional().describe("want=module: the project-relative file whose neighbours you want"),
     },
   }, safe(async ({ agentId, want, timeoutSeconds, taskId, path: modulePath }) => {
     // The lookups first: they are the same act as waiting — "tell me what I need to work" — but
     // answered from what DevTeam already knows instead of by blocking for something new.
+    if (want === "board") {
+      requireIdentity(agentId);
+      store.heartbeat(agentId);
+      if (!taskId) throw new Error("want=board needs taskId.");
+      store.assertMembership(agentId, taskId);
+      return withInbox(agentId, store.boardText(taskId));
+    }
     if (want === "state") {
       requireIdentity(agentId);
       store.heartbeat(agentId);
@@ -196,6 +200,20 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       await sleep(Math.min(750, Math.max(0, deadline - Date.now())));
     } while (Date.now() < deadline);
     const activity = store.teamActivityForAgent(agentId);
+    // Work that only an absent teammate may take is not a reason to keep polling: nobody in the room
+    // can move it until the owner brings that teammate back, and every idle round costs tokens.
+    const heldForAbsent = activity.workingAgents || activity.busyAgents ? [] : store.workWaitingOnAbsentTeammates(agentId);
+    if (heldForAbsent.length) {
+      const names = [...new Set(heldForAbsent.flatMap((item) => item.waitingFor))];
+      return {
+        status: "idle",
+        keepWaiting: false,
+        activity,
+        waitingOnTeammates: heldForAbsent,
+        message: `Nothing here is yours to take. ${heldForAbsent.length === 1 ? "One assignment is" : `${heldForAbsent.length} assignments are`} waiting for ${names.join(" or ")}, who ${names.length === 1 ? "is" : "are"} not connected.`,
+        next: `Tell the user that ${names.join(" or ")} is needed, then call devteam_leave. The user will bring you back when there is work for you.`,
+      };
+    }
     // A room the human blocked looks exactly like a finished one from here: no work, no busy
     // teammates. Say which task is stopped and that only the human can restart it, so the idle
     // answer cannot be read as "the team is done" or as licence to recreate the task elsewhere.
@@ -223,7 +241,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_message", {
     title: "Post a team message",
-    description: "Post a focused progress note, design decision, review finding, or question. Omit target to post a timeline note the whole room can read; set target to a teammate's name to send a directed message that is pushed to them. Pass replyTo (a timeline event id from devteam_next with want=state) to answer a specific message as a thread.",
+    description: "Post a focused progress note, design decision, review finding, or question. Omit target to say it to the whole room — every teammate in it receives it on their next call; set target to a teammate's name to send it to them alone. Pass replyTo (a timeline event id) to answer a specific message as a thread. Keep room messages for what teammates need to know: they are delivered, so each one costs everyone a read.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
@@ -239,17 +257,37 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   }));
 
   // Putting work on the board.
+  const planCard = z.object({
+    key: z.string().max(40).optional().describe("A name for this card inside the batch, so later cards can wait on it or review it before it has an id"),
+    title: z.string().min(1).max(160),
+    description: z.string().min(1).max(12000),
+    role: z.enum(["planner", "implementer", "reviewer"]).default("implementer"),
+    requiresWrite: z.boolean().default(false),
+    targetAgentName: z.string().max(80).optional(),
+    paths: z.array(z.string().max(500)).max(50).optional(),
+    dependsOn: z.array(z.string().max(60)).max(50).optional().describe("Keys of earlier cards in this batch, or ids of cards already on the board"),
+    reviews: z.string().max(60).optional().describe("For a reviewer card: the key (or id) of the card it reviews"),
+    checklist: z.array(z.string().max(300)).max(40).optional(),
+    domains: z.array(z.string().max(30)).max(20).optional(),
+  });
+
   server.registerTool("devteam_plan", {
-    title: "Put work on the board",
-    description: "Create a bounded assignment for whoever can take it. There are three roles and work moves through them in one direction: planner → implementer → reviewer. Order is the only other scheduling vocabulary you need: leave dependsOn empty and it can start now, in parallel with anything else that is ready; name earlier assignments and it waits for them. Declare `paths` for write work so non-overlapping writers run at the same time instead of queueing behind one lease. A reviewer assignment carries a checklist automatically.",
+    title: "Put work on the board, or fix a card that is already there",
+    description: "action=create (the default) puts a bounded assignment on the board for whoever can take it. There are three roles and work moves through them in one direction: planner → implementer → reviewer. Order is the only other scheduling vocabulary you need: leave dependsOn empty and it can start now, in parallel with anything else that is ready; name earlier assignments and it waits for them. Declare `paths` for write work so non-overlapping writers run at the same time instead of queueing behind one lease. A reviewer assignment carries a checklist automatically. Pass `cards` instead of a single title to put a whole plan on the board at once: each card may name earlier cards in the same batch by `key` in dependsOn and reviews, which is how the real order gets declared. Fix cards instead of copying them: action=reopen puts a blocked or closed card back in the queue (optionally with targetAgentName and a note), keeping everything that waits on it; action=edit changes a waiting card's title, description, targetAgentName or dependsOn; action=close takes a card off the board with a reason, and with replacedBy moves everything that waited on it (and any review of it) to the replacement. When work is sent back, its review card returns by itself as the next round — do not create a re-review.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
+      action: z.enum(["create", "edit", "reopen", "close"]).default("create"),
+      assignmentId: z.string().uuid().optional().describe("edit/reopen/close: the card to change"),
+      reason: z.string().max(1000).optional().describe("close: why it is coming off the board"),
+      replacedBy: z.string().uuid().optional().describe("close: the card that takes its place; its waiters and reviews move there"),
+      note: z.string().max(4000).optional().describe("reopen: what the next holder should know, appended to the description"),
+      cards: z.array(planCard).max(30).optional().describe("create: several cards at once, in the order they happen"),
       title: z.string().min(1).max(160).optional().describe("Assignment title"),
       description: z.string().max(12000).optional(),
-      role: z.enum(["planner", "implementer", "reviewer"]).default("implementer").describe("planner decides what the team does next (and researches whatever it needs to decide); implementer produces the work and exercises it; reviewer reads someone else's finished work and judges it. A reviewer assignment is never handed to whoever wrote the version under review. Security work is a reviewer assignment with the security domain selected."),
+      role: z.enum(["planner", "implementer", "reviewer"]).default("implementer").describe("planner decides what the team does next (and researches whatever it needs to decide); implementer produces the work and exercises it; reviewer reads someone else's finished work and judges it. A reviewer assignment is never handed to whoever wrote the version under review, unless the project turned solo mode on. If the project's team names agents for this role, only they (or the targetAgentName) are handed it. Security work is a reviewer assignment with the security domain selected."),
       requiresWrite: z.boolean().default(false),
-      targetAgentName: z.string().max(80).optional().describe("Address it to one teammate by name; it returns to the general queue if nobody by that name is connected"),
+      targetAgentName: z.string().max(80).optional().describe("Address it to one teammate by name. If nobody by that name is connected it returns to the queue, where only the agents the project's team names for this role may take it (anyone, if the team names nobody)."),
       reviewSubjectAssignmentId: z.string().uuid().optional().describe("For a verifying assignment: the same-task assignment being reviewed. This keeps its author ineligible even after unrelated later edits."),
       checklist: z.array(z.string().max(300)).max(40).optional().describe("Points the assignee must address; overrides the role's default checklist, and an empty array omits it"),
       paths: z.array(z.string().max(500)).max(50).optional().describe("For write work: the paths this will modify (e.g. src/ocean/**). Declaring them lets non-overlapping writers run in parallel; omit for an exclusive whole-project lease."),
@@ -259,6 +297,17 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   }, safe(async (args) => {
     const { agentId, taskId, title, description, role, requiresWrite, targetAgentName } = args;
     requireIdentity(agentId);
+    if (args.action !== "create") {
+      if (!args.assignmentId) throw new Error(`action=${args.action} needs the assignmentId of the card to change.`);
+      if (args.action === "reopen") {
+        return withInbox(agentId, store.reopenAssignment({ agentId, taskId, assignmentId: args.assignmentId, targetAgentName, note: args.note }));
+      }
+      if (args.action === "close") {
+        return withInbox(agentId, store.closeAssignment({ agentId, taskId, assignmentId: args.assignmentId, reason: args.reason, replacedBy: args.replacedBy || null }));
+      }
+      return withInbox(agentId, store.editAssignment({ agentId, taskId, assignmentId: args.assignmentId, title, description, targetAgentName, dependsOn: args.dependsOn }));
+    }
+    if (args.cards?.length) return withInbox(agentId, store.planBatch({ agentId, taskId, cards: args.cards }));
     if (!title || !description) throw new Error("An assignment needs a title and a description.");
     const created = store.createAssignment({
       agentId, taskId, title, description, role, requiresWrite, targetAgentName,
@@ -273,7 +322,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_memory", {
     title: "Project memory",
-    description: "The project's memory, in two halves, and it is mostly written for you. DevTeam distils completed work, decisions, blockers and findings into a linked vault by itself, and your brief already carries the most relevant notes as headlines. action=search fetches the full body of a note the brief only summarised, or finds notes by words, path or category — reach for it whenever a headline looks relevant. action=write records a fact the events cannot capture: an API limit, why the obvious approach fails here, a convention the code follows but never states. Not a progress update (use devteam_message) and not a decision the team took (use devteam_propose). action=get and action=set are a small versioned key/value scratchpad — scope=task for this job, scope=project to persist across the project's tasks; re-read and merge on a version conflict.",
+    description: "The project's memory. A note exists only because somebody wrote it — here with action=write, or in the learned field of devteam_report — and your brief already carries the most relevant notes as headlines. action=search fetches the full body of a note the brief only summarised, or finds notes by words, path or category — reach for it whenever a headline looks relevant. action=write records a fact the next person would otherwise rediscover: an API limit, why the obvious approach fails here, a convention the code follows but never states. Not a progress update and not a decision the team took — post those with devteam_message. action=get and action=set are a small versioned key/value scratchpad — scope=task for this job, scope=project to persist across the project's tasks; re-read and merge on a version conflict.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),

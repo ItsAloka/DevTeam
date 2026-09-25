@@ -22,15 +22,34 @@ export const MAX_IMPORTS = 100;
 export const MAX_EXPORTS = 100;
 export const MAX_SPECIFIER_LENGTH = 500;
 export const MAX_SYMBOL_LENGTH = 120;
+export const MAX_SUMMARY_LENGTH = 160;
+// Bumped whenever a parser starts reading something new, so stored modules are parsed again rather
+// than trusted because their bytes did not change. 2: Python `from pkg import module` members, source
+// roots, and a one-line purpose per file.
+export const PARSER_VERSION = 2;
 
 const uniqueSorted = (values, limit = Infinity) => [...new Set(values)].sort().slice(0, limit);
 const posix = (value) => String(value || "").replace(/\\/g, "/");
+
+// A file's own first sentence about itself: the line an agent reads to decide whether to open it.
+// Kept to one sentence and one line, because a map of a hundred files is only useful if every entry
+// stays short.
+export function firstSentence(text) {
+  const flat = String(text || "").replace(/\s+/g, " ").trim();
+  if (!flat) return "";
+  const sentence = flat.match(/^(.{12,}?[.!?])(?=\s|$)/)?.[1] || flat;
+  return sentence.length > MAX_SUMMARY_LENGTH ? `${sentence.slice(0, MAX_SUMMARY_LENGTH - 1).trimEnd()}…` : sentence;
+}
 
 // Collect bounded, de-duplicated imports/exports without every parser repeating the guards.
 function collector(clean) {
   const imports = [];
   const exports = [];
+  let summary = "";
   return {
+    setSummary(text) {
+      if (!summary) summary = clean(firstSentence(text), MAX_SUMMARY_LENGTH);
+    },
     addImport(specifier) {
       const value = clean(specifier, MAX_SPECIFIER_LENGTH);
       if (value && imports.length < MAX_IMPORTS) imports.push(value);
@@ -40,7 +59,7 @@ function collector(clean) {
       if (value && exports.length < MAX_EXPORTS) exports.push(value);
     },
     done() {
-      return { imports: uniqueSorted(imports, MAX_IMPORTS), exports: uniqueSorted(exports, MAX_EXPORTS) };
+      return { imports: uniqueSorted(imports, MAX_IMPORTS), exports: uniqueSorted(exports, MAX_EXPORTS), summary };
     },
   };
 }
@@ -84,6 +103,8 @@ export function javascriptParser(clean) {
           out.addExport(parts[1] || parts[0]);
         }
       }
+      const lead = source.replace(/^#![^\n]*\n/, "").match(/^\s*(?:\/\*\*?([\s\S]{0,2000}?)\*\/|((?:[ \t]*\/\/[^\n]*\n?){1,6}))/);
+      if (lead) out.setSummary((lead[1] || lead[2] || "").replace(/^[ \t]*(?:\*|\/\/)[ \t]?/gm, ""));
       for (const match of source.matchAll(/\b(?:module\.exports|exports)\.([A-Za-z_$][\w$]*)\s*=/g)) out.addExport(match[1]);
       for (const match of source.matchAll(/\bmodule\.exports\s*=\s*\{([^}]{0,4000})\}/g)) {
         for (const item of match[1].split(",").slice(0, MAX_EXPORTS)) {
@@ -113,7 +134,20 @@ export function pythonParser(clean) {
       for (const match of source.matchAll(/^[ \t]*import[ \t]+([A-Za-z_][\w.]*(?:[ \t]*,[ \t]*[A-Za-z_][\w.]*)*)/gm)) {
         for (const part of match[1].split(",")) out.addImport(part.trim().split(/\s+as\s+/i)[0]);
       }
-      for (const match of source.matchAll(/^[ \t]*from[ \t]+(\.*[A-Za-z_][\w.]*|\.+)[ \t]+import\b/gm)) out.addImport(match[1].trim());
+      // `from pkg import a, b` names modules as often as functions: `from ..core import updates`
+      // imports core/updates.py. Each name is offered as a member (`pkg:name`); resolution keeps it
+      // only when that module file exists, so a function name costs nothing. Parenthesised,
+      // multi-line lists are read too — they are how long imports are written.
+      for (const match of source.matchAll(/^[ \t]*from[ \t]+(\.*[A-Za-z_][\w.]*|\.+)[ \t]+import[ \t]+(\([^)]{0,4000}\)|[^\r\n#;]+)/gm)) {
+        const from = match[1].trim();
+        out.addImport(from);
+        for (const raw of match[2].replace(/[()\\]/g, " ").split(",")) {
+          const name = raw.trim().split(/\s+as\s+/i)[0].trim();
+          if (/^[A-Za-z_]\w*$/.test(name)) out.addImport(`${from}:${name}`);
+        }
+      }
+      const docstring = source.replace(/^(?:[ \t]*(?:#[^\n]*)?\r?\n)*/, "").match(/^[rRuU]?("""|\'\'\')([\s\S]{0,2000}?)\1/);
+      if (docstring) out.setSummary(docstring[2]);
       // Top-level definitions are what this module offers. Indented ones are methods and locals.
       for (const match of source.matchAll(/^(?:async[ \t]+)?def[ \t]+([A-Za-z_]\w*)/gm)) out.addExport(match[1]);
       for (const match of source.matchAll(/^class[ \t]+([A-Za-z_]\w*)/gm)) out.addExport(match[1]);
@@ -129,8 +163,14 @@ export function pythonParser(clean) {
     // A leading dot is always intra-package. Anything else may be either a third-party package or
     // this project's own top-level package, and only resolution can tell — so it is listed as a
     // dependency *and* offered for resolution. A name that turns out to be both is honestly both.
-    external: (specifier) => !specifier.startsWith("."),
-    resolve(specifier, fromPath) {
+    // A member (`pkg:name`) is only ever a guess at a module file, never a dependency of its own.
+    external: (specifier) => !specifier.startsWith(".") && !specifier.includes(":"),
+    // `roots` are the folders that hold this project's top-level packages — `src/` in a src-layout
+    // project, `backend/` in a monorepo — found by the graph from where `__init__.py` files sit.
+    resolve(rawSpecifier, fromPath, { roots = [] } = {}) {
+      // A member resolves only as a module: `pkg:name` is `pkg/name.py`, never `pkg` itself.
+      const [base, member] = rawSpecifier.split(":");
+      const specifier = member ? (base.endsWith(".") ? `${base}${member}` : `${base}.${member}`) : base;
       const directory = path.posix.dirname(fromPath);
       // Explicit relative import: leading dots are "up one package" each, after the first.
       const relative = specifier.match(/^(\.+)(.*)$/);
@@ -151,8 +191,11 @@ export function pythonParser(clean) {
         const asDirs = specifier.replace(/\./g, "/");
         asPath(asDirs);
         asPath(path.posix.normalize(path.posix.join(directory === "." ? "" : directory, asDirs)));
+        for (const root of roots) if (root) asPath(path.posix.normalize(path.posix.join(root, asDirs)));
       }
-      return candidates.filter(Boolean);
+      // A member that is not a module file must not fall back to its package: that edge already
+      // exists from the plain `from` specifier, and an `__init__.py` candidate here would add nothing.
+      return (member ? candidates.filter((candidate) => !candidate.endsWith("/__init__.py")) : candidates).filter(Boolean);
     },
   };
 }
@@ -178,6 +221,9 @@ export function markdownParser(clean) {
       // Headings are a prose document's public surface: they are what another document links to and
       // what a reader is looking for, which is exactly the role exports play for code.
       for (const match of source.matchAll(/^#{1,3}[ \t]+(.{1,120}?)[ \t]*#*$/gm)) out.addExport(match[1].trim());
+      const body = source.replace(/^---\r?\n[\s\S]{0,4000}?\r?\n---\r?\n/, "");
+      const heading = body.match(/^#{1,2}[ \t]+(.{1,160})$/m)?.[1];
+      out.setSummary(heading || body.split(/\r?\n/).find((line) => line.trim() && !line.startsWith("<")) || "");
       return out.done();
     },
     external: () => false,
@@ -193,13 +239,19 @@ export function markdownParser(clean) {
 // heard of: a filename mentioned inside a file is a real relationship, whatever the file is. It only
 // ever produces an edge when the mentioned path actually exists in the project, so a false positive
 // costs nothing and a stray word can never invent a module.
+// Files that list other files without depending on them. THIRD_PARTY_LICENSES.txt and a packaging
+// SOURCES.txt named every module in Stuff Downloader, which made them the biggest hubs on its map and a
+// third of its edges. They stay on the map as files; they just do not draw lines.
+const LISTING_FILE = /(^|\/)(third[-_ ]?party[^/]*|licen[cs]e[^/]*|notice[^/]*|copying[^/]*|changelog[^/]*|sources\.txt|record)$/i;
+
 export function referenceParser(clean) {
   return {
     id: "reference",
     extensions: [],           // the fallback: consulted for any text file no other parser claims
     language: (file) => path.extname(file).toLowerCase().replace(".", "") || "text",
-    parse(source) {
+    parse(source, filePath = "") {
       const out = collector(clean);
+      if (LISTING_FILE.test(String(filePath))) return out.done();
       for (const match of source.matchAll(/\[\[([^\]|]{1,200})(?:\|[^\]]{0,200})?\]\]/g)) {
         const target = match[1].trim();
         if (target) out.addImport(`./${target}`);

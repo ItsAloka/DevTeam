@@ -1,4 +1,4 @@
-import { agentColorIndex, blockedBannerCopy, boardSummary, currentWork, escapeHtml, layoutAssignmentBoard, layoutCodeMap, renderSafeMarkdown, unreadTimelineCount } from "/ui-utils.js";
+import { agentColorIndex, blockedBannerCopy, boardSummary, buildFlowModel, currentWork, escapeHtml, isTestPath, layoutCodeMap, layoutFlowBoard, renderSafeMarkdown, unreadTimelineCount } from "/ui-utils.js";
 
 const $ = (selector) => document.querySelector(selector);
 const time = (stamp) => new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date(stamp));
@@ -251,14 +251,28 @@ function render() {
 
 const KIND_LABELS = { "agent.question": "question", "agent.finding": "finding", "agent.decision": "decision", "agent.progress": "note" };
 
+// Where a message stands for each agent it is meant for, by name: seen, delivered, waiting for the
+// agent's next check, or waiting for it to rejoin. "Not delivered yet" alone never said whether that
+// was a second's wait or a day's — and Codex, which connects one turn at a time, is usually offline.
 function deliveryLine(event) {
   const target = event.metadata.targetLabel || "all agents";
   const receipts = event.receipts || [];
-  const names = (list) => list.map((receipt) => escapeHtml(receipt.agent_name)).join(", ");
-  if (!receipts.length) return `<div class="delivery"><span class="delivery-dot pending"></span>To ${escapeHtml(target)} · not delivered yet</div>`;
-  const seen = receipts.filter((receipt) => receipt.seen_at);
-  if (seen.length) return `<div class="delivery"><span class="delivery-dot seen"></span>To ${escapeHtml(target)} · seen by ${names(seen)}</div>`;
-  return `<div class="delivery"><span class="delivery-dot delivered"></span>To ${escapeHtml(target)} · delivered to ${names(receipts)}</div>`;
+  const members = (state?.selectedTask?.members || []).filter((member) => member.role !== "observer");
+  const wanted = String(event.metadata.target || "all").toLowerCase() === "all"
+    ? [...new Set(members.map((member) => member.agent_name))]
+    : [event.metadata.targetLabel || event.metadata.target];
+  const byName = (name) => receipts.filter((receipt) => String(receipt.agent_name).toLowerCase() === String(name).toLowerCase());
+  const connected = (name) => members.some((member) => member.agent_name.toLowerCase() === String(name).toLowerCase() && member.status !== "disconnected");
+  const parts = wanted.filter(Boolean).map((name) => {
+    const mine = byName(name);
+    if (mine.some((receipt) => receipt.seen_at)) return { name, state: "seen", text: "seen" };
+    if (mine.length) return { name, state: "delivered", text: "delivered" };
+    if (connected(name)) return { name, state: "pending", text: "on its next check" };
+    return { name, state: "offline", text: "offline — gets it when it rejoins" };
+  });
+  if (!parts.length) return `<div class="delivery"><span class="delivery-dot pending"></span>To ${escapeHtml(target)} · no agent has joined yet — it will be delivered when one does</div>`;
+  const worst = ["offline", "pending", "delivered", "seen"].find((key) => parts.some((part) => part.state === key)) || "pending";
+  return `<div class="delivery"><span class="delivery-dot ${worst === "offline" ? "pending" : worst}"></span><span class="delivery-text">To ${escapeHtml(target)} · ${parts.map((part) => `<span class="delivery-${part.state}">${escapeHtml(part.name)} ${escapeHtml(part.text)}</span>`).join(" · ")}</span></div>`;
 }
 
 const SYSTEM_EVENTS = ["task.created", "assignment.created", "task.accepted", "assignment.reassigned"];
@@ -430,14 +444,34 @@ function assignmentDetailMarkup(item) {
     ? `<div class="rework"><strong>Changes requested${Number(item.rework_count) > 1 ? ` · ${Number(item.rework_count)} times` : ""}</strong><span>${escapeHtml(item.rework_summary || "Sent back to its author.")}</span>${findings}</div>`
     : (item.findings?.length ? `<div class="rework"><strong>Open findings</strong>${findings}</div>` : "");
   const holder = item.agent_name ? `${item.agent_name} · ` : "";
-  return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><button class="assignment-detail-close" type="button" data-assignment-close aria-label="Close assignment details">×</button></div><span class="role">${escapeHtml(item.role)}</span><p>${escapeHtml(`${holder}${item.status}`)}${item.requires_write && leaseIsLive ? " · write lease" : ""}</p>${description}${rework}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${sendBack}${release}</div></div>`;
+  const round = Number(item.review_round) > 1 ? ` · round ${Number(item.review_round)}` : "";
+  const closed = item.status === "closed"
+    ? `<div class="scheduling-hold"><strong>Set aside</strong><span>${escapeHtml(item.closed_reason || "Closed.")}</span></div>`
+    : "";
+  const addressed = item.target_agent_name && ["queued", "blocked"].includes(item.status)
+    ? `<p class="assignment-addressed">For ${escapeHtml(item.target_agent_name)}</p>`
+    : "";
+  // Fixing a card instead of copying it: reopen or close a blocked one, edit or close a waiting one.
+  // A finished task is a record, and a stopped one is restarted as a whole, so neither offers them.
+  const taskStatus = state?.selectedTask?.status;
+  const taskOpen = !["accepted", "cancelled", "blocked"].includes(taskStatus);
+  const cardActions = !taskOpen ? "" : [
+    ["blocked", "closed"].includes(item.status) ? `<button class="mini" type="button" data-card-action="reopen" data-card-id="${escapeHtml(item.id)}">Reopen</button>` : "",
+    ["queued", "blocked"].includes(item.status) ? `<button class="mini" type="button" data-card-action="edit" data-card-id="${escapeHtml(item.id)}">Edit</button>` : "",
+    ["queued", "blocked"].includes(item.status) ? `<button class="mini danger" type="button" data-card-action="close" data-card-id="${escapeHtml(item.id)}">Close</button>` : "",
+  ].join("");
+  return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><button class="assignment-detail-close" type="button" data-assignment-close aria-label="Close assignment details">×</button></div><span class="role">${escapeHtml(roleWord(item.role))}${escapeHtml(round)}</span><p>${escapeHtml(`${holder}${statusWord(item.status)}`)}${item.requires_write && leaseIsLive ? " · write lease" : ""}</p>${addressed}${closed}${description}${rework}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${cardActions}${sendBack}${release}</div></div>`;
 }
+
+// The three roles in the words the board uses: a plan, a build, a review.
+const roleWord = (role) => ({ planner: "Plan", implementer: "Build", reviewer: "Review" }[role] || role || "Work");
+const statusWord = (status) => ({ queued: "waiting", claimed: "working", done: "done", blocked: "needs a decision", closed: "set aside" }[status] || status);
 
 // The closed strip. Every chip opens the board on that note, so the one-line answer to "what is
 // happening" and the whole graph are one click apart in either direction.
 function renderCurrentWork(task) {
   const strip = $("#board-now");
-  const { items, more } = currentWork(task.assignments || []);
+  const { items, more } = currentWork(task.assignments || [], 3, task.status);
   const chips = items.map((item) => {
     const colorClass = item.agent_name ? `agent-color-${agentColorIndex(item.agent_name)}` : "is-unclaimed";
     // Only a holder earns space here. "Unclaimed" on three chips in a row is three copies of what
@@ -451,42 +485,87 @@ function renderCurrentWork(task) {
   strip.innerHTML = chips.join("");
 }
 
+// What an unclaimed, ready note is waiting for, in the few words a card has room for. Only for work
+// whose own dependencies are done: a note still waiting on earlier work already says so by its place
+// on the board, and naming a teammate there would point at the wrong holdup.
+function waitingLabel(item) {
+  const hold = item.schedulingHold;
+  if (item.status !== "queued" || !hold || item.blockedBy?.length) return null;
+  if (hold.reason === "waiting_for_team") return `Waiting for ${(hold.waitingFor || []).join(" or ")}`;
+  if (hold.reason === "verifier_is_author") return "Needs a reviewer who didn't write it";
+  if (hold.reason === "awaiting_writer") return "Waiting for the build";
+  if (hold.reason === "write_lease_conflict") return "Waiting for a file lock";
+  return null;
+}
+
+// The work board: a flowchart of how the work went (layoutFlowBoard in ui-utils.js). Each step is a
+// piece of work with its review directly beneath it; send-backs are a loop on the step, not more cards;
+// and whatever left the flow — closed, replaced, decided, or left blocked on a finished task — waits in
+// "set aside" below, one click from its details.
+let setAsideOpen = false;
+
+function flowCardMarkup(node, step) {
+  const item = node.card;
+  const waiting = item.agent_name ? null : waitingLabel(item);
+  const decision = step?.decision && node.kind === "main" && item.status === "blocked"
+    ? (step.decision.agent_name ? `${step.decision.agent_name} is deciding` : "Waiting for the planner")
+    : null;
+  const holder = item.agent_name
+    ? `<span class="flow-holder"><span class="agent-swatch"></span>${escapeHtml(item.agent_name)}</span>`
+    : waiting
+      ? `<span class="flow-holder waiting" title="${escapeHtml(item.schedulingHold.detail)}">${escapeHtml(waiting)}</span>`
+      : `<span class="flow-holder unclaimed">${item.target_agent_name ? `For ${escapeHtml(item.target_agent_name)}` : "Unclaimed"}</span>`;
+  const icon = { queued: "○", claimed: "●", done: "✓", blocked: "!" }[item.status] || "•";
+  const round = node.kind === "review" && node.rounds > 1 ? `<span class="flow-badge">Round ${node.rounds}</span>` : "";
+  const status = item.status === "blocked" ? "Needs a decision" : statusWord(item.status);
+  return `<span class="flow-card-top"><span class="flow-role">${escapeHtml(roleWord(item.role))}</span>${round}<span class="flow-status">${icon} ${escapeHtml(status)}</span></span><span class="flow-title">${escapeHtml(item.title)}</span><span class="flow-foot">${holder}${decision ? `<span class="flow-decision">${escapeHtml(decision)}</span>` : ""}</span>`;
+}
+
 function renderAssignmentBoard(task) {
   const board = $("#assignment-board");
   const empty = board.querySelector(".assignment-board-empty");
   const canvas = board.querySelector(".assignment-board-canvas");
   const nodesContainer = board.querySelector(".assignment-nodes");
+  const setAside = board.querySelector(".flow-set-aside");
   const detail = $("#assignment-detail");
   const assignments = task.assignments || [];
-  empty.classList.toggle("hidden", assignments.length > 0);
-  canvas.classList.toggle("hidden", assignments.length === 0);
+  const model = buildFlowModel(assignments, { taskStatus: task.status });
+  empty.classList.toggle("hidden", model.steps.length > 0);
+  canvas.classList.toggle("hidden", model.steps.length === 0);
   if (!assignments.length) {
     nodesContainer.replaceChildren();
+    setAside.replaceChildren();
     detail.classList.add("hidden");
     focusedAssignmentId = null;
     return;
   }
 
-  // Zoom widens the gaps, never the cards: the same notes in the same order, further apart, so the
+  // Zoom widens the gaps, never the cards: the same steps in the same order, further apart, so the
   // arrows between them get room to be read. The layout is plain arithmetic, so re-running it for a
   // zoom step costs nothing and cannot reorder anything.
-  const layout = layoutAssignmentBoard(assignments, {
-    siblingGap: BOARD_SIBLING_GAP * boardZoom,
-    layerGap: BOARD_LAYER_GAP * boardZoom,
+  const layout = layoutFlowBoard(model, {
+    columnGap: BOARD_SIBLING_GAP * boardZoom,
+    rowGap: BOARD_LAYER_GAP * boardZoom,
   });
   canvas.style.width = `${layout.width}px`;
   canvas.style.height = `${layout.height}px`;
-  board.querySelector(".assignment-lanes").innerHTML = layout.lanes.map((lane) => `<div class="assignment-lane" style="top:${lane.y}px;height:${lane.height}px"><span>${escapeHtml(lane.label)}</span></div>`).join("");
+  const clock = (iso) => (iso ? new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "");
+  board.querySelector(".assignment-lanes").innerHTML = layout.rows.map((row) =>
+    `<div class="assignment-lane" style="top:${row.y}px;height:${row.height}px"><span>${escapeHtml(row.label)}</span>${row.startedAt ? `<small>${escapeHtml(clock(row.startedAt))}</small>` : ""}</div>`).join("");
   const svg = board.querySelector(".assignment-edges");
   svg.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
-  svg.innerHTML = `<defs><marker id="dependency-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path class="dependency-arrow" d="M0,0 L7,3.5 L0,7 Z"></path></marker><marker id="review-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path class="review-arrow" d="M0,0 L7,3.5 L0,7 Z"></path></marker></defs>${layout.edges.map((edge) => `<path class="assignment-edge ${edge.type}" d="${edge.path}" marker-end="url(#${edge.type === "review" ? "review" : "dependency"}-arrow)"></path>`).join("")}`;
+  const marker = (id, cls) => `<marker id="${id}" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path class="${cls}" d="M0,0 L8,4 L0,8 Z"></path></marker>`;
+  svg.innerHTML = `<defs>${marker("flow-arrow", "flow-arrow-head")}${marker("flow-arrow-quiet", "flow-arrow-head quiet")}${marker("flow-arrow-rework", "flow-arrow-head rework")}</defs>${layout.edges.map((edge) => {
+    const head = edge.type === "rework" ? "flow-arrow-rework" : edge.type === "sequence" ? "flow-arrow-quiet" : "flow-arrow";
+    const label = edge.label ? `<text class="flow-edge-label" x="${edge.labelX}" y="${edge.labelY}">${escapeHtml(edge.label)}</text>` : "";
+    return `<path class="assignment-edge ${edge.type}" d="${edge.path}" marker-end="url(#${head})"></path>${label}`;
+  }).join("")}`;
 
-  const assignmentById = new Map(assignments.map((item) => [String(item.id), item]));
+  const stepById = new Map(model.steps.map((step) => [step.id, step]));
   const existing = new Map([...nodesContainer.querySelectorAll("[data-assignment-focus]")].map((node) => [node.dataset.assignmentFocus, node]));
   const liveIds = new Set();
   for (const node of layout.nodes) {
-    const item = assignmentById.get(node.id);
-    if (!item) continue;
+    const item = node.card;
     liveIds.add(node.id);
     let button = existing.get(node.id);
     if (!button) {
@@ -495,21 +574,29 @@ function renderAssignmentBoard(task) {
       button.dataset.assignmentFocus = node.id;
       nodesContainer.append(button);
     }
-    const hasRework = Number(item.rework_count) > 0 || Boolean(item.rework_requested_at);
     const colorClass = item.agent_name ? `agent-color-${agentColorIndex(item.agent_name)}` : "is-unclaimed";
-    button.className = `assignment-node status-${item.status} ${colorClass}${hasRework ? " has-rework" : ""}${focusedAssignmentId === node.id ? " selected" : ""}`;
+    const waiting = !item.agent_name && waitingLabel(item) ? " is-waiting" : "";
+    button.className = `assignment-node flow-card kind-${node.kind} role-${escapeHtml(item.role)} status-${item.status} ${colorClass}${waiting}${focusedAssignmentId === node.id ? " selected" : ""}`;
     button.style.width = `${node.width}px`;
     button.style.height = `${node.height}px`;
     button.style.transform = `translate(${node.x}px, ${node.y}px)`;
+    button.title = item.title;
     button.setAttribute("aria-expanded", String(focusedAssignmentId === node.id));
-    button.setAttribute("aria-label", `${item.title}, ${item.role}, ${item.agent_name ? `held by ${item.agent_name}, ` : ""}${item.status}${hasRework ? ", changes requested" : ""}`);
-    const holder = item.agent_name ? `<span class="assignment-holder"><span class="agent-swatch"></span>${escapeHtml(item.agent_name)}</span>` : `<span class="assignment-holder unclaimed">Unclaimed</span>`;
-    const statusIcon = { queued: "○", claimed: "◉", done: "✓", blocked: "!" }[item.status] || "•";
-    const rework = hasRework ? `<span class="assignment-rework">↻ Rework${Number(item.rework_count) > 1 ? ` ×${Number(item.rework_count)}` : ""}</span>` : "";
-    button.innerHTML = `<span class="assignment-node-title">${escapeHtml(item.title)}</span><span class="assignment-node-meta"><span class="role">${escapeHtml(item.role)}</span><span class="assignment-status">${statusIcon} ${escapeHtml(item.status)}</span></span><span class="assignment-node-foot">${holder}${rework}</span>`;
+    button.setAttribute("aria-label", `${roleWord(item.role)}: ${item.title}, ${item.agent_name ? `held by ${item.agent_name}, ` : ""}${statusWord(item.status)}${node.rounds > 1 ? `, round ${node.rounds}` : ""}`);
+    button.innerHTML = flowCardMarkup(node, stepById.get(node.stepId));
   }
   for (const [id, node] of existing) if (!liveIds.has(id)) node.remove();
 
+  // Set aside: never deleted, just out of the flow. The open/closed state survives re-renders.
+  if (model.setAside.length) {
+    setAside.innerHTML = `<details ${setAsideOpen ? "open" : ""}><summary>${model.setAside.length} set aside <span>closed, replaced or decided cards — kept for the record</span></summary><div class="flow-set-aside-list">${model.setAside.map(({ card, reason }) =>
+      `<button type="button" class="flow-set-aside-item${focusedAssignmentId === String(card.id) ? " selected" : ""}" data-assignment-focus="${escapeHtml(card.id)}"><span class="flow-role">${escapeHtml(roleWord(card.role))}</span><strong>${escapeHtml(card.title)}</strong><small>${escapeHtml(reason)}</small></button>`).join("")}</div></details>`;
+    setAside.querySelector("details").addEventListener("toggle", (event) => { setAsideOpen = event.target.open; });
+  } else {
+    setAside.replaceChildren();
+  }
+
+  const assignmentById = new Map(assignments.map((item) => [String(item.id), item]));
   const focused = focusedAssignmentId ? assignmentById.get(String(focusedAssignmentId)) : null;
   if (!focused && focusedAssignmentId) focusedAssignmentId = null;
   detail.classList.toggle("hidden", !focused);
@@ -528,6 +615,23 @@ function renderAssignmentBoard(task) {
 const MAP_STALE_MS = 60_000;
 let mapState = { taskId: null, data: null, layout: null, size: "", loading: false, error: null, fetchedAt: 0 };
 let mapSelected = null;
+// Test files double a project's file count and sit on top of the code they test, so the map starts
+// with them set aside; one chip brings them back. Remembered per browser.
+let mapShowTests = false;
+try { mapShowTests = localStorage.getItem("devteam.mapTests") === "show"; } catch { /* private window */ }
+
+// What the map draws: the data, less the test files when they are set aside.
+function visibleMapData(data) {
+  if (mapShowTests) return data;
+  const keep = new Set(data.modules.filter((module) => !isTestPath(module.path)).map((module) => module.path));
+  return {
+    ...data,
+    modules: data.modules.filter((module) => keep.has(module.path)),
+    edges: data.edges.filter((edge) => keep.has(edge.from) && keep.has(edge.to)),
+    notes: (data.notes || []).map((note) => ({ ...note, files: note.files.filter((file) => keep.has(file)) })).filter((note) => note.files.length),
+    touched: (data.touched || []).filter((entry) => keep.has(entry.file)),
+  };
+}
 // The file under the pointer. Kept across repaints, because zooming redraws every node.
 let mapHovered = null;
 let mapGroupFilter = null;
@@ -582,12 +686,15 @@ async function loadCodeMap(taskId, { force = false } = {}) {
 }
 
 function mapSummaryLine(data, layout) {
-  const files = data.modules.length;
+  const tests = mapShowTests ? 0 : data.modules.filter((module) => isTestPath(module.path)).length;
+  const files = data.modules.length - tests;
   const noted = new Set((data.notes || []).flatMap((note) => note.files || [])).size;
-  const parts = [`${files} file${files === 1 ? "" : "s"}`, `${data.edges.length} import${data.edges.length === 1 ? "" : "s"}`];
+  const imports = layout ? layout.edges.length : data.edges.length;
+  const parts = [`${files} file${files === 1 ? "" : "s"}`, `${imports} import${imports === 1 ? "" : "s"}`];
   if (data.touched.length) parts.push(`${data.touched.length} touched by this task`);
   if (noted) parts.push(`${noted} with notes`);
   if (layout?.dropped) parts.push(`${layout.dropped} leaf files hidden`);
+  if (tests) parts.push(`${tests} test files set aside`);
   if (data.truncated) parts.push("index truncated");
   if (data.indexedAt) parts.push(`indexed ${relativeTime(data.indexedAt)}`);
   return parts.join(" · ");
@@ -640,21 +747,33 @@ function paintCodeMap() {
   }).join("");
   // Spread far enough apart, every file has room for its name, not just the ones the layout picked.
   const labelAll = k >= MAP_LABEL_ALL_ZOOM;
+  const areaMarkup = layout.groups.length > 1 ? layout.groups.map((group) =>
+    `<text class="map-area-label map-group-${group.index % 8}${mapGroupFilter && mapGroupFilter !== group.name ? " dim" : ""}" x="${sx(group.labelX)}" y="${sy(group.labelY)}">${escapeHtml(group.label)}</text>`).join("") : "";
   const labelMarkup = layout.nodes.filter((node) => (node.labelled || labelAll) && !dimmed(node)).map((node) =>
     `<text class="map-label${node.touched ? " touched" : ""}" x="${sx(node.x)}" y="${(node.y * k + ty - node.r - 5).toFixed(1)}">${escapeHtml(node.name)}</text>`).join("");
   svg.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
-  svg.innerHTML = `<g class="map-edges">${edgeMarkup}</g><g class="map-nodes">${nodeMarkup}</g><g class="map-labels" aria-hidden="true">${labelMarkup}</g>`;
+  svg.innerHTML = `<g class="map-edges">${edgeMarkup}</g><g class="map-areas" aria-hidden="true">${areaMarkup}</g><g class="map-nodes">${nodeMarkup}</g><g class="map-labels" aria-hidden="true">${labelMarkup}</g>`;
 
   const legend = $("#code-map-legend");
+  const testCount = (mapState.data?.modules || []).filter((module) => isTestPath(module.path)).length;
+  const testsChip = testCount
+    ? `<button class="map-legend-chip map-tests-toggle${mapShowTests ? " active" : ""}" type="button" data-map-tests aria-pressed="${mapShowTests}" title="${mapShowTests ? "Set the test files aside" : "Show the test files beside the code they test"}">${mapShowTests ? "Hide" : "Show"} tests<span class="map-legend-count">${testCount}</span></button>`
+    : "";
   legend.innerHTML = layout.groups.map((group) =>
-    `<button class="map-legend-chip map-group-${group.index % 8}${mapGroupFilter === group.name ? " active" : ""}" type="button" data-map-group="${escapeHtml(group.name)}" title="${escapeHtml(group.name)} — ${group.count} file${group.count === 1 ? "" : "s"}${group.touched ? `, ${group.touched} touched by this task` : ""}"><span class="map-legend-dot"></span>${escapeHtml(group.name)}<span class="map-legend-count">${group.count}</span></button>`).join("");
+    `<button class="map-legend-chip map-group-${group.index % 8}${mapGroupFilter === group.name ? " active" : ""}" type="button" data-map-group="${escapeHtml(group.name)}" title="${escapeHtml(group.name)} — ${group.count} file${group.count === 1 ? "" : "s"}${group.touched ? `, ${group.touched} touched by this task` : ""}"><span class="map-legend-dot"></span>${escapeHtml(group.label)}<span class="map-legend-count">${group.count}</span></button>`).join("") + testsChip;
 
   const detail = $("#code-map-detail");
   const node = mapSelected ? layout.nodes.find((candidate) => candidate.path === mapSelected) : null;
   detail.classList.toggle("hidden", !node);
   if (!node) { detail.innerHTML = ""; return; }
-  const imports = layout.edges.filter((edge) => edge.from === node.path).length;
-  const importedBy = layout.edges.filter((edge) => edge.to === node.path).length;
+  const importList = layout.edges.filter((edge) => edge.from === node.path).map((edge) => edge.to);
+  const importerList = layout.edges.filter((edge) => edge.to === node.path).map((edge) => edge.from);
+  const imports = importList.length;
+  const importedBy = importerList.length;
+  const fileList = (label, files) => (files.length
+    ? `<div class="map-detail-links"><span class="section-label">${label}</span>${files.slice(0, 14).map((file) =>
+      `<button type="button" class="map-detail-link" data-map-jump="${escapeHtml(file)}">${escapeHtml(file.slice(file.lastIndexOf("/") + 1))}<small>${escapeHtml(file.slice(0, file.lastIndexOf("/") + 1))}</small></button>`).join("")}${files.length > 14 ? `<small class="map-detail-more">and ${files.length - 14} more</small>` : ""}</div>`
+    : "");
   const facts = [
     node.language || "file",
     node.loc ? `${node.loc} lines` : null,
@@ -664,11 +783,16 @@ function paintCodeMap() {
   const touched = node.touched
     ? `<p class="map-detail-touched">Changed ${node.touched}× while this task ran.</p>`
     : "";
+  // Notes come last and fold after three: a note is pinned to every file its report changed, so a
+  // busy file collects notes that are about its neighbours as much as about it.
+  const noteRow = (note) => `<div class="map-detail-note"><span class="role">${escapeHtml(note.category)}</span><span>${escapeHtml(note.title)}</span></div>`;
   const notes = node.notes.length
-    ? `<div class="map-detail-notes"><span class="section-label">What the team knows</span>${node.notes.map((note) =>
-        `<div class="map-detail-note"><span class="role">${escapeHtml(note.category)}</span><span>${escapeHtml(note.title)}</span></div>`).join("")}</div>`
+    ? `<div class="map-detail-notes"><span class="section-label">What the team knows</span>${node.notes.slice(0, 3).map(noteRow).join("")}${node.notes.length > 3
+      ? `<details class="map-detail-more-notes"><summary>${node.notes.length - 3} more</summary>${node.notes.slice(3).map(noteRow).join("")}</details>`
+      : ""}</div>`
     : "";
-  detail.innerHTML = `<div class="map-detail-top"><strong>${escapeHtml(node.name)}</strong><button class="assignment-detail-close" type="button" data-map-close aria-label="Close file details">×</button></div><code class="map-detail-path">${escapeHtml(node.path)}</code><p class="map-detail-facts">${escapeHtml(facts)}</p>${touched}${notes}`;
+  const purpose = node.summary ? `<p class="map-detail-purpose">${escapeHtml(node.summary)}</p>` : "";
+  detail.innerHTML = `<div class="map-detail-top"><strong>${escapeHtml(node.name)}</strong><button class="assignment-detail-close" type="button" data-map-close aria-label="Close file details">×</button></div><code class="map-detail-path">${escapeHtml(node.path)}</code>${purpose}<p class="map-detail-facts">${escapeHtml(facts)}</p>${touched}${fileList("Uses", importList)}${fileList("Used by", importerList)}${notes}`;
 }
 
 function renderCodeMap({ relayout = false } = {}) {
@@ -701,7 +825,7 @@ function renderCodeMap({ relayout = false } = {}) {
   const height = Math.max(260, Math.round(canvas.clientHeight) || 620);
   const size = `${width}x${height}`;
   if (relayout || !mapState.layout || mapState.size !== size) {
-    mapState.layout = layoutCodeMap(mapState.data, { width, height });
+    mapState.layout = layoutCodeMap(visibleMapData(mapState.data), { width, height });
     mapState.size = size;
     // A resize keeps the zoom the person chose; only the pan is pulled back inside the new box.
     mapView = clampMapView(mapView, width, height);
@@ -744,7 +868,7 @@ function showMapHover(node, event) {
   svg.querySelector(`[data-map-node="${CSS.escape(node.path)}"]`)?.classList.add("hovered");
   const links = node.degree ? `${node.degree} link${node.degree === 1 ? "" : "s"}` : "no imports";
   const extra = [links, node.touched ? `changed ${node.touched}× by this task` : null, node.notes.length ? `${node.notes.length} note${node.notes.length === 1 ? "" : "s"}` : null].filter(Boolean).join(" · ");
-  card.innerHTML = `<strong>${escapeHtml(node.name)}</strong><code>${escapeHtml(node.path)}</code><span>${escapeHtml(extra)}</span>`;
+  card.innerHTML = `<strong>${escapeHtml(node.name)}</strong><code>${escapeHtml(node.path)}</code>${node.summary ? `<em>${escapeHtml(node.summary)}</em>` : ""}<span>${escapeHtml(extra)}</span>`;
   card.classList.remove("hidden");
   // Beside the pointer, flipped to the other side near the right or bottom edge.
   const box = canvas.getBoundingClientRect();
@@ -777,6 +901,14 @@ $("#code-map-svg").addEventListener("keydown", (event) => {
   paintCodeMap();
 });
 $("#code-map-legend").addEventListener("click", (event) => {
+  if (event.target.closest("[data-map-tests]")) {
+    mapShowTests = !mapShowTests;
+    try { localStorage.setItem("devteam.mapTests", mapShowTests ? "show" : "hide"); } catch { /* private window */ }
+    mapSelected = null;
+    mapGroupFilter = null;
+    renderCodeMap({ relayout: true });
+    return;
+  }
   const chip = event.target.closest("[data-map-group]");
   if (!chip) return;
   mapGroupFilter = mapGroupFilter === chip.dataset.mapGroup ? null : chip.dataset.mapGroup;
@@ -784,6 +916,12 @@ $("#code-map-legend").addEventListener("click", (event) => {
   paintCodeMap();
 });
 $("#code-map-detail").addEventListener("click", (event) => {
+  const jump = event.target.closest("[data-map-jump]");
+  if (jump) {
+    mapSelected = jump.dataset.mapJump;
+    paintCodeMap();
+    return;
+  }
   if (!event.target.closest("[data-map-close]")) return;
   mapSelected = null;
   paintCodeMap();
@@ -1026,7 +1164,7 @@ function renderTask(task) {
   // Collapsed, this line is the whole board. It has to say enough that nobody opens it to find out
   // that nothing has changed — which a bare count of open notes never did, since a board of six
   // blocked notes counted zero.
-  $("#board-summary").textContent = boardSummary(task.assignments);
+  $("#board-summary").textContent = boardSummary(task.assignments, task.status, buildFlowModel(task.assignments || [], { taskStatus: task.status }));
   renderCurrentWork(task);
   renderAssignmentBoard(task);
   // A different task means a different set of touched files, and possibly a different project.
@@ -1288,8 +1426,8 @@ function populateMessageTargets(connected) {
   }
   const hint = $("#composer-hint");
   if (hint) hint.textContent = connected.length
-    ? "Delivered live to connected agents on their next check (about a minute)."
-    : "No agents connected yet — they will read this in the timeline when they join.";
+    ? "Agents in the room get this on their next check; one that is offline gets it when it rejoins."
+    : "No agent is connected — each one gets this when it joins the room.";
 }
 
 
@@ -1401,6 +1539,12 @@ document.addEventListener("click", async (event) => {
     form.dataset.projectId = project.id;
     form.elements.name.value = project.name;
     form.elements.root.value = project.root;
+    const team = project.team || {};
+    for (const role of ["planner", "implementer", "reviewer"]) form.elements[`team_${role}`].value = (team[role] || []).join(", ");
+    form.elements.soloReview.checked = Boolean(project.solo_review);
+    // Suggest the names agents have actually connected under, since that is what the team matches.
+    $("#known-agent-names").innerHTML = [...new Set((state.agents || []).map((agent) => agent.name))]
+      .map((name) => `<option value="${escapeHtml(name)}"></option>`).join("");
     $("#project-edit-dialog").showModal();
     return;
   }
@@ -1415,6 +1559,8 @@ document.addEventListener("click", async (event) => {
     }
     return;
   }
+  const cardAction = event.target.closest("[data-card-action]");
+  if (cardAction) { openCardDialog(cardAction.dataset.cardAction, cardAction.dataset.cardId); return; }
   const releaseButton = event.target.closest("[data-release]");
   if (releaseButton) {
     const title = releaseButton.dataset.releaseTitle;
@@ -1556,6 +1702,60 @@ function openTaskEditor() {
   $("#task-edit-dialog").showModal();
 }
 
+// One dialog for fixing a card. Reopen: who takes it and what they should know. Edit: its title,
+// description and addressee. Close: why, and optionally which card replaces it.
+function openCardDialog(mode, cardId) {
+  const task = state?.selectedTask;
+  const item = task?.assignments?.find((candidate) => String(candidate.id) === String(cardId));
+  if (!item) return;
+  const form = $("#card-form");
+  form.dataset.mode = mode;
+  form.dataset.cardId = item.id;
+  $("#card-dialog-eyebrow").textContent = { reopen: "REOPEN", edit: "EDIT CARD", close: "CLOSE CARD" }[mode];
+  $("#card-dialog-title").textContent = item.title;
+  for (const section of form.querySelectorAll("[data-card-mode]")) {
+    section.classList.toggle("hidden", !section.dataset.cardMode.split(" ").includes(mode));
+  }
+  form.elements.title.value = item.title;
+  form.elements.description.value = item.description || "";
+  form.elements.note.value = "";
+  form.elements.reason.value = "";
+  const names = [...new Set([
+    ...Object.entries(task.team || {}).filter(([key]) => key !== "soloReview").flatMap(([, list]) => list),
+    ...(state.agents || []).map((agent) => agent.name),
+    ...(item.target_agent_name ? [item.target_agent_name] : []),
+  ])].filter(Boolean);
+  form.elements.target.innerHTML = `<option value="">Anyone who may take it</option>${names.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")}`;
+  form.elements.target.value = item.target_agent_name || "";
+  const others = task.assignments.filter((candidate) => candidate.id !== item.id && ["queued", "claimed", "done"].includes(candidate.status));
+  form.elements.replacedBy.innerHTML = `<option value="">No replacement</option>${others.map((candidate) => `<option value="${escapeHtml(candidate.id)}">${escapeHtml(candidate.title)}</option>`).join("")}`;
+  $("#card-submit").textContent = { reopen: "Reopen card", edit: "Save card", close: "Close card" }[mode];
+  $("#card-submit").classList.toggle("danger-fill", mode === "close");
+  $("#card-dialog").showModal();
+}
+
+$("#card-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  const { mode, cardId } = form.dataset;
+  const taskId = state?.selectedTask?.id;
+  if (!taskId || !cardId) return;
+  const base = `/api/tasks/${taskId}/assignments/${cardId}`;
+  try {
+    if (mode === "reopen") {
+      await api(`${base}/reopen`, { method: "POST", body: JSON.stringify({ note: form.elements.note.value, targetAgentName: form.elements.target.value }) });
+    } else if (mode === "edit") {
+      await api(base, { method: "PATCH", body: JSON.stringify({ title: form.elements.title.value, description: form.elements.description.value, targetAgentName: form.elements.target.value }) });
+    } else {
+      if (!form.elements.reason.value.trim()) { toast("Say why this card is being closed"); return; }
+      await api(`${base}/close`, { method: "POST", body: JSON.stringify({ reason: form.elements.reason.value, replacedBy: form.elements.replacedBy.value || null }) });
+    }
+    form.closest("dialog").close();
+    await refresh();
+    toast({ reopen: "Card reopened", edit: "Card saved", close: "Card closed" }[mode]);
+  } catch (error) { toast(error.message); }
+});
+
 $("#edit-task").addEventListener("click", openTaskEditor);
 $("#edit-task-from-brief").addEventListener("click", () => {
   $("#task-brief-dialog").close();
@@ -1581,8 +1781,10 @@ $("#project-edit-form").addEventListener("submit", async (event) => {
   const projectId = form.dataset.projectId;
   if (!projectId) return;
   const values = Object.fromEntries(new FormData(form));
+  const names = (value) => String(value || "").split(",").map((name) => name.trim()).filter(Boolean);
+  const team = { planner: names(values.team_planner), implementer: names(values.team_implementer), reviewer: names(values.team_reviewer) };
   try {
-    await api(`/api/projects/${projectId}`, { method: "PATCH", body: JSON.stringify({ name: values.name, root: values.root }) });
+    await api(`/api/projects/${projectId}`, { method: "PATCH", body: JSON.stringify({ name: values.name, root: values.root, team, soloReview: form.elements.soloReview.checked }) });
     form.closest("dialog").close(); await refresh(); toast("Project updated");
   } catch (error) { toast(error.message); }
 });
@@ -1922,6 +2124,19 @@ function initPanelToggles() {
   sync(false);
 }
 
+// The page is long-lived; the server and its files are not. When the dashboard files change under a
+// running page — an update, or a restart onto new code — say so, rather than leaving the owner
+// looking at yesterday's markup and wondering why a fix did not land.
+async function checkForDashboardUpdate() {
+  try {
+    const latest = await api("/api/config");
+    if (config?.dashboardBuild && latest.dashboardBuild && latest.dashboardBuild !== config.dashboardBuild) {
+      $("#update-banner").classList.remove("hidden");
+    }
+  } catch { /* the server is restarting; the next check will see it */ }
+}
+$("#reload-dashboard").addEventListener("click", () => window.location.reload());
+
 async function boot() {
   initPanelToggles();
   initPanelResizers();
@@ -1929,6 +2144,9 @@ async function boot() {
     config = await api("/api/config"); $("#server-address").textContent = new URL(config.mcpUrl).host;
     await refresh();
     const stream = new EventSource("/api/stream"); stream.onmessage = () => refresh().catch(() => {});
+    // A reconnect is exactly when the server may have been restarted onto new files.
+    stream.onopen = () => checkForDashboardUpdate();
+    setInterval(checkForDashboardUpdate, 60_000);
     // Keep presence ("3s ago", pulse colour) live between server events.
     setInterval(() => { if (state) renderAgentList(); }, 5000);
   } catch (error) { toast(error.message); }

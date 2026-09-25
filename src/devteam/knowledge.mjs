@@ -676,7 +676,19 @@ export class KnowledgeVault {
       ORDER BY id ASC
     `).all(task.id);
     const decisions = events.filter((event) => event.type === "agent.decision");
-    const stops = events.filter((event) => ["assignment.blocked", "task.blocked"].includes(event.type));
+    // Where it stopped is where it *is*, not every block it ever passed through: Rebuild 9's page
+    // listed four misrouted-review refusals under a task that finished accepted. A finished task says
+    // it finished and how; an open one names what is still blocked or waiting.
+    const openCards = this.db.prepare(`
+      SELECT title, status FROM assignments WHERE task_id = ? AND status IN ('blocked', 'queued', 'claimed') ORDER BY created_at ASC
+    `).all(task.id);
+    const approval = this.db.prepare(`
+      SELECT metadata FROM events WHERE task_id = ? AND type = 'task.approved' ORDER BY id DESC LIMIT 1
+    `).get(task.id);
+    const approvalSummary = approval ? parseJson(approval.metadata, {})?.summary : null;
+    const stops = ["accepted", "cancelled"].includes(task.status)
+      ? [`${task.status === "accepted" ? "Accepted" : "Cancelled"} at version ${task.version}${approvalSummary ? `: ${short(approvalSummary, 240)}` : "."}`]
+      : openCards.map((card) => `${card.status === "blocked" ? "Blocked" : card.status === "claimed" ? "In progress" : "Waiting"}: ${short(card.title, 200)}`);
     // safeFiles, not the raw list: a report naming `.env` or `secrets/token.txt` must not put those
     // paths on a page that lands in the repository.
     const changed = safeFiles(events
@@ -694,7 +706,7 @@ export class KnowledgeVault {
       ...section("Learned", learned.map((note) => `- **${short(note.title, 160)}** — ${short(KnowledgeVault.headline(note.body), 240)}`),
         "- Nothing was recorded as learned here."),
       ...section("Decisions", decisions.map((event) => `- ${short(event.message, 240)}`), "- No decisions were recorded."),
-      ...section("Where it stopped", stops.map((event) => `- ${short(event.message, 240)}`), "- Nothing was reported blocked."),
+      ...section("Where it stopped", stops.map((line) => `- ${line}`), "- Nothing is open."),
       ...section("Files changed", changed.map((file) => `- \`${file}\``), "- No file changes were reported."),
       "",
     ].join("\n");

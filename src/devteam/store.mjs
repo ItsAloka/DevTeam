@@ -14,10 +14,11 @@ import { knowledgeMethods } from "./store-knowledge.mjs";
 import { consensusMethods } from "./store-consensus.mjs";
 import { viewMethods } from "./store-views.mjs";
 import { agentMethods } from "./store-agents.mjs";
+import { boardMethods } from "./store-board.mjs";
 import { CodeGraph } from "./codegraph.mjs";
 import { KnowledgeVault } from "./knowledge.mjs";
 import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
-import { normalizeRoleName, PLANNING_ROLE, roleBehaviour, roleCatalogue } from "./roles.mjs";
+import { normalizeRoleName, PLANNING_ROLE, ROLE_NAMES, roleBehaviour, roleCatalogue } from "./roles.mjs";
 import { hashToken, mintToken, normalizeTokenLabel, tokensMatch } from "./access.mjs";
 
 // A task in one of these states hands out no work; named once so the candidate scan and the
@@ -589,13 +590,53 @@ export class DevTeamStore extends EventEmitter {
       LEFT JOIN tasks t ON t.project_id = p.id
       GROUP BY p.id
       ORDER BY p.created_at ASC
-    `).all();
+    `).all().map((project) => ({ ...project, team: this.projectTeam(project.id) }));
+  }
+
+  // ---- The team: who does which role on this project ----
+  //
+  // Agent `capabilities` were recorded and never read, so the owner wrote "Claude implements, Codex
+  // plans and reviews" into every task description and the scheduler handed work out as if nobody
+  // had said anything. This is that sentence as data. A role nobody is named for stays open to the
+  // whole room, so a project that never sets a team behaves exactly as before.
+  projectTeam(projectId) {
+    const team = Object.fromEntries(ROLE_NAMES.map((role) => [role, []]));
+    for (const row of this.db.prepare("SELECT agent_name, role FROM project_team WHERE project_id = ? ORDER BY role, agent_name").all(projectId)) {
+      if (team[row.role]) team[row.role].push(row.agent_name);
+    }
+    return team;
+  }
+
+  // The team and the solo switch as one small object, for briefs and the dashboard.
+  teamSummary(projectId) {
+    const project = this.db.prepare("SELECT solo_review FROM projects WHERE id = ?").get(projectId);
+    return { ...this.projectTeam(projectId), soloReview: Boolean(project?.solo_review) };
+  }
+
+  #normalizeTeam(team) {
+    if (!team || typeof team !== "object" || Array.isArray(team)) throw new Error("team must map planner, implementer and reviewer to lists of agent names.");
+    const clean = {};
+    for (const [role, value] of Object.entries(team)) {
+      if (!ROLE_NAMES.includes(role)) throw new Error(`Unknown role "${role}". The roles are ${ROLE_NAMES.join(", ")}.`);
+      const names = (Array.isArray(value) ? value : String(value ?? "").split(","))
+        .map((name) => String(name ?? "").trim()).filter(Boolean);
+      const seen = new Set();
+      clean[role] = [];
+      for (const name of names) {
+        if (name.length > 80) throw new Error("An agent name is at most 80 characters.");
+        if (seen.has(name.toLowerCase())) continue;
+        seen.add(name.toLowerCase());
+        clean[role].push(name);
+      }
+      if (clean[role].length > 10) throw new Error("Name at most 10 agents for one role.");
+    }
+    return clean;
   }
 
   // Edit a project's display name and/or its root folder after creation. Changing the root is
   // validated for existence by the caller (server) and for uniqueness here (one project per root),
   // and re-initializes the knowledge vault against the new location. At least one field must change.
-  updateProject(projectId, { name = undefined, root = undefined } = {}) {
+  updateProject(projectId, { name = undefined, root = undefined, team = undefined, soloReview = undefined } = {}) {
     const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
     if (!project) throw new Error("Project not found.");
     const nextName = name === undefined ? project.name : String(name).trim();
@@ -605,7 +646,28 @@ export class DevTeamStore extends EventEmitter {
       const clash = this.db.prepare("SELECT id FROM projects WHERE root = ? AND id != ?").get(nextRoot, projectId);
       if (clash) throw new Error("Another project already uses that folder.");
     }
-    if (nextName === project.name && nextRoot === project.root) return project;
+    const nextTeam = team === undefined ? null : this.#normalizeTeam(team);
+    const nextSolo = soloReview === undefined ? Boolean(project.solo_review) : Boolean(soloReview);
+    if (nextTeam || nextSolo !== Boolean(project.solo_review)) {
+      this._transaction(() => {
+        this.db.prepare("UPDATE projects SET solo_review = ? WHERE id = ?").run(nextSolo ? 1 : 0, projectId);
+        if (nextTeam) {
+          const insert = this.db.prepare("INSERT OR IGNORE INTO project_team (project_id, agent_name, role) VALUES (?, ?, ?)");
+          for (const [role, names] of Object.entries(nextTeam)) {
+            this.db.prepare("DELETE FROM project_team WHERE project_id = ? AND role = ?").run(projectId, role);
+            for (const agentName of names) insert.run(projectId, agentName, role);
+          }
+        }
+      });
+      if (Boolean(project.solo_review) && !nextSolo) {
+        const openTasks = this.db.prepare("SELECT id FROM tasks WHERE project_id = ? AND status NOT IN ('accepted', 'blocked', 'cancelled')").all(projectId);
+        this._transaction(() => { for (const openTask of openTasks) this._releaseAuthorTargets(openTask.id); });
+      }
+      this._changed("project.updated");
+    }
+    if (nextName === project.name && nextRoot === project.root) {
+      return { ...this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId), team: this.projectTeam(projectId) };
+    }
     this.db.prepare("UPDATE projects SET name = ?, root = ? WHERE id = ?").run(nextName, nextRoot, projectId);
     // A check allowlist is approved against the tree it was reviewed in. Repointing the root would
     // otherwise silently start executing those commands somewhere the human never looked.
@@ -617,7 +679,7 @@ export class DevTeamStore extends EventEmitter {
       catch (error) { this.codegraphErrors.set(`project:${projectId}`, { message: error.message, at: now() }); }
     }
     this._changed("project.updated");
-    return this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
+    return { ...this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId), team: this.projectTeam(projectId) };
   }
 
   // ---- Domains: the vocabulary IS the checklists directory ----
@@ -948,23 +1010,49 @@ export class DevTeamStore extends EventEmitter {
     // is claimed, so an older open one already covers the newer version. A request naming a different
     // reviewer is not a duplicate — the planner wants that specific independent teammate.
     if (behaviour.verifies) {
-      const existing = this.db.prepare(`
-        SELECT * FROM assignments
-        WHERE task_id = ? AND verifies = 1 AND lower(role) = lower(?) AND lower(title) = lower(?)
-          AND COALESCE(review_subject_assignment_id, '') = COALESCE(?, '')
-          AND (? IS NULL OR lower(COALESCE(target_agent_name, '')) = lower(?))
-          AND status IN ('queued', 'claimed', 'verifying')
-        ORDER BY created_at ASC LIMIT 1
-      `).get(taskId, assignment.role, assignment.title, reviewSubjectId, assignment.targetAgentName, assignment.targetAgentName);
+      // With a subject, any open review of that same work is the review — whatever it is titled.
+      // "Review X", "Review X (Codex)" and "Re-review X" were three cards for one job on Stuff
+      // Downloader's boards. Naming a different reviewer re-addresses the open card instead of adding
+      // a second one; without a subject the old title rule still applies.
+      const existing = reviewSubjectId
+        ? this.db.prepare(`
+            SELECT * FROM assignments
+            WHERE task_id = ? AND verifies = 1 AND review_subject_assignment_id = ? AND status IN ('queued', 'claimed')
+            ORDER BY created_at ASC LIMIT 1
+          `).get(taskId, reviewSubjectId)
+        : this.db.prepare(`
+            SELECT * FROM assignments
+            WHERE task_id = ? AND verifies = 1 AND lower(role) = lower(?) AND lower(title) = lower(?)
+              AND review_subject_assignment_id IS NULL
+              AND (? IS NULL OR lower(COALESCE(target_agent_name, '')) = lower(?))
+              AND status IN ('queued', 'claimed', 'verifying')
+            ORDER BY created_at ASC LIMIT 1
+          `).get(taskId, assignment.role, assignment.title, assignment.targetAgentName, assignment.targetAgentName);
       if (existing) {
+        let readdressed = false;
+        if (reviewSubjectId && existing.status === "queued" && assignment.targetAgentName
+          && String(existing.target_agent_name || "").toLowerCase() !== assignment.targetAgentName.toLowerCase()) {
+          this._transaction(() => {
+            this.db.prepare("UPDATE assignments SET target_agent_name = ? WHERE id = ?").run(assignment.targetAgentName, existing.id);
+            this._event(taskId, agentId, "assignment.edited", `“${existing.title}” is now addressed to ${assignment.targetAgentName}.`, {
+              assignmentId: existing.id, changed: ["targetAgentName"], targetAgentName: assignment.targetAgentName,
+            });
+            this._releaseAuthorTargets(taskId);
+          });
+          this._changed("assignment.edited", taskId);
+          readdressed = true;
+        }
+        const current = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(existing.id);
         return {
-          ...existing,
+          ...current,
           checklist: this._checklistFor(existing.id),
           writePaths: this._writeScopeFor(existing.id),
           dependsOn: this._dependenciesFor(existing.id).map((dependency) => dependency.id),
           duplicateOf: existing.id,
           created: false,
-          message: `An open ${existing.role} assignment with this title and subject already exists; reusing “${existing.title}”. Its own description and checklist apply, not the ones in this request.`,
+          message: readdressed
+            ? `An open review of that work already exists (“${existing.title}”); it is now addressed to ${assignment.targetAgentName} instead of adding a second card.`
+            : `An open ${existing.role} assignment for this work already exists; reusing “${existing.title}”. Its own description and checklist apply, not the ones in this request.`,
         };
       }
     }
@@ -1008,6 +1096,7 @@ export class DevTeamStore extends EventEmitter {
         dependsOn: dependencyIds,
         ...(assignmentDomains.length ? { domains: assignmentDomains } : {}),
       });
+      if (behaviour.verifies && assignment.targetAgentName) this._releaseAuthorTargets(taskId);
     });
     this._changed("assignment.created", taskId);
     return { ...this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignment.id), checklist: resolvedChecklist || [], writePaths, dependsOn: dependencyIds, domains: assignmentDomains };
@@ -1076,6 +1165,20 @@ export class DevTeamStore extends EventEmitter {
         params: [agentName, reconnectGraceCutoff()],
       },
       {
+        // The project's team decides who does which role. A role nobody is named for stays open to
+        // the room. A named role is done only by the agents named for it — or by whoever the card is
+        // explicitly addressed to, because addressing it is the planner or the human choosing. The
+        // targeting rule above still returns an absent target's card to the queue; this is what
+        // stops the queue handing a review meant for Codex to whichever agent happens to be online.
+        code: "role_not_on_team",
+        sql: `(
+            NOT EXISTS (SELECT 1 FROM project_team team WHERE team.project_id = t.project_id AND team.role = a.role)
+            OR EXISTS (SELECT 1 FROM project_team team WHERE team.project_id = t.project_id AND team.role = a.role AND team.agent_name = ?)
+            OR lower(COALESCE(a.target_agent_name, '')) = lower(?)
+          )`,
+        params: [agentName, agentName],
+      },
+      {
         code: "room_invitation_only",
         sql: memberRoomList
           ? `(a.task_id IN (${memberRoomList}) OR lower(a.target_agent_name) = lower(?))`
@@ -1128,7 +1231,7 @@ export class DevTeamStore extends EventEmitter {
   // Which of the scan's predicates this one assignment fails, evaluated with the very SQL the scan
   // composes. Agent-scoped predicates are skipped when there is no agent to scope them to.
   #failedClaimPredicates(assignment, agent) {
-    const AGENT_SCOPED = ["room_not_claimable", "room_invitation_only", "targeted_elsewhere"];
+    const AGENT_SCOPED = ["room_not_claimable", "room_invitation_only", "targeted_elsewhere", "role_not_on_team"];
     const predicates = this.#claimPredicates(agent
       ? {
         agentName: agent.name,
@@ -1388,6 +1491,21 @@ export class DevTeamStore extends EventEmitter {
       // sit claimable-by-nobody. Reported anyway, because "nobody named X is here" explains a lot.
       add("target_absent", `Targeted at “${targetName}”, who is not connected; any member of the room may claim it.`, { targetAgentName: targetName }, false);
     }
+    if (failed.has("role_not_on_team")) {
+      const names = this.projectTeam(assignment.project_id)[assignment.role] || [];
+      add("role_not_on_team", `On this project, ${assignment.role} work is done by ${names.join(", ")}, and “${agent.name}” is not one of them. The owner sets this in the project's team.`,
+        { role: assignment.role, team: names });
+    }
+    if (!agent) {
+      // The card-level answer to "who is this waiting for?": everyone allowed to take it is away.
+      // Not blocking, for the same reason an absent target is not — the named agent may connect the
+      // next second — but it is the one sentence that explains an idle board.
+      const waitingFor = this._absentClaimants(assignment, { includeReviewers: false });
+      if (waitingFor) {
+        add("waiting_for_team", `Waiting for ${waitingFor.join(" or ")} to connect: on this project only they take ${assignment.role} work.`,
+          { waitingFor, role: assignment.role }, false);
+      }
+    }
     // An invitation authorizes exactly the item(s) addressed to this agent by name and nothing else
     // in that room. Skipped for an agent that is not in the room at all: it already heard that, and
     // hearing "your invitation does not stretch this far" on top of it would be untrue.
@@ -1407,7 +1525,9 @@ export class DevTeamStore extends EventEmitter {
     // which the scan's single query can see, so it is resolved here exactly as the scan resolves it.
     if (assignment.verifies) {
       if (agent && this._verifierIsAuthor(agent.id, assignment)) {
-        add("verifier_is_author", `“${agent.name}” wrote version ${assignment.task_version}, so it cannot verify it; an independent teammate is free to take this one.`,
+        add("verifier_is_author", this._soloReviewAllowed(assignment.task_id)
+          ? `“${agent.name}” wrote version ${assignment.task_version}, so it cannot verify it; an independent teammate is free to take this one.`
+          : `“${agent.name}” wrote version ${assignment.task_version}, so it cannot review it. Solo mode is off on this project, so the review waits for someone who did not write the code.`,
           { version: assignment.task_version });
       } else if (!agent) {
         // The dashboard asks about the item rather than about a claimant, and "the people in this
@@ -1419,9 +1539,12 @@ export class DevTeamStore extends EventEmitter {
         const authors = this._reviewAuthors(assignment);
         const connected = this._connectedParticipants(assignment.task_id);
         const excluded = [...connected].filter((agentId) => authors.has(agentId));
-        if (excluded.length && this._independentClaimantExists(assignment, authors, null)) {
-          add("verifier_is_author", `Held for an independent teammate: ${excluded.length} of the contributors in this room wrote version ${assignment.task_version} and cannot verify their own work.`,
-            { version: assignment.task_version, excludedAuthors: excluded.length }, false);
+        const independentReady = this._independentClaimantExists(assignment, authors, null);
+        if (excluded.length && (independentReady || !this._soloReviewAllowed(assignment.task_id))) {
+          add("verifier_is_author", independentReady
+            ? `Held for an independent teammate: ${excluded.length} of the contributors in this room wrote version ${assignment.task_version} and cannot verify their own work.`
+            : `Waiting for an independent reviewer: the contributors connected now wrote version ${assignment.task_version}, and solo mode is off on this project.`,
+          { version: assignment.task_version, excludedAuthors: excluded.length }, false);
         }
       }
     }
@@ -1461,6 +1584,80 @@ export class DevTeamStore extends EventEmitter {
       claimable: reasons.every((reason) => !reason.blocking),
       reasons,
     };
+  }
+
+  // A review addressed to the agent who wrote what it reviews can never be done by that agent while
+  // solo mode is off — and while that agent is connected, its address keeps everyone else off the
+  // card too, so nobody at all can take it. The randomized scheduler suite found this on its first
+  // run with solo mode off. Authorship only changes when work is reported, so the address is checked
+  // then (and when a review is created, or solo mode is switched off): if it names an author it is
+  // dropped, the timeline says why, and the review returns to whoever may take it.
+  _releaseAuthorTargets(taskId) {
+    if (this._soloReviewAllowed(taskId)) return [];
+    const task = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(taskId);
+    if (!task) return [];
+    const nameOf = this.db.prepare("SELECT name FROM agents WHERE id = ?");
+    const released = [];
+    const reviews = this.db.prepare(`
+      SELECT * FROM assignments
+      WHERE task_id = ? AND status = 'queued' AND verifies = 1 AND target_agent_name IS NOT NULL
+    `).all(taskId);
+    for (const review of reviews) {
+      const authors = this._reviewAuthors({ ...review, task_version: task.version });
+      const authorNames = new Set([...authors].map((id) => String(nameOf.get(id)?.name || "").toLowerCase()));
+      if (!authorNames.has(review.target_agent_name.toLowerCase())) continue;
+      this.db.prepare("UPDATE assignments SET target_agent_name = NULL WHERE id = ?").run(review.id);
+      this._event(taskId, null, "assignment.retargeted",
+        `“${review.title}” was addressed to ${review.target_agent_name}, who wrote the work it reviews. It is now open to any reviewer who did not.`,
+        { assignmentId: review.id, previousTarget: review.target_agent_name, reason: "target_is_author" });
+      released.push(review.id);
+    }
+    return released;
+  }
+
+  // Everyone who may take this card, when every one of them is away: the team named for its role
+  // (plus an explicit addressee), or — for a review with solo mode off — "an independent reviewer"
+  // when nobody connected could take it without reviewing their own work. Null when someone present
+  // could take it, or when the role is open to the whole room.
+  _absentClaimants(assignment, { includeReviewers = true } = {}) {
+    const projectId = assignment.project_id
+      || this.db.prepare("SELECT project_id FROM tasks WHERE id = ?").get(assignment.task_id)?.project_id;
+    const names = [...(this.projectTeam(projectId)[assignment.role] || [])];
+    if (names.length) {
+      const target = assignment.target_agent_name;
+      if (target && !names.some((name) => name.toLowerCase() === target.toLowerCase())) names.push(target);
+      const present = this.db.prepare(`SELECT 1 FROM agents present WHERE ${PRESENT_BY_NAME_SQL} LIMIT 1`);
+      const cutoff = reconnectGraceCutoff();
+      return names.some((name) => present.get(name, cutoff)) ? null : names;
+    }
+    if (includeReviewers && assignment.verifies && !this._soloReviewAllowed(assignment.task_id)) {
+      const withVersion = assignment.task_version === undefined
+        ? { ...assignment, task_version: this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(assignment.task_id).version }
+        : assignment;
+      const authors = this._reviewAuthors(withVersion);
+      if (authors.size && !this._independentClaimantExists(withVersion, authors, null)) return ["an independent reviewer"];
+    }
+    return null;
+  }
+
+  // Queued work in this agent's rooms that only somebody who is away may take. An agent looking at
+  // nothing but this is not "waiting for work" — it is waiting for a teammate the owner has to bring
+  // back, and polling devteam_next every 45 seconds until then only spends the owner's tokens.
+  workWaitingOnAbsentTeammates(agentId) {
+    const rooms = this._memberTaskIds(agentId);
+    if (!rooms.length) return [];
+    const queued = this.db.prepare(`
+      SELECT a.*, t.project_id, t.version AS task_version FROM assignments a JOIN tasks t ON t.id = a.task_id
+      WHERE a.status = 'queued' AND a.task_id IN (${rooms.map(() => "?").join(", ")})
+        AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
+      ORDER BY a.created_at ASC
+    `).all(...rooms);
+    const waiting = [];
+    for (const assignment of queued) {
+      const waitingFor = this._absentClaimants(assignment);
+      if (waitingFor) waiting.push({ assignmentId: assignment.id, taskId: assignment.task_id, title: assignment.title, role: assignment.role, waitingFor });
+    }
+    return waiting;
   }
 
   // "There is work on the board and I am doing nothing" — answered in one call. Every queued item
@@ -1889,21 +2086,24 @@ export class DevTeamStore extends EventEmitter {
         version,
         ...(unverifiedFiles.length ? { unverifiedFiles } : {}),
       });
+      this._releaseAuthorTargets(assignment.task_id);
+      if (status !== "blocked") this._rearmIfSubjectSentBack(assignment, { reviewerName: agent.name, stamp });
       if (status === "blocked") {
         // An assignment-level blocker is a triage signal, not permission to stop every teammate.
         // Queue a fresh planner item so the team can re-scope or ask the human while sibling work
         // and write leases continue. Only the explicit blockTask/devteam_stuck path is task-wide.
         followUpAssignmentId = randomUUID();
         this.db.prepare(`
-          INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at, plans)
-          VALUES (?, ?, ?, ?, ?, 0, 'queued', ?, 1)
+          INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at, plans, resolves_assignment_id)
+          VALUES (?, ?, ?, ?, ?, 0, 'queued', ?, 1, ?)
         `).run(
           followUpAssignmentId,
           assignment.task_id,
           `Resolve blocker: ${assignment.title}`,
-          `Review the blocker reported for "${assignment.title}": ${message.trim()}. Re-scope the work, create a replacement assignment, or use devteam_stuck only if the entire task genuinely requires human input.`,
+          `Decide the blocked card "${assignment.title}" (${assignment.id}): ${message.trim()}. Fix the card itself rather than copying it: devteam_plan action=reopen (optionally re-addressed, with a note), action=edit, or action=close with replacedBy. Use devteam_stuck only if the entire task genuinely requires human input.`,
           PLANNING_ROLE,
           stamp,
+          assignment.id,
         );
         this._event(assignment.task_id, agentId, "assignment.created", `Resolve blocker: ${assignment.title}`, {
           assignmentId: followUpAssignmentId,
@@ -2241,4 +2441,4 @@ export class DevTeamStore extends EventEmitter {
 // that every call site — inside this file and out — reads exactly as it did when they were declared
 // here. Order does not matter: no two mixins define the same name.
 Object.assign(DevTeamStore.prototype,
-  checksMethods, knowledgeMethods, consensusMethods, viewMethods, agentMethods);
+  checksMethods, knowledgeMethods, consensusMethods, viewMethods, agentMethods, boardMethods);

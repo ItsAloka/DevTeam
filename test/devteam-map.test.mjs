@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { DevTeamStore } from "../src/devteam/store.mjs";
 import { normalizeMapPath } from "../src/devteam/store-views.mjs";
-import { layoutCodeMap, mapGroupOf } from "../public/ui-utils.js";
+import { isTestPath, layoutCodeMap, mapGroupLabel, mapGroupOf, mapGrouping } from "../public/ui-utils.js";
 
 // The graph rows are written by hand here rather than indexed, so the fixtures stay small and say
 // exactly what each test is about. The indexer has its own tests; this file is about what the map
@@ -52,6 +52,31 @@ test("a file belongs to its top level folder, and a file at the root belongs to 
   assert.equal(mapGroupOf("problems.md"), "/");
   assert.equal(mapGroupOf("/leading/slash.ts"), "leading");
   assert.equal(mapGroupOf(""), "/");
+});
+
+// Stuff Downloader drew as two colours, "src" and "tests", which said nothing about where core ends
+// and the GUI begins. A folder holding most of the files is split into the areas under it.
+test("a folder holding most of the project is split into the areas a human would name", () => {
+  const paths = [
+    ...Array.from({ length: 14 }, (unused, index) => `src/app/core/c${index}.py`),
+    ...Array.from({ length: 6 }, (unused, index) => `src/app/gui/g${index}.py`),
+    "src/app/__init__.py", "src/worker/w.py", "plan.md",
+  ];
+  const grouping = mapGrouping(paths);
+  assert.equal(grouping.get("src/app/core/c0.py"), "src/app/core");
+  assert.equal(grouping.get("src/app/gui/g0.py"), "src/app/gui");
+  assert.equal(grouping.get("src/app/__init__.py"), "src/app", "a file directly in a split folder stays in it");
+  assert.equal(grouping.get("src/worker/w.py"), "src/worker");
+  assert.equal(grouping.get("plan.md"), "/");
+  assert.equal(mapGroupLabel("src/app/core"), "app/core", "a leading src/ is not repeated on every area");
+  assert.equal(mapGroupLabel("/"), "root files");
+  const small = mapGrouping(["a/x.py", "b/y.py"]);
+  assert.equal(small.get("a/x.py"), "a", "a small project keeps its top-level folders");
+});
+
+test("test files are recognised by the conventions every ecosystem here uses", () => {
+  for (const file of ["tests/unit/test_a.py", "test/devteam-ui.test.mjs", "src/a_test.go", "web/app.spec.ts", "pkg/__tests__/x.js"]) assert.ok(isTestPath(file), file);
+  for (const file of ["src/app/core/a.py", "public/app.js", "docs/testing.md", "src/latest.py"]) assert.ok(!isTestPath(file), file);
 });
 
 test("the map carries the code, the notes that name files, and the files this task changed", () => withStore((store, root) => {
@@ -165,7 +190,10 @@ test("a hub does not crush the files that import it into a dot", () => {
   const spoke = layout.nodes.filter((node) => /^backend\/src\/mod-/.test(node.path));
   const hub = layout.nodes.find((node) => node.path === "backend/src/schema.ts");
   const spread = Math.max(...spoke.map((node) => Math.hypot(node.x - hub.x, node.y - hub.y)));
-  assert.ok(spread > 120, `the hub's importers should occupy a region, not a dot (spread ${spread.toFixed(0)}px)`);
+  // The failure this guards was ~35px from the hub. Since a folder holding most of a project is split
+  // into its areas, the forty unconnected docs no longer share the hub's area, so its importers sit a
+  // little tighter (~110px) — still a region several times the size of the old dot.
+  assert.ok(spread > 100, `the hub's importers should occupy a region, not a dot (spread ${spread.toFixed(0)}px)`);
 });
 
 test("files of the same folder are drawn nearer each other than files of different folders", () => {
@@ -181,8 +209,10 @@ test("files of the same folder are drawn nearer each other than files of differe
     }
   }
   assert.ok(mean(within) < mean(across), `folders should read as regions (${mean(within).toFixed(0)}px within vs ${mean(across).toFixed(0)}px across)`);
-  assert.deepEqual(layout.groups.map((group) => group.name), ["backend", "frontend"]);
-  assert.equal(layout.groups.find((group) => group.name === "backend").count, 131);
+  // backend/ holds 81% of the files, so it is split into the areas under it; frontend/ is not.
+  assert.deepEqual(layout.groups.map((group) => group.name), ["backend/docs", "backend/src", "frontend"]);
+  assert.equal(layout.groups.find((group) => group.name === "backend/src").count, 91);
+  for (const group of layout.groups) assert.ok(Number.isFinite(group.labelX) && Number.isFinite(group.labelY), `${group.name} has a place for its name`);
 });
 
 test("the same project draws the same picture every time", () => {
@@ -209,7 +239,7 @@ test("what the team touched and wrote down is carried onto the map", () => {
   // An import touching the task's work is marked so the picture can say where the work landed.
   assert.ok(layout.edges.some((edge) => edge.live), "imports into a changed file are flagged");
   assert.ok(layout.edges.every((edge) => edge.live === (edge.from === "backend/src/schema.ts" || edge.to === "backend/src/schema.ts")));
-  assert.equal(layout.groups.find((group) => group.name === "backend").touched, 1);
+  assert.equal(layout.groups.find((group) => group.name === "backend/src").touched, 1);
 });
 
 test("labels never sit on top of one another", () => {

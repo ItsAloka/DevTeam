@@ -314,3 +314,68 @@ test("the graph will not write into a knowledge vault another project has claime
   assert.equal(second.vaultOwner, "Somebody else", "and names who it stood down for");
   assert.deepEqual(await readdir(path.join(projectRoot, "knowledge", "graph")), before, "nothing on disk moved");
 });
+
+// Stuff Downloader drew its tests as an island and its biggest file with no link to the modules it
+// used most: `from ..core import engine_update` linked only core/__init__.py, and
+// `import stuff_downloader.core` from tests/ resolved against nothing because the package lives in src/.
+test("python modules imported from a package, and a src-layout package, are real edges", async (t) => {
+  const { store, project } = await fixture(t, {
+    "src/app/__init__.py": "",
+    "src/app/core/__init__.py": "",
+    "src/app/core/updates.py": '"""Find newer engine versions."""\n',
+    "src/app/core/settings.py": "",
+    "src/app/gui/__init__.py": "",
+    "src/app/gui/main_window.py": "from ..core import updates, settings as config\nfrom ..core import (\n    updates as again,\n)\n",
+    "tests/unit/test_updates.py": "from app.core import updates\nimport app.core.settings\n",
+  });
+  const found = edges(store, project.id);
+  const has = (from, to) => found.some((edge) => edge.from_path === from && edge.to_path === to);
+  assert.ok(has("src/app/gui/main_window.py", "src/app/core/updates.py"), "a module named in `from pkg import` is an edge to that module");
+  assert.ok(has("src/app/gui/main_window.py", "src/app/core/settings.py"), "including one imported under another name");
+  assert.ok(has("tests/unit/test_updates.py", "src/app/core/updates.py"), "a test reaches a src-layout package");
+  assert.ok(has("tests/unit/test_updates.py", "src/app/core/settings.py"));
+  const updates = modules(store, project.id).find((module) => module.path === "src/app/core/updates.py");
+  assert.equal(updates.summary, "Find newer engine versions.", "a module's docstring is its purpose line");
+  assert.ok(!JSON.parse(modules(store, project.id).find((module) => module.path === "src/app/gui/main_window.py").dependencies).some((dependency) => dependency.includes(":")),
+    "a guessed member is never listed as a dependency");
+});
+
+test("a listing file such as a licence names every file and imports none of them", async (t) => {
+  const { store, project } = await fixture(t, {
+    "src/a.py": "",
+    "THIRD_PARTY_LICENSES.txt": "Used by src/a.py and README.md\n",
+    "notes.txt": "See src/a.py\n",
+  });
+  const found = edges(store, project.id);
+  assert.ok(!found.some((edge) => edge.from_path === "THIRD_PARTY_LICENSES.txt"), "a licence draws no lines");
+  assert.ok(found.some((edge) => edge.from_path === "notes.txt" && edge.to_path === "src/a.py"), "ordinary prose still does");
+});
+
+test("a card's own words choose the files its brief shows first, each with its purpose", async (t) => {
+  const files = { "src/billing/invoice.py": '"""Turn orders into invoices."""\n' };
+  for (let index = 0; index < 30; index += 1) files[`src/misc/helper_${index}.py`] = "from ..billing import invoice\n";
+  const { store, project } = await fixture(t, files);
+  const task = store.createTask({ projectId: project.id, title: "Invoices", description: "Round invoice totals." });
+  const card = store.createAssignment({ taskId: task.id, title: "Round invoice totals to cents", description: "The invoice module adds floats.", role: "implementer" });
+  const context = store.codegraph.codeContext(task.id, { assignmentId: card.id });
+  assert.equal(context[0].path, "src/billing/invoice.py", "the file the card is about comes first");
+  assert.equal(context[0].purpose, "Turn orders into invoices.");
+});
+
+test("in a git repository, files the project ignores stay off the map", async (t) => {
+  const { execFileSync } = await import("node:child_process");
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-codegraph-git-"));
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-codegraph-git-data-"));
+  let store = null;
+  t.after(async () => { store?.close(); await rm(projectRoot, { recursive: true, force: true }); await rm(dataDir, { recursive: true, force: true }); });
+  try { execFileSync("git", ["init", "-q", projectRoot], { stdio: "ignore" }); } catch { t.skip("git is not installed"); return; }
+  await put(projectRoot, ".gitignore", "*.egg-info/\nvendor/\n");
+  await put(projectRoot, "src/app.py", "import helper\n");
+  await put(projectRoot, "src/helper.py", "");
+  await put(projectRoot, "src/app.egg-info/SOURCES.txt", "src/app.py\nsrc/helper.py\n");
+  await put(projectRoot, "vendor/lib.py", "");
+  store = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: true } });
+  const project = store.ensureProject("Git project", projectRoot);
+  const paths = modules(store, project.id).map((module) => module.path);
+  assert.deepEqual(paths.filter((file) => file.endsWith(".py") || file.endsWith(".txt")), ["src/app.py", "src/helper.py"], "untracked-but-not-ignored files are indexed; ignored ones are not");
+});

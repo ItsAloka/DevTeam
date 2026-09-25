@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   lstatSync,
@@ -10,7 +11,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 import { atomicWrite, redact, secretLike, slugify, vaultOwner } from "./knowledge.mjs";
-import { buildParserRegistry, MAX_EXPORTS, MAX_IMPORTS, MAX_SPECIFIER_LENGTH, MAX_SYMBOL_LENGTH } from "./parsers.mjs";
+import { buildParserRegistry, MAX_EXPORTS, MAX_IMPORTS, MAX_SPECIFIER_LENGTH, MAX_SUMMARY_LENGTH, MAX_SYMBOL_LENGTH, PARSER_VERSION } from "./parsers.mjs";
 
 // Which file types are artifacts, and how each is read, now comes from the parser registry rather
 // than a JS/TS list here. See parsers.mjs for the interface and why every parser is a bounded regex.
@@ -39,11 +40,12 @@ function languageFor(file) {
 // the registry, which is what the scanner uses.
 function parseSource(source, filePath = "file.mjs") {
   const parser = REGISTRY.for(filePath);
-  if (!parser) return { exports: [], imports: [], dependencies: [] };
+  if (!parser) return { exports: [], imports: [], dependencies: [], summary: "" };
   const parsed = parser.parse(source, filePath);
   return {
     exports: parsed.exports,
     imports: parsed.imports,
+    summary: parsed.summary || "",
     // What counts as "outside the project" is the parser's call: `./x` in JavaScript, a leading dot
     // in Python, and nothing at all in prose, where every specifier is a path.
     dependencies: parsed.imports.filter((specifier) => parser.external(specifier)),
@@ -118,8 +120,16 @@ export class CodeGraph {
       CREATE INDEX IF NOT EXISTS idx_code_edges_to ON code_edges(project_id, to_path);
     `);
     const moduleColumns = new Set(this.db.prepare("PRAGMA table_info(code_modules)").all().map((column) => column.name));
-    for (const [name, ddl] of [["size", "INTEGER NOT NULL DEFAULT 0"], ["mtime_ms", "INTEGER NOT NULL DEFAULT 0"]]) {
+    for (const [name, ddl] of [["size", "INTEGER NOT NULL DEFAULT 0"], ["mtime_ms", "INTEGER NOT NULL DEFAULT 0"], ["summary", "TEXT"]]) {
       if (!moduleColumns.has(name)) this.db.exec(`ALTER TABLE code_modules ADD COLUMN ${name} ${ddl}`);
+    }
+    // Stored modules were parsed by an older parser. Their bytes have not changed, so the hash check
+    // would keep them forever; forget the hash and size instead, and the next reconcile reads every
+    // file again with the current parser.
+    const version = this.db.prepare("SELECT value FROM metadata WHERE key = 'codegraph_parser_version'").get()?.value;
+    if (String(version) !== String(PARSER_VERSION)) {
+      this.db.exec("UPDATE code_modules SET hash = '', size = -1; UPDATE code_graph_state SET dirty = 1;");
+      this.db.prepare("INSERT INTO metadata (key, value) VALUES ('codegraph_parser_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(String(PARSER_VERSION));
     }
     const columns = new Set(this.db.prepare("PRAGMA table_info(code_graph_state)").all().map((column) => column.name));
     for (const [name, ddl] of [
@@ -170,8 +180,39 @@ export class CodeGraph {
     return secretLike(normalized) ? null : normalized;
   }
 
+  // What git says belongs to the project: tracked files plus untracked ones that are not ignored.
+  // The project's own .gitignore is the best statement there is of what is source and what is build
+  // output — `*.egg-info/`, `tools/`, a vendored folder — and a hard-coded list of names can only ever
+  // approximate it. Null when the folder is not a git repository or git is not installed.
+  #gitFiles(realRoot) {
+    try {
+      const output = execFileSync("git", ["-C", realRoot, "ls-files", "--cached", "--others", "--exclude-standard", "-z"], {
+        encoding: "utf8", maxBuffer: 32 * 1024 * 1024, timeout: 15_000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true,
+      });
+      return new Set(output.split("\0").filter(Boolean).map(posix));
+    } catch {
+      return null;
+    }
+  }
+
+  // The subset of these paths git ignores, for files named in a report rather than found by a scan.
+  #gitIgnored(realRoot, paths) {
+    if (!paths.length) return new Set();
+    try {
+      const output = execFileSync("git", ["-C", realRoot, "check-ignore", "-z", "--stdin"], {
+        input: paths.join("\0"), encoding: "utf8", timeout: 15_000, stdio: ["pipe", "pipe", "ignore"], windowsHide: true,
+      });
+      return new Set(output.split("\0").filter(Boolean).map(posix));
+    } catch {
+      // Exit status 1 means "none of them are ignored"; any other failure means git could not answer,
+      // and a file is then indexed as it always was.
+      return new Set();
+    }
+  }
+
   #inventory(projectId) {
     const { project, realRoot } = this.#projectRoot(projectId);
+    const tracked = this.#gitFiles(realRoot);
     const files = [];
     const visited = new Set([realRoot]);
     const walk = (directory) => {
@@ -196,6 +237,7 @@ export class CodeGraph {
         if (!this.#insideRoot(realRoot, realFile)) continue;
         const relative = posix(path.relative(realRoot, realFile));
         if (!relative || relative.startsWith("..") || path.posix.isAbsolute(relative) || secretLike(relative)) continue;
+        if (tracked && !tracked.has(relative)) continue;
         files.push({ path: relative, absolute: realFile, size: info.size, mtimeMs: Math.trunc(info.mtimeMs) });
       }
     };
@@ -224,6 +266,7 @@ export class CodeGraph {
       exports: parsed.exports,
       dependencies: parsed.dependencies,
       imports: parsed.imports,
+      summary: safeString(parsed.summary, MAX_SUMMARY_LENGTH) || null,
       loc: source.length ? source.split(/\r?\n/).length : 0,
       updatedAt: now(),
     };
@@ -231,16 +274,16 @@ export class CodeGraph {
 
   #upsertModule(projectId, module) {
     this.db.prepare(`
-      INSERT INTO code_modules (id, project_id, path, language, hash, size, mtime_ms, exports, dependencies, loc, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO code_modules (id, project_id, path, language, hash, size, mtime_ms, exports, dependencies, loc, updated_at, summary)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(project_id, path) DO UPDATE SET id = excluded.id, language = excluded.language,
         hash = excluded.hash, size = excluded.size, mtime_ms = excluded.mtime_ms, exports = excluded.exports,
-        dependencies = excluded.dependencies, loc = excluded.loc, updated_at = excluded.updated_at
+        dependencies = excluded.dependencies, loc = excluded.loc, updated_at = excluded.updated_at, summary = excluded.summary
     `).run(module.id, projectId, module.path, module.language, module.hash, module.size, module.mtimeMs,
-      JSON.stringify(module.exports), JSON.stringify(module.dependencies), module.loc, module.updatedAt);
+      JSON.stringify(module.exports), JSON.stringify(module.dependencies), module.loc, module.updatedAt, module.summary ?? null);
     this.db.prepare("DELETE FROM code_imports WHERE project_id = ? AND from_path = ?").run(projectId, module.path);
     const insert = this.db.prepare("INSERT OR IGNORE INTO code_imports (project_id, from_path, specifier, kind, is_bare) VALUES (?, ?, ?, 'import', ?)");
-    for (const specifier of module.imports) insert.run(projectId, module.path, specifier, specifier.startsWith("./") || specifier.startsWith("../") ? 0 : 1);
+    for (const specifier of module.imports) insert.run(projectId, module.path, specifier, specifier.startsWith(".") ? 0 : 1);
   }
 
   #deleteModule(projectId, modulePath) {
@@ -253,18 +296,35 @@ export class CodeGraph {
   // means util/__init__.py in Python, and `[[decisions/x]]` in prose means a Markdown file. Each
   // parser proposes candidates in preference order and the first one that actually exists wins, so
   // a parser may guess freely — a wrong guess costs an edge, never a wrong edge.
-  #resolveImport(fromPath, specifier, inventory) {
+  #resolveImport(fromPath, specifier, inventory, context = {}) {
     const parser = REGISTRY.for(fromPath);
     if (!parser) return null;
-    for (const candidate of parser.resolve(specifier, fromPath).slice(0, 20)) {
+    for (const candidate of parser.resolve(specifier, fromPath, context).slice(0, 24)) {
       const normalized = path.posix.normalize(candidate);
       if (normalized && !normalized.startsWith("..") && inventory.has(normalized)) return normalized;
     }
     return null;
   }
 
+  // The folders that hold a project's top-level Python packages: the parent of every package whose
+  // own parent is not a package. `src/` in a src-layout project, `backend/` in a monorepo, "" when the
+  // package sits at the root. Absolute imports resolve against these, which is how
+  // `import stuff_downloader.core` in tests/ finds src/stuff_downloader/core/.
+  #pythonRoots(inventory) {
+    const roots = new Set();
+    for (const file of inventory) {
+      if (!file.endsWith("/__init__.py") && file !== "__init__.py") continue;
+      const packageDir = path.posix.dirname(file);
+      if (packageDir === ".") continue;
+      const parent = path.posix.dirname(packageDir);
+      if (!inventory.has(parent === "." ? "__init__.py" : `${parent}/__init__.py`)) roots.add(parent === "." ? "" : parent);
+    }
+    return [...roots].sort().slice(0, 12);
+  }
+
   #rebuildEdges(projectId) {
     const inventory = new Set(this.db.prepare("SELECT path FROM code_modules WHERE project_id = ?").all(projectId).map((row) => row.path));
+    const context = { roots: this.#pythonRoots(inventory) };
     // Every recorded import is offered for resolution, not just the ones classified as intra-project.
     // Python's `from mypkg.core import x` is "bare" by its parser's externality rule and still names a
     // file in this repo; resolution is what decides, and it only ever answers with a file that exists.
@@ -273,8 +333,8 @@ export class CodeGraph {
     const insert = this.db.prepare("INSERT OR IGNORE INTO code_edges (project_id, from_path, to_path, kind) VALUES (?, ?, ?, ?)");
     for (const item of imports) {
       if (!inventory.has(item.from_path)) continue;
-      const target = this.#resolveImport(item.from_path, item.specifier, inventory);
-      if (target) insert.run(projectId, item.from_path, target, item.kind);
+      const target = this.#resolveImport(item.from_path, item.specifier, inventory, context);
+      if (target && target !== item.from_path) insert.run(projectId, item.from_path, target, item.kind);
     }
   }
 
@@ -388,7 +448,8 @@ export class CodeGraph {
     }
     const { realRoot } = this.#projectRoot(task.project_id);
     const existing = new Map(this.db.prepare("SELECT * FROM code_modules WHERE project_id = ?").all(task.project_id).map((row) => [row.path, row]));
-    const results = paths.map((file) => this.#explicitItem(realRoot, task.project_id, file))
+    const ignored = this.#gitIgnored(realRoot, paths);
+    const results = paths.map((file) => (ignored.has(file) ? { invalid: true, path: file } : this.#explicitItem(realRoot, task.project_id, file)))
       .filter(Boolean).map((item) => item.missing || item.invalid ? item : this.#readCandidate(item, existing.get(item.path)));
     const stamp = now();
     this.#transaction(() => {
@@ -600,13 +661,16 @@ export class CodeGraph {
     if (lean) {
       return {
         path: module.path,
-        language: module.language || null,
-        importedBy: importedBy.slice(0, 10),
-        truncated: { importedBy: importedBy.length > 10 },
+        // One line on what the file is for, from its own docstring or header comment — the thing that
+        // lets an agent choose which three files to open instead of opening all twenty.
+        ...(module.summary ? { purpose: module.summary } : {}),
+        importedBy: importedBy.slice(0, 6),
+        ...(importedBy.length > 6 ? { moreImporters: importedBy.length - 6 } : {}),
       };
     }
     return {
       path: module.path,
+      ...(module.summary ? { purpose: module.summary } : {}),
       // The graph is no longer single-language, so what kind of artifact this is has become part of
       // the answer: "python" and "markdown" tell an agent how to read it before it opens the file.
       language: module.language || null,
@@ -647,6 +711,11 @@ export class CodeGraph {
       }
     }
     for (const file of recentFiles) add(file);
+    // Then the files this card is about, by its own words. A card that declares no paths and has no
+    // history used to get the project's most-imported files, whatever it was for — the same list for a
+    // UI fix and a database migration. Words from the title and description are matched against each
+    // file's path, its exported names and its purpose line; a path hit counts most.
+    for (const modulePath of this.#matchingModules(assignmentId, modules)) add(modulePath);
     for (const directory of directories) {
       for (const module of modules) if (!directory || module.path === directory || module.path.startsWith(`${directory}/`)) add(module.path);
     }
@@ -672,6 +741,32 @@ export class CodeGraph {
       context.push(item);
     }
     return context;
+  }
+
+  #matchingModules(assignmentId, modules, limit = 10) {
+    if (!assignmentId) return [];
+    const card = this.db.prepare("SELECT title, description FROM assignments WHERE id = ?").get(assignmentId);
+    if (!card) return [];
+    const STOP = new Set(["this", "that", "with", "from", "into", "when", "then", "than", "them", "they", "have", "should",
+      "must", "will", "what", "each", "only", "also", "make", "sure", "does", "done", "work", "file", "files", "code",
+      "task", "test", "tests", "review", "implement", "change", "changes", "update", "after", "before", "about"]);
+    const words = [...new Set(`${card.title} ${card.description}`.toLowerCase().match(/[a-z][a-z0-9_]{3,}/g) || [])]
+      .filter((word) => !STOP.has(word)).slice(0, 60);
+    if (!words.length) return [];
+    const scored = [];
+    for (const module of modules) {
+      const pathText = module.path.toLowerCase();
+      const exportText = String(module.exports || "").toLowerCase();
+      const summaryText = String(module.summary || "").toLowerCase();
+      let score = 0;
+      for (const word of words) {
+        if (pathText.includes(word)) score += 3;
+        else if (exportText.includes(word)) score += 2;
+        else if (summaryText.includes(word)) score += 1;
+      }
+      if (score >= 3) scored.push({ path: module.path, score });
+    }
+    return scored.sort((left, right) => right.score - left.score || left.path.localeCompare(right.path)).slice(0, limit).map((item) => item.path);
   }
 
   neighborhood(taskId, modulePath) {

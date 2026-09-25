@@ -77,6 +77,7 @@
               <svg class="assignment-edges" aria-hidden="true"></svg>
               <div class="assignment-nodes"></div>
             </div>
+            <div class="flow-set-aside"></div>
           </div>
           <div id="code-map" class="code-map hidden" aria-label="Project code map">
             <div id="code-map-head" class="code-map-head">
@@ -113,7 +114,7 @@
           <div id="reply-context" class="reply-context hidden"></div>
           <textarea name="message" rows="1" aria-label="Message the team" aria-describedby="composer-hint composer-shortcut" placeholder="Message the team, or paste/drop an image or PDF…"></textarea>
           <div id="attachment-preview" class="attachment-preview hidden" aria-live="polite"></div>
-          <div class="composer-footer"><div class="composer-guidance"><span id="composer-hint">Delivered live to connected agents on their next check.</span><span id="draft-status" class="draft-status" aria-live="polite"></span><span id="composer-shortcut" class="composer-shortcut"><kbd>Shift + Enter</kbd> new line</span></div><div class="composer-actions"><label class="attach-button" title="Attach images or PDFs"><span aria-hidden="true">＋</span><span class="sr-only">Attach images or PDFs</span><input id="attachment-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf" multiple></label><button class="send" title="Send message" aria-label="Send message">↑</button></div></div>
+          <div class="composer-footer"><div class="composer-guidance"><span id="composer-hint">Agents in the room get this on their next check; one that is offline gets it when it rejoins.</span><span id="draft-status" class="draft-status" aria-live="polite"></span><span id="composer-shortcut" class="composer-shortcut"><kbd>Shift + Enter</kbd> new line</span></div><div class="composer-actions"><label class="attach-button" title="Attach images or PDFs"><span aria-hidden="true">＋</span><span class="sr-only">Attach images or PDFs</span><input id="attachment-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf" multiple></label><button class="send" title="Send message" aria-label="Send message">↑</button></div></div>
         </form>
       </section>
     </main>
@@ -214,15 +215,29 @@
     </form>
   </dialog>
 
-  <dialog id="task-edit-dialog">
+  <dialog id="task-edit-dialog" class="task-dialog">
     <form id="task-edit-form" method="dialog">
       <div class="dialog-head"><div><span class="eyebrow">EDIT WORK</span><h2>Edit task details</h2></div><button type="button" class="close">×</button></div>
       <label>Task title<input name="title" maxlength="120" required></label>
-      <label>What should the team deliver?<textarea name="description" rows="5" required></textarea></label>
+      <label>What should the team deliver?<textarea name="description" rows="14" required></textarea></label>
       <label>Independent approvals<select name="requiredApprovals"><option value="1">1 reviewer</option><option value="2">2 reviewers</option><option value="3">3 reviewers</option></select></label>
       <fieldset class="domain-picker" data-domain-picker><legend>Domains <span class="hint">changes apply to work planned from now on</span></legend></fieldset>
       <p class="hint">Editing the brief does not reset the version, existing approvals, or work already done — it just updates the task's information.</p>
       <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Save changes</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="card-dialog" class="card-dialog">
+    <form id="card-form" method="dialog">
+      <div class="dialog-head"><div><span id="card-dialog-eyebrow" class="eyebrow">EDIT CARD</span><h2 id="card-dialog-title">Card</h2></div><button type="button" class="close" aria-label="Cancel">×</button></div>
+      <label data-card-mode="edit">Title<input name="title" maxlength="160"></label>
+      <label data-card-mode="edit">What should be done<textarea name="description" rows="10"></textarea></label>
+      <label data-card-mode="reopen edit">Who takes it<select name="target"></select></label>
+      <label data-card-mode="reopen">Note for whoever takes it <span class="hint">optional · added to the card</span><textarea name="note" rows="4" maxlength="4000" placeholder="What changed, and what to do differently this time"></textarea></label>
+      <label data-card-mode="close">Why is it coming off the board?<textarea name="reason" rows="3" maxlength="1000" placeholder="Not needed after the redesign"></textarea></label>
+      <label data-card-mode="close">Replaced by <span class="hint">cards waiting on this one, and its review, move to the replacement</span><select name="replacedBy"></select></label>
+      <p class="hint" data-card-mode="reopen">Reopening keeps everything that waits on this card waiting on it — no copy needed.</p>
+      <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button id="card-submit" class="primary" value="submit">Save</button></div>
     </form>
   </dialog>
 
@@ -232,6 +247,14 @@
       <label>Project name<input name="name" maxlength="80" required></label>
       <label>Absolute folder path<input name="root" required></label>
       <p class="hint">The folder must already exist. Changing it re-points where agents work and where the knowledge vault is written.</p>
+      <fieldset class="team-picker"><legend>Team <span class="hint">who does each step · names as agents connect · empty means anyone</span></legend>
+        <label>Plans<input name="team_planner" list="known-agent-names" placeholder="Anyone" autocomplete="off"></label>
+        <label>Builds<input name="team_implementer" list="known-agent-names" placeholder="Anyone" autocomplete="off"></label>
+        <label>Reviews<input name="team_reviewer" list="known-agent-names" placeholder="Anyone" autocomplete="off"></label>
+        <datalist id="known-agent-names"></datalist>
+        <p class="hint">Separate several names with commas, for example <code>Codex</code> for plans and reviews, <code>Claude</code> for builds.</p>
+      </fieldset>
+      <label class="solo-toggle"><input type="checkbox" name="soloReview"><span><strong>Solo mode</strong> — when nobody else can review, the agent that wrote the work may review it. Marked self-reviewed. Off: reviews wait for someone who did not write the code.</span></label>
       <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Save changes</button></div>
     </form>
   </dialog>
@@ -241,6 +264,7 @@
 
 
   <div id="toast" class="toast"></div>
+  <div id="update-banner" class="update-banner hidden" role="status"><span>DevTeam was updated. Reload to use the new version.</span><button id="reload-dashboard" type="button" class="primary">Reload</button></div>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

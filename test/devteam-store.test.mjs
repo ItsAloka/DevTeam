@@ -870,9 +870,15 @@ test("an agent can direct a message to a specific teammate", async (t) => {
   assert.equal(inbox[0].from, "Codex", "the recipient sees who sent it");
   assert.equal(store.deliverDirectedMessages(claude.id).length, 0, "a delivered message is not delivered again");
 
-  // An undirected agent note stays a timeline broadcast, not a push.
+  // A note said to the room reaches everyone in it — the room is a chat — but never its sender.
   store.postMessage({ agentId: codex.id, taskId: task.id, message: "General progress note.", type: "agent.progress" });
-  assert.equal(store.deliverDirectedMessages(claude.id).length, 0, "an undirected agent note is not pushed to teammates");
+  const heard = store.deliverDirectedMessages(claude.id);
+  assert.deepEqual(heard.map((message) => [message.message, message.from]), [["General progress note.", "Codex"]], "a room message is pushed to teammates");
+  assert.equal(store.deliverDirectedMessages(other.id).length, 1, "to every teammate in the room");
+  assert.equal(store.deliverDirectedMessages(codex.id).length, 0, "but not back to the one who said it");
+  // What DevTeam itself records as agent.* events — a note written to memory — is not chat.
+  store.knowledgeWrite({ agentId: codex.id, taskId: task.id, category: "pitfalls", title: "The API rate-limits at 30 requests a minute", body: "Measured." });
+  assert.equal(store.deliverDirectedMessages(claude.id).length, 0, "a recorded note is not pushed as a message");
 });
 
 test("listAgents reports per-agent unread (undelivered) message counts", async (t) => {
@@ -922,11 +928,12 @@ test("teamActivity reports whether the room is still working", async (t) => {
   assert.equal(store.teamActivity().active, false, "with no open work and no busy agent the room is quiet again");
 });
 
-test("no dead-end: a solo agent can complete a task that nominally needs two approvals", async (t) => {
+test("with solo mode on, a solo agent can complete a task that nominally needs two approvals", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-solo-"));
   const store = new DevTeamStore(dataDir);
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Solo project", process.cwd());
+  store.updateProject(project.id, { soloReview: true });
   const task = store.createTask({ projectId: project.id, title: "Solo run", description: "One agent, two approvals configured.", requiredApprovals: 2 });
   const solo = store.connectAgent({ name: "Solo", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(solo.id);
@@ -1018,7 +1025,7 @@ test("reconnecting does not make an author independent of its own work", async (
     /Approval requires a completed, read-only reviewer assignment/);
 });
 
-test("refusing the author a review of its own work never leaves that review unclaimable", async (t) => {
+test("with solo mode on, refusing the author a review of its own work never leaves that review unclaimable", async (t) => {
   // The rule is "somebody else could actually take this", not "an independent teammate exists". A
   // teammate who is connected but cannot claim — or who has left — must not hold a review hostage on
   // the board forever. The randomized scheduler suite found exactly this deadlock on seed 18 the
@@ -1027,6 +1034,7 @@ test("refusing the author a review of its own work never leaves that review uncl
   const store = new DevTeamStore(dataDir);
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Solo again project", process.cwd());
+  store.updateProject(project.id, { soloReview: true });
   const task = store.createTask({ projectId: project.id, title: "Author is left alone", description: "The reviewer goes home.", requiredApprovals: 1 });
   const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
   const alice = store.connectAgent({ name: "Alice", provider: "test", freshTaskId: task.id });
@@ -1051,11 +1059,12 @@ test("refusing the author a review of its own work never leaves that review uncl
   assert.equal(outcome.selfReviewed, true, "and it is labeled selfReviewed rather than passed off as consensus");
 });
 
-test("a disconnected historical teammate cannot dead-end the remaining solo author", async (t) => {
+test("with solo mode on, a disconnected historical teammate cannot dead-end the remaining solo author", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-now-solo-"));
   const store = new DevTeamStore(dataDir);
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Now-solo project", process.cwd());
+  store.updateProject(project.id, { soloReview: true });
   const task = store.createTask({ projectId: project.id, title: "Finish after teammate leaves", description: "Current availability controls approvals.", requiredApprovals: 2 });
   const former = store.connectAgent({ name: "Former teammate", provider: "test", freshTaskId: task.id });
   const solo = store.connectAgent({ name: "Remaining author", provider: "test", freshTaskId: task.id });
@@ -1075,11 +1084,12 @@ test("a disconnected historical teammate cannot dead-end the remaining solo auth
   assert.equal(outcome.selfReviewed, true);
 });
 
-test("a solo acceptance is labeled selfReviewed; changed files that aren't on disk are flagged", async (t) => {
+test("with solo mode on, a solo acceptance is labeled selfReviewed; changed files that aren't on disk are flagged", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-selfreview-"));
   const store = new DevTeamStore(dataDir);
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Self review project", process.cwd());
+  store.updateProject(project.id, { soloReview: true });
   const task = store.createTask({ projectId: project.id, title: "Solo but honest", description: "Label the lack of independent review.", requiredApprovals: 2 });
   const solo = store.connectAgent({ name: "Solo", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(solo.id);

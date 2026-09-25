@@ -1,5 +1,5 @@
-import { randomBytes, randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { readdirSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +21,19 @@ import {
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(moduleDir, "../../public");
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
+// A fingerprint of the dashboard files as they are on disk right now. The dashboard is one
+// long-lived page, so after an update it kept running the old markup until somebody thought to
+// reload — which is how a fixed dialog was still reported as too small. The page compares this with
+// the value it booted with and offers a reload when they differ.
+function dashboardBuild() {
+  const hash = createHash("sha256");
+  for (const name of readdirSync(publicDir).sort()) {
+    const info = statSync(path.join(publicDir, name), { throwIfNoEntry: false });
+    if (info?.isFile()) hash.update(`${name}:${info.size}:${Math.trunc(info.mtimeMs)}\n`);
+  }
+  return hash.digest("hex").slice(0, 16);
+}
 const ATTACHMENT_TYPES = new Map([
   ["image/png", { extension: ".png", matches: (body) => body.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) }],
   ["image/jpeg", { extension: ".jpg", matches: (body) => body[0] === 0xff && body[1] === 0xd8 && body[2] === 0xff }],
@@ -205,6 +218,7 @@ export async function startDevTeamServer({
     mcpUrl: `${req.protocol}://${req.get("host")}/mcp`,
     idleWaitSeconds: 45,
     liveness: store.liveness,
+    dashboardBuild: dashboardBuild(),
   }));
   // The bearer token lives behind the dashboard session (or the token itself), never in the routine
   // config that drives polling — so a stray GET can't harvest it.
@@ -246,7 +260,10 @@ export async function startDevTeamServer({
     const patch = {};
     if (typeof req.body?.name === "string") patch.name = req.body.name;
     if (typeof req.body?.root === "string" && req.body.root.trim()) patch.root = requireDirectory(req.body.root);
-    if (!Object.keys(patch).length) throw new Error("Provide a new name or folder path to update.");
+    // Validated by the store: the three role names only, at most ten names each.
+    if (req.body?.team !== undefined) patch.team = req.body.team;
+    if (typeof req.body?.soloReview === "boolean") patch.soloReview = req.body.soloReview;
+    if (!Object.keys(patch).length) throw new Error("Provide a new name, folder path, team or solo setting to update.");
     res.json(store.updateProject(req.params.projectId, patch));
   });
   app.delete("/api/projects/:projectId", (req, res) => {
@@ -353,6 +370,23 @@ export async function startDevTeamServer({
   });
   app.post("/api/tasks/:taskId/assignments/:assignmentId/cancel", (req, res) => {
     res.json(store.requestCancel({ taskId: req.params.taskId, assignmentId: req.params.assignmentId, reason: req.body?.reason }));
+  });
+  // Fixing a card instead of copying it (store-board.mjs). The owner may change any card.
+  app.post("/api/tasks/:taskId/assignments/:assignmentId/reopen", (req, res) => {
+    res.json(store.reopenAssignment({
+      taskId: req.params.taskId, assignmentId: req.params.assignmentId, note: req.body?.note,
+      ...(req.body?.targetAgentName !== undefined ? { targetAgentName: req.body.targetAgentName } : {}),
+    }));
+  });
+  app.post("/api/tasks/:taskId/assignments/:assignmentId/close", (req, res) => {
+    requireFields(req.body, ["reason"]);
+    res.json(store.closeAssignment({ taskId: req.params.taskId, assignmentId: req.params.assignmentId, reason: req.body.reason, replacedBy: req.body.replacedBy || null }));
+  });
+  app.patch("/api/tasks/:taskId/assignments/:assignmentId", (req, res) => {
+    const patch = {};
+    for (const key of ["title", "description", "targetAgentName", "dependsOn"]) if (req.body?.[key] !== undefined) patch[key] = req.body[key];
+    if (!Object.keys(patch).length) throw new Error("Provide a title, description, addressee or dependencies to change.");
+    res.json(store.editAssignment({ taskId: req.params.taskId, assignmentId: req.params.assignmentId, ...patch }));
   });
   // T4.3 — the whole task as a narrative, for when something went wrong and the question is where.
   app.get("/api/tasks/:taskId/replay", (req, res) => {

@@ -25,8 +25,8 @@ The project files are the source of truth. DevTeam tells you what the team knows
 | | |
 |---|---|
 | `devteam_join` | arrive, enter a room, or resume a dropped session |
-| `devteam_next` | wait for your next assignment or message; `want=state` / `want=brief` look things up |
-| `devteam_plan` | put an assignment on the board |
+| `devteam_next` | wait for your next assignment or message; `want=board` / `want=brief` / `want=state` look things up |
+| `devteam_plan` | put work on the board, or reopen, edit or close a card already there |
 | `devteam_report` | finish the assignment you hold, with evidence and anything you `learned` |
 | `devteam_verdict` | approve, or send back, work you reviewed |
 | `devteam_stuck` | ask why work will not move, or stop the task for the human |
@@ -58,6 +58,13 @@ planner decides what the team does next and researches whatever it needs to deci
 produces the work and exercises it. A reviewer reads someone else's finished work and judges it.
 Security review is a reviewer assignment with the `security` domain selected, not a separate role.
 
+**The project's team says who does each role.** When you enter a room the reply carries `team`, for
+example `{ planner: ["Codex"], implementer: ["Claude"], reviewer: ["Codex"] }`. A role with names is
+handed only to those agents (or to whoever a card is addressed to); an empty list means anyone. So
+you will not be handed work outside your role, and you should not plan work for a role nobody
+connected can take without saying who is needed. `soloReview` says whether an author may review its
+own work when nobody else can; it is usually `false`.
+
 **The human's word in the room outranks the scheduler.** If the human says who plans, implements or
 reviews and the board hands you something else, do not do it anyway: re-address it with
 `devteam_plan targetAgentName=…`, report your claim done saying you handed it on, and tell that
@@ -79,14 +86,23 @@ blocks, so call it with the default timeout rather than polling. It answers with
 - `room_required` — join a room first.
 - `idle` — nothing for you yet. With `keepWaiting: true` the team is still busy; call `next` again.
   After about five quiet minutes, or when `keepWaiting` is false, leave and tell the human. If
+  `waitingOnTeammates` is present, the open work belongs to someone who is not connected (for
+  example a review for Codex): tell the human who is needed, then leave rather than polling. If
   `blockedRooms` is present the task is stopped and only the human can restart it: say so and stop.
   Never recreate a blocked task elsewhere.
 
-The lookups do not block. `want=state` (with `taskId`) returns the full task: every assignment and
-its status, events with their ids, approvals, members, check baselines and regressions. Use it to see
-what teammates did and to find an event id for `replyTo`. `want=brief` re-reads your briefing.
-`want=module` with a `path` returns a file's importers and imports from the code graph, when
-`codeContext` was not enough.
+The lookups do not block. **`want=board` (with `taskId`) is how you see where the work stands**: the
+same flowchart the owner sees, as a few lines of text — each step, its review underneath, who has it,
+what it waits on, and the full ids to act on. It is about 1–3 KB; read it whenever you need the
+picture. `want=state` returns the whole task including every event (hundreds of KB on a busy task):
+use it only for an event id to `replyTo` or the full history. `want=brief` re-reads your briefing.
+`want=module` with a `path` returns a file's importers, imports and one-line purpose from the code
+graph, when `codeContext` was not enough.
+
+Your brief carries `previousWork` — how the last task in this project ended, what it learned, and
+anything left open — and `codeContext`, the files this card is most likely about, each with a
+`purpose` line from its own docstring or header. Use them to choose which files to open instead of
+reading everything.
 
 ## Doing the assignment
 
@@ -107,7 +123,8 @@ Finish with `devteam_report`, always passing `claimToken`:
 - `learned` — see Memory. Up to three durable facts.
 - `checklistSections` — the `## ` sections of `checklistFiles` you actually walked.
 - `message` — what you did and why, what you did not do, and anything the reviewer should look at.
-- `status=blocked` closes only this assignment and queues planner triage; the task keeps running.
+- `status=blocked` pauses only this card and queues a planner card to decide it; the task keeps
+  running, and the card can be reopened — nothing that waits on it is lost.
 
 ## Memory
 
@@ -174,12 +191,31 @@ task text alone is a guess. Then put each piece of work on the board with `devte
   default checklist (`[]` removes it). Domain checklists still come from `domains`. The task needs its `required_approvals` count of approvals, and no open
   assignments, to be accepted.
 
+To put a whole plan up at once, pass `cards` instead of a single title: give each card a `key`, and
+let later cards name earlier ones by key in `dependsOn` and `reviews` (the card a reviewer reviews).
+That is the easiest way to declare the real order.
+
+**Fix cards; never copy them.** A "(replacement)" card leaves the original and everything waiting on
+it stranded on the board. Instead:
+
+- `action=reopen` with `assignmentId` puts a blocked or closed card back in the queue, optionally with
+  a new `targetAgentName` and a `note` for the next holder. What waited on it still waits on it.
+- `action=edit` changes a waiting card's `title`, `description`, `targetAgentName` or `dependsOn`.
+- `action=close` with a `reason` takes a card off the board. Add `replacedBy` and everything that
+  waited on it — and any review of it — moves to the replacement.
+
+A "Resolve blocker" card is yours to decide with one of those three. When the project's team names
+planners, only they change the board.
+
 Then report your planner assignment with a summary of the plan.
 
 ## Checking each other
 
-**You will never be handed a review of your own work.** If nobody independent exists, acceptance is
-labelled `selfReviewed` rather than passed off as consensus.
+**You will never be handed a review of your own work.** When no one who did not write it is
+connected, the review waits and the board says who it is waiting for. Only a project with solo mode
+on lets the author review its own work, and then acceptance is labelled `selfReviewed` rather than
+passed off as consensus. If you ever are handed your own work to review, report it `status=blocked`
+saying so; do not review it.
 
 A review is two calls. First do the review read-only (read the diff and the files, run the tests),
 then `devteam_report` your reviewer assignment with **no** `changedFiles`. Only then give the verdict
@@ -191,6 +227,9 @@ with `devteam_verdict`, which needs that completed read-only review on the curre
   is a general lesson, add `rule` (one short, testable sentence with no task-specific names) and
   `section` (Security, Testing, Data, Performance, UX…); the owner decides whether it earns a line
   in `checklists/`.
+
+After `verdict=changes`, your review card comes back by itself as the next round, addressed to you,
+once the author reports the fix. Claim it then; **do not create a re-review card**.
 
 **Sending work back is normal.** Approving work you doubt is the failure. If you must fix something
 yourself, that is new write work, not a review; put it on the board.
@@ -213,16 +252,18 @@ wrong answer costs far more than a stopped assignment.
 
 ## Staying reachable
 
-Messages ride along on **any** call as `pendingMessages`. Read them, and reply with `devteam_message`
-before carrying on: omit `target` for the room, set it to a teammate's name to push it to them, pass
-`replyTo` with an event id to thread. Use `kind` (`progress`, `decision`, `finding`, `question`) so the
+Messages ride along on **any** call as `pendingMessages` — the human's, and your teammates' room
+messages. Read them, and reply with `devteam_message` before carrying on: omit `target` to say it to
+the whole room (every teammate receives it), set it to a teammate's name to send it to them alone,
+pass `replyTo` with an event id to thread. Use `kind` (`progress`, `decision`, `finding`, `question`) so the
 timeline reads right. Keep progress notes for moments that matter to others; the report is where the
 detail goes.
 
 ## Working alone
 
-The loop still holds: do the work, then review it in a separate read-only pass and say plainly it was
-self-reviewed. Be a harder reviewer of yourself, not a friendlier one.
+Only when the project has solo mode on. The loop still holds: do the work, then review it in a
+separate read-only pass and say plainly it was self-reviewed. Be a harder reviewer of yourself, not
+a friendlier one. With solo mode off, finish your part and leave; the review waits for a teammate.
 
 ## Leaving
 

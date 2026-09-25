@@ -10,9 +10,9 @@
 // The invariant with the most history behind it lives here. An agent may not verify work it wrote,
 // enforced at claim time by _verifierIsAuthor rather than only at approval — refusing it only at
 // approval meant the author was handed the review, read the whole diff, and found that its single
-// exit was to block the assignment. _independentClaimantExists is the no-dead-end half: with no
-// independent teammate who could actually take it, the author still gets the work and the
-// acceptance is labeled selfReviewed rather than the item sitting claimable by nobody.
+// exit was to block the assignment. _independentClaimantExists is the solo-mode half: on a project
+// that turned solo mode on, with no independent teammate who could actually take it, the author
+// still gets the work and the acceptance is labeled selfReviewed. With solo mode off the review waits.
 //
 // A mixin on DevTeamStore.prototype, for the reasons in store-checks.mjs. The scheduler in store.mjs
 // calls _verifierIsAuthor and _findingsFor directly, which is exactly why those had to stop being
@@ -124,13 +124,27 @@ export const consensusMethods = {
   // assignments produced two requests for changes. Enforcing it where the claim is handed out costs
   // the team nothing and is the difference between independent review and a rubber stamp.
   //
-  // No dead-ends, the same rule the rest of consensus follows: with no independent teammate
-  // connected, the author still gets the work and the acceptance is labeled selfReviewed rather than
-  // the assignment sitting claimable-by-nobody.
+  // With no independent teammate connected, what happens is the project's choice. Solo mode on: the
+  // author still gets the work and the acceptance is labeled selfReviewed rather than the assignment
+  // sitting claimable-by-nobody. Solo mode off (the default): the review waits, and the board says
+  // who it is waiting for.
+  //
+  // Off is the default because "no dead-ends" turned out to be the wrong trade for a team whose
+  // reviewer connects one turn at a time. Codex opens a fresh session per turn, so between turns
+  // Claude was the only contributor present, was handed reviews of its own code, refused them under
+  // the owner's rule, and every refusal queued a planner card: 42 of Stuff Downloader's 62 blocked
+  // reports were exactly that loop. Waiting costs a visible pause; the loop cost the board.
   _verifierIsAuthor(agentId, assignment) {
     const authors = this._reviewAuthors(assignment);
     if (!authors.has(agentId)) return false;
+    if (!this._soloReviewAllowed(assignment.task_id)) return true;
     return this._independentClaimantExists(assignment, authors, agentId);
+  },
+
+  _soloReviewAllowed(taskId) {
+    return Boolean(this.db.prepare(`
+      SELECT p.solo_review FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = ?
+    `).get(taskId)?.solo_review);
   },
 
   // "Could somebody else actually take this, right now?" — deliberately not "does an independent
@@ -203,13 +217,16 @@ export const consensusMethods = {
     });
     if (!reviewEvidence) throw new Error("Approval requires a completed, read-only reviewer assignment on the current task version.");
     // Reviewer ≠ author: when the team is more than one agent, the author of the current version
-    // cannot approve it — an independent teammate must. A genuine solo run is still allowed to
-    // finish (no dead-ends), but its acceptance is labeled selfReviewed so it is never mistaken
-    // for independent consensus.
+    // cannot approve it — an independent teammate must. With solo mode on, a genuine solo run is
+    // still allowed to finish, but its acceptance is labeled selfReviewed so it is never mistaken
+    // for independent consensus. With solo mode off, the author never approves its own version.
     const authors = this._currentVersionAuthors(taskId, task.version);
     const eligibleIndependent = this._eligibleIndependentApprovers(taskId, task.version);
     if (authors.has(agentId) && eligibleIndependent.size > 0) {
       throw new Error("The author of the current version cannot approve it; an independent reviewer must.");
+    }
+    if (authors.has(agentId) && !this._soloReviewAllowed(taskId)) {
+      throw new Error("You wrote the current version, and solo mode is off for this project, so a reviewer who did not write it has to approve it.");
     }
     let outcome;
     this._transaction(() => {
@@ -341,8 +358,11 @@ export const consensusMethods = {
           clearedApprovals,
           findings: cleanFindings,
         });
+      // The review that found this goes round again on the same card, instead of a new re-review card.
+      const nextRound = this._rearmReviewOf(assignmentId, { reviewerAgentId: agentId, stamp });
       this._syncTaskStatus(taskId, stamp);
       outcome = {
+        ...(nextRound ? { reviewRound: nextRound.round, reviewAssignmentId: nextRound.assignmentId } : {}),
         changesRequested: true,
         taskId,
         assignmentId,

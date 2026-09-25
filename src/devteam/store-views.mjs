@@ -12,6 +12,13 @@ import path from "node:path";
 import { fromJson, now } from "./util.mjs";
 import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
 import { checklistBrief, DEFAULT_CHECKLIST_DIRNAME } from "./checklists.mjs";
+// The board's step model is shared with the dashboard, so the text an agent reads and the flowchart
+// the owner sees can never describe two different boards. Plain functions; nothing browser-only.
+import { buildFlowModel, layoutFlowBoard } from "../../public/ui-utils.js";
+
+// Long enough for a real task brief — Stuff Downloader's run 2.5–3.5 KB — with room to spare, and
+// still a fraction of the 32 KB total the brief is held to.
+const TASK_DESCRIPTION_BRIEF_BYTES = 12_000;
 
 // File paths reach the map from two places that were never validated against the code graph: a
 // note's related files, and the changed files an agent reports. Both are written by hand, so they
@@ -78,7 +85,7 @@ export const viewMethods = {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     const projectId = task.project_id;
-    const modules = this.db.prepare("SELECT path, language, loc FROM code_modules WHERE project_id = ? ORDER BY path ASC").all(projectId);
+    const modules = this.db.prepare("SELECT path, language, loc, summary FROM code_modules WHERE project_id = ? ORDER BY path ASC").all(projectId);
     const known = new Set(modules.map((module) => module.path));
     const edges = this.db.prepare("SELECT from_path, to_path FROM code_edges WHERE project_id = ? ORDER BY from_path, to_path").all(projectId)
       .filter((edge) => known.has(edge.from_path) && known.has(edge.to_path) && edge.from_path !== edge.to_path)
@@ -113,7 +120,7 @@ export const viewMethods = {
       taskId,
       projectId,
       projectName: task.project_name || projectId,
-      modules: modules.map((module) => ({ path: module.path, language: module.language, loc: Number(module.loc) || 0 })),
+      modules: modules.map((module) => ({ path: module.path, language: module.language, loc: Number(module.loc) || 0, ...(module.summary ? { summary: module.summary } : {}) })),
       edges,
       notes,
       touched: [...touched].map(([file, count]) => ({ file, count })).sort((left, right) => right.count - left.count),
@@ -305,19 +312,19 @@ export const viewMethods = {
   // same card already lists them as blockedBy.
   _schedulingHold(assignment) {
     if (assignment.status !== "queued") return null;
-    const HOLD_PRECEDENCE = ["awaiting_writer", "write_lease_conflict", "verifier_is_author", "target_absent"];
+    const HOLD_PRECEDENCE = ["awaiting_writer", "write_lease_conflict", "waiting_for_team", "verifier_is_author", "target_absent"];
     const { reasons } = this.whyNotClaimable(assignment.id);
     for (const code of HOLD_PRECEDENCE) {
       const hold = reasons.find((reason) => reason.code === code);
-      if (hold) return { reason: hold.code, detail: hold.detail };
+      if (hold) return { reason: hold.code, detail: hold.detail, ...(hold.waitingFor ? { waitingFor: hold.waitingFor } : {}) };
     }
     return null;
   },
 
-  taskDetail(taskId) {
-    const task = this.getTask(taskId);
-    if (!task) return null;
-    const assignments = this.db.prepare(`
+  // Every card on a task, with what the board needs to draw it. `full` adds what only the dashboard's
+  // detail panel shows — checklists, checks, findings — which the text board leaves out.
+  _boardAssignments(taskId, { full = true } = {}) {
+    return this.db.prepare(`
       SELECT a.*, ag.name AS agent_name, ag.provider AS agent_provider
       FROM assignments a LEFT JOIN agents ag ON ag.id = a.agent_id
       WHERE a.task_id = ? ORDER BY a.created_at ASC
@@ -325,16 +332,78 @@ export const viewMethods = {
       const dependencies = this._dependenciesFor(assignment.id);
       return {
         ...assignment,
-        checklist: this._checklistFor(assignment.id),
-        writeScope: assignment.requires_write ? this._writeScopeFor(assignment.id) : [],
+        ...(full ? {
+          checklist: this._checklistFor(assignment.id),
+          writeScope: assignment.requires_write ? this._writeScopeFor(assignment.id) : [],
+          checks: this._checksFor(assignment.id),
+          findings: this._findingsFor(assignment.id),
+          resolvedFindings: this._findingsFor(assignment.id, { includeResolved: true }).filter((finding) => finding.resolved_at),
+        } : {}),
         dependsOn: dependencies.map((item) => item.id),
         blockedBy: dependencies.filter((item) => item.status !== "done"),
-        checks: this._checksFor(assignment.id),
-        findings: this._findingsFor(assignment.id),
-        resolvedFindings: this._findingsFor(assignment.id, { includeResolved: true }).filter((finding) => finding.resolved_at),
         schedulingHold: this._schedulingHold(assignment),
       };
     });
+  },
+
+  // The board as an agent reads it: the same flowchart the owner sees, as a few lines of text with
+  // the ids an agent needs to act. want=state answered "what is on the board?" with the whole task —
+  // 222,000 characters for Rebuild 9, every event included. This is under 3,000.
+  boardText(taskId) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    const assignments = this._boardAssignments(taskId, { full: false });
+    const model = buildFlowModel(assignments, { taskStatus: task.status });
+    const layout = layoutFlowBoard(model);
+    const team = this.teamSummary(task.project_id);
+    const teamLine = ["planner", "implementer", "reviewer"]
+      .map((role) => `${{ planner: "plan", implementer: "build", reviewer: "review" }[role]} ${team[role]?.length ? team[role].join("/") : "anyone"}`)
+      .join(" · ");
+    const icon = { queued: "○", claimed: "●", done: "✓", blocked: "!", closed: "×" };
+    const word = { queued: "waiting", claimed: "working", done: "done", blocked: "NEEDS A DECISION", closed: "set aside" };
+    const role = { planner: "Plan", implementer: "Build", reviewer: "Review" };
+    const holder = (card) => {
+      if (card.agent_name) return card.agent_name;
+      // A finished card whose agent session has since been purged: the result stands, the name is gone.
+      if (["done", "closed"].includes(card.status)) return null;
+      const hold = card.schedulingHold;
+      if (card.status === "queued" && hold?.reason === "waiting_for_team") return `waiting for ${(hold.waitingFor || []).join(" or ")}`;
+      if (card.status === "queued" && hold?.reason === "verifier_is_author") return "needs a reviewer who did not write it";
+      if (card.target_agent_name) return `for ${card.target_agent_name}`;
+      return "anyone";
+    };
+    const rowOfStep = new Map();
+    for (const node of layout.nodes) {
+      const row = layout.rows.find((candidate) => node.y >= candidate.y && node.y < candidate.y + candidate.height);
+      if (row && node.kind === "main") rowOfStep.set(node.stepId, row.label);
+    }
+    const lines = [
+      `${task.title} · v${task.version} · ${task.status}`,
+      `team: ${teamLine} · solo review ${team.soloReview ? "on" : "off"}`,
+    ];
+    for (const row of layout.rows) {
+      const steps = model.steps.filter((step) => rowOfStep.get(step.id) === row.label);
+      steps.forEach((step, index) => {
+        const label = index === 0 ? row.label : "";
+        const after = step.dependsOn.map((id) => rowOfStep.get(id)).filter(Boolean);
+        const loop = step.sentBack ? `, sent back ${step.sentBack}×` : "";
+        const decision = step.decision ? `, decision: ${step.decision.agent_name || "waiting for the planner"}` : "";
+        lines.push(`${label.padEnd(8)}${icon[step.main.status] || "•"} ${role[step.main.role] || "Work"}: ${step.main.title} — ${[word[step.main.status] || step.main.status, holder(step.main)].filter(Boolean).join(", ")}${loop}${decision}${after.length ? ` · after ${[...new Set(after)].join(", ")}` : ""} [${step.main.id}]`);
+        if (step.review) {
+          lines.push(`${"".padEnd(8)}  ↳ ${icon[step.review.status] || "•"} Review${step.rounds > 1 ? ` round ${step.rounds}` : ""}: ${step.review.title} — ${[word[step.review.status] || step.review.status, holder(step.review)].filter(Boolean).join(", ")} [${step.review.id}]`);
+        }
+      });
+    }
+    if (model.setAside.length) lines.push(`set aside: ${model.setAside.length} card${model.setAside.length === 1 ? "" : "s"} (closed, replaced or decided) — not part of the flow`);
+    const decisions = model.steps.filter((step) => step.main.status === "blocked");
+    if (decisions.length) lines.push(`needs a decision: ${decisions.map((step) => `“${step.main.title}” [${step.main.id}]`).join("; ")} — reopen, edit or close it with devteam_plan`);
+    return { taskId, board: lines.join("\n"), steps: model.steps.length, setAside: model.setAside.length };
+  },
+
+  taskDetail(taskId) {
+    const task = this.getTask(taskId);
+    if (!task) return null;
+    const assignments = this._boardAssignments(taskId);
     // The roles this project understands travel with the task, so the dashboard's assignment form
     // offers the project's own vocabulary rather than a hardcoded list of software job titles.
     const roleCatalogue = this.roleCatalogue();
@@ -385,6 +454,7 @@ export const viewMethods = {
     const codeGraphState = this.codegraph.projectState(task.project_id);
     return {
       ...task, assignments, approvals, events, blackboard, projectBlackboard, knowledge, members, roleCatalogue,
+      team: this.teamSummary(task.project_id),
       blockedRecovery: this.blockedRecovery(taskId),
       regressions: this.openRegressions(taskId), checkBaseline: this.checkBaseline(taskId),
       reliability: this.teamReliability(),
@@ -545,7 +615,6 @@ export const viewMethods = {
         dependsOn: dependencies.dependsOn,
         blockedBy: dependencies.blockedBy,
         task_title: clip(currentSource.task_title || task.title, 600, "currentAssignmentTaskTitle"),
-        task_description: clip(currentSource.task_description || task.description, 2_003, "currentAssignmentTaskDescription"),
         task_version: Number(currentSource.task_version ?? task.version),
         required_approvals: Number(currentSource.required_approvals ?? task.required_approvals),
         project_root: clip(currentSource.project_root || task.project_root, 2_000, "currentAssignmentProjectRoot"),
@@ -582,7 +651,9 @@ export const viewMethods = {
       SELECT COUNT(*) AS count FROM knowledge_notes
       WHERE project_id = ? AND status IN ('verified', 'inferred')
     `).get(task.project_id)?.count || 0);
-    const recentTypes = ["human.message", "agent.decision", "agent.finding", "task.blocked", "task.unblocked", "task.accepted"];
+    // Progress notes are how teammates say what they just did and what comes next; leaving them out
+    // meant an agent could not see its teammate's last word without dumping the whole task state.
+    const recentTypes = ["human.message", "agent.progress", "agent.decision", "agent.finding", "task.blocked", "task.unblocked", "task.accepted"];
     const typePlaceholders = recentTypes.map(() => "?").join(", ");
     const recentTotal = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM events WHERE task_id = ? AND type IN (${typePlaceholders})`).get(taskId, ...recentTypes).count);
     const recent = this.db.prepare(`
@@ -622,6 +693,33 @@ export const viewMethods = {
       if (errorKey) this.codegraphErrors.set(errorKey, { message: error.message, at: now() });
       this.emit("codegraph-error", { taskId, type: "codegraph.context", error });
     }
+    // Where the last piece of work in this project ended. Each task used to start cold — the owner
+    // wrote "R7 is done, read plan.md §2" into every description because nothing carried it over.
+    const previousRow = this.db.prepare(`
+      SELECT id, title, status, version, updated_at FROM tasks
+      WHERE project_id = ? AND id != ? AND created_at <= ?
+      ORDER BY updated_at DESC LIMIT 1
+    `).get(task.project_id, task.id, task.created_at);
+    const previousWork = [];
+    if (previousRow) {
+      const approval = this.db.prepare("SELECT metadata FROM events WHERE task_id = ? AND type = 'task.approved' ORDER BY id DESC LIMIT 1").get(previousRow.id);
+      const lastReport = this.db.prepare("SELECT message FROM events WHERE task_id = ? AND type = 'assignment.completed' ORDER BY id DESC LIMIT 1").get(previousRow.id);
+      const stillOpen = ["accepted", "cancelled"].includes(previousRow.status) ? [] : this.db.prepare(`
+        SELECT title, status FROM assignments WHERE task_id = ? AND status IN ('queued', 'claimed', 'blocked') ORDER BY created_at ASC LIMIT 5
+      `).all(previousRow.id).map((card) => `${card.status}: ${clip(card.title, 200, "previousWorkOpen")}`);
+      const learnedThere = this.db.prepare(`
+        SELECT title FROM knowledge_notes WHERE project_id = ? AND source_task_id = ? AND status IN ('verified', 'inferred') ORDER BY created_at DESC LIMIT 5
+      `).all(task.project_id, previousRow.id).map((note) => clip(note.title, 200, "previousWorkLearned"));
+      previousWork.push({
+        taskId: previousRow.id,
+        title: clip(previousRow.title, 300, "previousWorkTitle"),
+        status: previousRow.status,
+        version: previousRow.version,
+        endedWith: clip(fromJson(approval?.metadata, {})?.summary || lastReport?.message || "", 900, "previousWorkEnding"),
+        ...(stillOpen.length ? { stillOpen } : {}),
+        ...(learnedThere.length ? { learned: learnedThere } : {}),
+      });
+    }
     const recentChangedFiles = this.db.prepare(`
       SELECT metadata FROM events WHERE task_id = ?
         AND type IN ('assignment.completed', 'assignment.blocked') ORDER BY id DESC LIMIT 30
@@ -658,7 +756,10 @@ export const viewMethods = {
         task: {
           id: task.id,
           title: clip(task.title, 600, "taskTitle"),
-          description: clip(task.description, 2_003, "taskDescription"),
+          // The owner's own words are the one part of a brief nobody can re-derive, and the rules they
+          // put at the end were the part a 2 KB clip cut off. It used to ride twice — here and again as
+          // currentAssignment.task_description — which cost the same bytes as carrying it once in full.
+          description: clip(task.description, TASK_DESCRIPTION_BRIEF_BYTES, "taskDescription"),
           status: task.status,
           version: task.version,
           project: {
@@ -666,6 +767,8 @@ export const viewMethods = {
             name: clip(task.project_name, 400, "projectName"),
             root: clip(task.project_root, 2_000, "projectRoot"),
           },
+          // Who does which step here. An empty list means anyone in the room may take that role.
+          team: this.teamSummary(task.project_id),
         },
         [assignmentKey]: currentAssignment,
         claimInstructions: "Retain the claim token privately, inspect the current project state before writing, stay inside the declared write scope, and pass the token to devteam_report so stale work is fenced.",
@@ -678,6 +781,7 @@ export const viewMethods = {
         { key: "projectMemory", group: "projectMemory", items: projectMemory, totalCount: projectMemoryTotal, maxItems: 16, maxBytes: DEFAULT_BRIEF_BUDGET.projectMemoryBytes },
         { key: "projectKnowledge", group: "knowledge", items: projectKnowledge, totalCount: knowledgeTotal, maxItems: 12, maxBytes: DEFAULT_BRIEF_BUDGET.knowledgeBytes },
         { key: "codeContext", group: "codeContext", items: codeContext || [], emptyValue: this.codegraph.enabled ? [] : null, totalCount: codeContext?.length || 0, maxItems: 30, maxBytes: DEFAULT_BRIEF_BUDGET.codeContextBytes },
+        { key: "previousWork", group: "previousWork", items: previousWork, totalCount: previousWork.length, maxItems: 1, maxBytes: 2_048 },
         { key: "pendingMessages", group: "activity", items: boundedPendingMessages, totalCount: Array.isArray(pendingMessages) ? pendingMessages.length : 0, maxItems: 20, maxBytes: DEFAULT_BRIEF_BUDGET.activityBytes },
         { key: "recent", group: "activity", items: recent, totalCount: recentTotal, maxItems: 12, maxBytes: DEFAULT_BRIEF_BUDGET.activityBytes },
         { key: "unresolvedQuestions", group: "activity", items: unresolvedQuestions, totalCount: unresolvedTotal, maxItems: 10, maxBytes: DEFAULT_BRIEF_BUDGET.activityBytes },

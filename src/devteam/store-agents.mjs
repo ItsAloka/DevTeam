@@ -82,9 +82,13 @@ export const agentMethods = {
   // target "all". Only messages posted during this session are delivered live;
   // older history is still visible through devteam_next with want=state.
   // Is this timeline event a live message for the given agent? Human messages reach the agent
-  // if broadcast ("all") or addressed to its name. Agent messages are only *pushed* when they
-  // are directed to this agent by name (never the sender's own, never undirected broadcasts —
-  // those stay timeline notes read via devteam_next with want=state).
+  // if broadcast ("all") or addressed to its name. Agent messages reach it when addressed to it by
+  // name, or when a teammate posted them to the whole room with devteam_message — never the
+  // sender's own, and never the bookkeeping DevTeam writes as agent.* events (joins, recorded notes).
+  //
+  // Room messages used to stay timeline notes only an agent dumping the whole task state would see,
+  // so "Claude says the fix is in" never reached Codex unless Claude remembered to name it. The room
+  // is a chat: what is said to it, everyone in it hears.
   _messageIsForAgent(event, agent) {
     const nameLower = String(agent.name).toLowerCase();
     if (event.type === "human.message") {
@@ -93,7 +97,10 @@ export const agentMethods = {
     }
     if (String(event.agent_id || "") === agent.id) return false;
     const target = String(event.metadata.target || "").toLowerCase();
-    if (!target) return false;
+    if (!target) {
+      if (!event.metadata.roomMessage) return false;
+      return String(event.metadata.senderName || "").toLowerCase() !== nameLower;
+    }
     return target === nameLower || target === String(agent.id).toLowerCase();
   },
 
@@ -167,8 +174,10 @@ export const agentMethods = {
     // token issued below); a truly gone session is cleaned up by transport-close or the reaper.
     const resumeToken = randomBytes(24).toString("base64url");
     // A returning identity that reconnects within this window inherits its prior session's read floor
-    // (below) so it still sees what it missed while away; older sessions are left as history.
-    const RECONNECT_REPLAY_MS = 6 * 60 * 60 * 1000;
+    // (below) so it still sees what it missed while away; older sessions are left as history. A week,
+    // not an afternoon: the owner brings Codex back for the review the next morning as often as the
+    // next minute, and whatever was said to it overnight is exactly what it needs.
+    const RECONNECT_REPLAY_MS = 7 * 24 * 60 * 60 * 1000;
     this._transaction(() => {
       this.db.prepare(`
         INSERT INTO agents (id, name, provider, capabilities, status, connected_at, last_seen, resume_token_hash, session_generation, fresh_task_id, current_model, current_effort)
@@ -450,16 +459,17 @@ export const agentMethods = {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     this.assertMembership(agentId, taskId);
-    // A message can be aimed at a specific teammate. A directed agent message is pushed to that
-    // teammate (returned by their next devteam_next / tool call); an undirected one is a
-    // timeline note anyone can read via devteam_next with want=state.
-    const enriched = { ...metadata };
+    // A message can be aimed at a specific teammate, or said to the whole room. Either way it is
+    // pushed — to that teammate, or to every other member — on their next devteam_next or tool call.
+    const enriched = { ...metadata, senderName: agent.name };
     let directedTo = null;
     if (metadata.target && String(metadata.target).trim()) {
       enriched.targetLabel = metadata.targetLabel || String(metadata.target).trim();
       enriched.target = String(metadata.target).trim().toLowerCase();
       enriched.senderName = agent.name;
       directedTo = enriched.targetLabel;
+    } else {
+      enriched.roomMessage = true;
     }
     this._transaction(() => {
       this._event(taskId, agentId, type, message.trim(), enriched);

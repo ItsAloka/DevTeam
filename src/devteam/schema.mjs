@@ -136,6 +136,16 @@ export function applySchema(db) {
       PRIMARY KEY (project_id, key)
     );
 
+    -- Who does which of the three roles on a project, by the name an agent connects under. A role
+    -- with no rows is open to anyone; a role with rows is done only by the agents it names. This is
+    -- the owner saying "Codex plans and reviews, Claude builds" once, instead of in every task.
+    CREATE TABLE IF NOT EXISTS project_team (
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      agent_name TEXT NOT NULL COLLATE NOCASE,
+      role TEXT NOT NULL,
+      PRIMARY KEY (project_id, agent_name, role)
+    );
+
     -- What an agent reported its checks did. Every row is the agent's own word: DevTeam used to run
     -- allowlisted commands itself and grade them by exit code, and the columns for that (argv,
     -- exit code, duration, captured output, a verified flag) are gone with the executor.
@@ -282,6 +292,18 @@ export function applySchema(db) {
     // earns a line in checklists/ is the owner's call, not DevTeam's.
     ["assignment_findings", "rule", "TEXT"],
     ["assignment_findings", "section", "TEXT"],
+    // Solo mode: when no independent reviewer can take a review, may its author review it, labelled
+    // selfReviewed? Off by default — a review then waits for someone who did not write the code.
+    ["projects", "solo_review", "INTEGER NOT NULL DEFAULT 0"],
+    // Card lifecycle (store-board.mjs). `closed` is a status of its own — taken off the board, not
+    // done — with the reason and, when there is one, the card that replaced it.
+    ["assignments", "closed_reason", "TEXT"],
+    ["assignments", "replaced_by_assignment_id", "TEXT"],
+    // Which round a review is on: a review sent back comes back as the same card, one round later.
+    ["assignments", "review_round", "INTEGER NOT NULL DEFAULT 1"],
+    // The blocked card a "Resolve blocker" planner card exists to decide, so the board can draw the
+    // two as one thing and settle the planner card when the blocked one is decided.
+    ["assignments", "resolves_assignment_id", "TEXT"],
   ]) {
     try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
   }
@@ -372,6 +394,35 @@ export function applySchema(db) {
       UPDATE assignments SET role = 'implementer' WHERE verifies = 0 AND plans = 0;
     `);
     db.prepare("INSERT INTO metadata (key, value) VALUES ('roles_collapsed_to_three', ?)").run(new Date().toISOString());
+  }
+  // Boards written before cards could be reopened or replaced still carry what the agents did
+  // instead: "Resolve blocker: …" planner cards whose link lives only in an event, and replacement
+  // cards that name the card they replace in their title — "(replaces da00ff11)". Record both links
+  // once, so the board can fold the old cards away instead of drawing every copy side by side.
+  if (!db.prepare("SELECT value FROM metadata WHERE key = 'board_links_backfilled'").get()) {
+    db.exec(`
+      UPDATE assignments SET resolves_assignment_id = (
+        SELECT json_extract(e.metadata, '$.blockedAssignmentId') FROM events e
+        WHERE e.task_id = assignments.task_id AND e.type = 'assignment.created'
+          AND json_extract(e.metadata, '$.assignmentId') = assignments.id
+          AND json_extract(e.metadata, '$.blockedAssignmentId') IS NOT NULL
+        LIMIT 1
+      )
+      WHERE resolves_assignment_id IS NULL AND title LIKE 'Resolve blocker:%';
+    `);
+    const replacements = db.prepare("SELECT id, task_id, title FROM assignments WHERE lower(title) LIKE '%replaces %'").all();
+    const original = db.prepare(`
+      SELECT id FROM assignments
+      WHERE task_id = ? AND id LIKE ? AND id != ? AND status IN ('blocked', 'closed') AND replaced_by_assignment_id IS NULL
+    `);
+    const link = db.prepare("UPDATE assignments SET replaced_by_assignment_id = ? WHERE id = ?");
+    for (const replacement of replacements) {
+      for (const match of replacement.title.matchAll(/replaces\s+([0-9a-f]{8})\b/gi)) {
+        const old = original.get(replacement.task_id, `${match[1].toLowerCase()}%`, replacement.id);
+        if (old) link.run(replacement.id, old.id);
+      }
+    }
+    db.prepare("INSERT INTO metadata (key, value) VALUES ('board_links_backfilled', ?)").run(new Date().toISOString());
   }
   // One agent may hold at most one claimed assignment at a time. Self-heal any legacy
   // double-claims (keep the earliest) before enforcing it at the schema level, so the

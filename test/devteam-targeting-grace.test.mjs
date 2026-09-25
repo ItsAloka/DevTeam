@@ -89,16 +89,18 @@ test("the author is not handed its own review while the independent reviewer is 
   assert.equal(store.claimNextAssignment(bobAgain.id)?.id, review.id, "and the review goes to the independent reviewer");
 });
 
-test("after the grace window the author may self-review, so the review never strands", async (t) => {
-  const { store, alice, bob, review } = await authorWithReviewer(t);
+test("with solo mode on, after the grace window the author may self-review, so the review never strands", async (t) => {
+  const { store, task, alice, bob, review } = await authorWithReviewer(t);
+  store.updateProject(task.project_id, { soloReview: true });
   store.handleTransportClose(bob.id);
   age(store, bob.id, TARGET_RECONNECT_GRACE_MS + 1_000);
 
   assert.equal(store.claimNextAssignment(alice.id)?.id, review.id);
 });
 
-test("a deliberate leave by the reviewer hands the author the review immediately, as before", async (t) => {
-  const { store, alice, bob, review } = await authorWithReviewer(t);
+test("with solo mode on, a deliberate leave by the reviewer hands the author the review immediately, as before", async (t) => {
+  const { store, task, alice, bob, review } = await authorWithReviewer(t);
+  store.updateProject(task.project_id, { soloReview: true });
   store.disconnectAgent(bob.id, "Going home.");
   assert.equal(store.claimNextAssignment(alice.id)?.id, review.id);
 });
