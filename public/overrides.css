@@ -2342,28 +2342,6 @@ nav.tasks-collapsed #task-current { display: block; }
 .card-dialog { width: min(760px, calc(100vw - 40px)); }
 .card-dialog textarea { resize: vertical; line-height: 1.45; }
 
-/* Open, the board keeps the chat beside it on a wide screen: watching the flow and talking to the
-   team are one activity. Narrower than that, the board takes the column as before. */
-@media (min-width: 1280px) {
-  .workspace.board-full {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) clamp(320px, 30%, 460px);
-    grid-template-rows: auto auto minmax(0, 1fr);
-  }
-  .workspace.board-full > .task-header,
-  .workspace.board-full > .blocked-banner { grid-column: 1 / -1; }
-  .workspace.board-full > #work-board { grid-column: 1; grid-row: 3; min-height: 0; }
-  .workspace.board-full > #conversation {
-    display: flex;
-    grid-column: 2;
-    grid-row: 3;
-    min-height: 0;
-    border-left: 1px solid var(--line);
-  }
-  .workspace.board-full > #conversation .event-list { padding: 18px 18px 26px; }
-  .workspace.board-full > #conversation .event { max-width: none; }
-}
-
 /* The map's areas, named where they sit, and the file panel's own sentence about the file. */
 .map-area-label {
   fill: color-mix(in srgb, var(--agent-color, var(--muted)) 75%, var(--text));
