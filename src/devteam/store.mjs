@@ -669,9 +669,6 @@ export class DevTeamStore extends EventEmitter {
       return { ...this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId), team: this.projectTeam(projectId) };
     }
     this.db.prepare("UPDATE projects SET name = ?, root = ? WHERE id = ?").run(nextName, nextRoot, projectId);
-    // A check allowlist is approved against the tree it was reviewed in. Repointing the root would
-    // otherwise silently start executing those commands somewhere the human never looked.
-    if (nextRoot !== project.root) this.db.prepare("DELETE FROM project_check_commands WHERE project_id = ?").run(projectId);
     if (nextRoot !== project.root) {
       try { this.knowledge.initializeProject(projectId); }
       catch (error) { this.knowledgeErrors.set(`project:${projectId}`, { message: error.message, at: now() }); }

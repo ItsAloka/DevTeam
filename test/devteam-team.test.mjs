@@ -227,3 +227,21 @@ test("a new task's brief starts from where the previous task ended", async (t) =
   assert.match(brief.previousWork[0].endedWith, /installer and UI still to build/);
   assert.deepEqual(brief.previousWork[0].learned, ["The frozen app does not ship packaging"]);
 });
+
+// Moving a project to another folder used to save the new folder and then throw, because it still
+// cleared the approvals table of a command runner that no longer exists — so the vault and the code
+// graph were never pointed at the new folder.
+test("a project can be moved to another folder in one step", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-move-"));
+  const before = await mkdtemp(path.join(os.tmpdir(), "devteam-move-before-"));
+  const after = await mkdtemp(path.join(os.tmpdir(), "devteam-move-after-"));
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: false } });
+  t.after(async () => {
+    store.close();
+    for (const folder of [dataDir, before, after]) await rm(folder, { recursive: true, force: true });
+  });
+  const project = store.ensureProject("Moving project", before);
+  const moved = store.updateProject(project.id, { root: after });
+  assert.equal(moved.root, path.resolve(after));
+  assert.equal(store.listProjects()[0].root, path.resolve(after));
+});
