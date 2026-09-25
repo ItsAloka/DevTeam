@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
+import { normalizeMapPath } from "./util.mjs";
 
 const CATEGORIES = ["architecture", "decisions", "components", "conventions", "pitfalls", "workflows"];
 // Which DevTeam project a vault on disk belongs to. Every generated note carries the same
@@ -83,6 +84,62 @@ function safeFiles(files) {
     .filter((item) => item && item.length <= 500 && !secretLike(item)))].slice(0, 100);
 }
 
+// Endings that make a dotted name a file rather than a Python module: `cookies.txt` is a text file,
+// not `cookies.py`.
+const FILE_EXTENSIONS = new Set([
+  "bat", "cfg", "cjs", "css", "csv", "dll", "exe", "gif", "html", "ini", "ipynb", "iss", "jpg", "jpeg",
+  "js", "json", "jsx", "lock", "log", "md", "mjs", "png", "ps1", "py", "pyi", "sh", "spec", "sql", "toml",
+  "ts", "tsx", "txt", "whl", "xml", "yaml", "yml", "zip",
+]);
+
+// The files a note is about are the files it names. A lesson written on a report used to inherit
+// every file that report changed — twenty of them for a fact about one API — so a pitfall about
+// Deezer's error format sat on the map beside a GUI page it never mentions, and that page carried 39
+// notes. A name counts in the forms people write one: a path or the tail of one (`gui/pages.py`), a
+// file name (`installer.iss`), or a Python module path (`core.runner.ENV_OF`,
+// `widgets.plain_tooltip`). Only files the project has can be named, and a name that fits more than
+// three of them (`__init__.py`) names none — pinning a note to every package is what this replaces.
+export function filesNamedIn(text, candidates) {
+  const files = [...new Set((Array.isArray(candidates) ? candidates : []).map(normalizeMapPath).filter(Boolean))];
+  const lower = files.map((file) => file.toLowerCase());
+  const byName = new Map();
+  lower.forEach((file, index) => {
+    const name = file.slice(file.lastIndexOf("/") + 1);
+    byName.set(name, [...(byName.get(name) || []), files[index]]);
+  });
+  // Paths are matched whatever their case, because Windows writes them either way; module names are
+  // not, because Python never does.
+  const endingWith = (tail, exactCase = false) => files.filter((file, index) => {
+    const subject = exactCase ? file : lower[index];
+    const wanted = exactCase ? tail : tail.toLowerCase();
+    return subject === wanted || subject.endsWith(`/${wanted}`);
+  });
+  const found = new Set();
+  const pin = (matches) => {
+    if (!matches.length || matches.length > 3) return false;
+    for (const file of matches) found.add(file);
+    return true;
+  };
+  const named = (token) => {
+    if (!token.includes(".")) return;
+    if (pin(byName.get(token.toLowerCase()) || [])) return;
+    const parts = token.split(".");
+    if (FILE_EXTENSIONS.has(parts.at(-1).toLowerCase())) return;
+    // The longest prefix that is a module wins: `core.runner.ENV_OF` is core/runner.py, not core.
+    for (let length = parts.length; length >= 1; length -= 1) {
+      const modulePath = parts.slice(0, length).join("/");
+      const matches = [...endingWith(`${modulePath}.py`, true), ...endingWith(`${modulePath}/__init__.py`, true)];
+      if (matches.length) { pin(matches); return; }
+    }
+  };
+  for (const raw of String(text || "").match(/[A-Za-z0-9_][\w.\-/\\]*\w/g) || []) {
+    const token = raw.replace(/\\/g, "/");
+    if (!token.includes("/")) named(token);
+    else if (!pin(endingWith(token))) token.split("/").forEach(named);
+  }
+  return [...found].sort();
+}
+
 function normalizeProjectFiles(projectRoot, files) {
   const root = realpathSync(path.resolve(projectRoot));
   const normalized = [];
@@ -129,6 +186,23 @@ const STOP_WORDS = new Set([
 function terms(value) {
   const matches = String(value || "").toLowerCase().normalize("NFKD").match(/[a-z0-9][a-z0-9_-]{1,}/g) || [];
   return new Set(matches.filter((term) => !STOP_WORDS.has(term)).slice(0, 400));
+}
+
+// Two titles state the same fact when they share nearly all their significant words — filler dropped,
+// plurals folded. Measured on every note in the live database: the one real duplicate pair (two
+// agents recording the same Inno Setup pitfall a minute apart) scores 0.91, and the closest pair of
+// genuinely different notes scores 0.23. A bar at 0.8 sits well inside that gap, and it lets a short
+// title differ by one word only once it has five.
+function titleWords(value) {
+  return new Set([...terms(value)].map((word) => (word.length > 3 && word.endsWith("s") && !word.endsWith("ss") ? word.slice(0, -1) : word)));
+}
+
+export function sameTitle(left, right) {
+  const leftWords = titleWords(left);
+  const rightWords = titleWords(right);
+  if (!leftWords.size || !rightWords.size) return false;
+  const shared = [...leftWords].filter((word) => rightWords.has(word)).length;
+  return shared / (leftWords.size + rightWords.size - shared) >= 0.8;
 }
 
 function overlaps(left, right) {
@@ -641,17 +715,20 @@ export class KnowledgeVault {
     const active = tasks.filter((task) => !["accepted", "cancelled"].includes(task.status));
     const sessionPath = (task) => `sessions/${stampDate(task.created_at)}-${slugify(task.title)}-${task.id.slice(0, 8)}`;
     const notes = this.db.prepare(`
-      SELECT category, title, body, confidence, source_task_id, related_files, created_at
+      SELECT category, title, body, status, stale_reason, confidence, source_task_id, related_files, created_at
       FROM knowledge_notes WHERE project_id = ? ORDER BY created_at ASC
     `).all(project.id);
+    // What the project believes now. A retired note stays on the page of the task that learned it,
+    // marked as retired, but it is no longer something the project has learned.
+    const current = notes.filter((note) => ["verified", "inferred"].includes(note.status));
     const lines = [
       "---", `project: ${yamlString(project.name)}`, "generated_by: DevTeam", `updated: ${yamlString(new Date().toISOString())}`, "---", "",
       `# Current — ${project.name}`, "", "> One file per task, written from DevTeam's history. Do not store secrets here.", "",
       "## Active tasks", "",
       ...(active.length ? active.map((task) => `- **${task.title}** — ${task.status}, v${task.version} ([[${sessionPath(task)}]])`) : ["- No active tasks."]),
       "", "## What this project has learned", "",
-      ...(notes.length
-        ? notes.slice(-40).reverse().map((note) => `- **${short(note.title, 160)}** — ${note.category}, ${note.confidence} confidence`)
+      ...(current.length
+        ? current.slice(-40).reverse().map((note) => `- **${short(note.title, 160)}** — ${note.category}, ${note.confidence} confidence`)
         : ["- Nothing recorded yet. Notes come from `devteam_memory write`, a `learned` line on a report, or a project memory key."]),
       "",
     ];
@@ -703,7 +780,8 @@ export class KnowledgeVault {
       // `short`, not `clip`: one line each. A decision here is an index entry — the argument itself
       // is in the room, and pasting 400 characters of it per bullet is the transcript dump this
       // page replaced.
-      ...section("Learned", learned.map((note) => `- **${short(note.title, 160)}** — ${short(KnowledgeVault.headline(note.body), 240)}`),
+      ...section("Learned", learned.map((note) => `- **${short(note.title, 160)}** — ${short(KnowledgeVault.headline(note.body), 240)}${
+        note.status === "archived" ? ` *(retired: ${short(note.stale_reason || "no longer holds", 200)})*` : ""}`),
         "- Nothing was recorded as learned here."),
       ...section("Decisions", decisions.map((event) => `- ${short(event.message, 240)}`), "- No decisions were recorded."),
       ...section("Where it stopped", stops.map((line) => `- ${line}`), "- Nothing is open."),
@@ -892,7 +970,12 @@ export class KnowledgeVault {
   //     human), and letting an agent claim it would make the distinction worthless exactly where
   //     it matters most: deciding what to believe in the next session's briefing.
   //   * `sessions` and `archive` are not writable categories. They are DevTeam's own bookkeeping.
-  write({ projectId, category, title, body, confidence = "medium", relatedFiles = [], author = "agent", taskId = null, eventId = null }) {
+  //
+  // One fact is one note. A title that says what a current note already says updates that note
+  // rather than adding a second one beside it, and `replaces` names a note this one corrects, which
+  // is then retired — so fixing what a pitfall warned about leaves one note saying how things are
+  // now, not two that disagree.
+  write({ projectId, category, title, body, confidence = "medium", relatedFiles = [], replaces = null, author = "agent", taskId = null, eventId = null }) {
     if (!this.enabled) return { written: false, reason: "The knowledge vault is disabled for this server." };
     const cleanCategory = String(category || "").trim().toLowerCase();
     if (!CATEGORIES.includes(cleanCategory)) {
@@ -902,41 +985,189 @@ export class KnowledgeVault {
     const cleanBody = String(body || "").trim();
     if (!cleanTitle) throw new Error("A knowledge note needs a title.");
     if (!cleanBody) throw new Error("A knowledge note needs a body — the fact you learned, in a sentence or two.");
+    const replaced = replaces ? this.#activeNote(projectId, replaces) : null;
+    if (replaces && !replaced) {
+      throw new Error("The note to replace is not one of this project's current notes. Search for it again, or write without replaces.");
+    }
     const cleanConfidence = ["low", "medium", "high"].includes(String(confidence).toLowerCase())
       ? String(confidence).toLowerCase() : "medium";
     const stamp = new Date().toISOString();
     const slug = slugify(cleanTitle);
+    const exact = this.db.prepare("SELECT id, category, slug, status FROM knowledge_notes WHERE id = ?")
+      .get(KnowledgeVault.noteId(projectId, cleanCategory, slug));
+    // The note this fact already lives in, if any. It keeps its category and slug, so its id and every
+    // link to it hold; the newer wording replaces the older, because it is the later look at the same
+    // thing. A retired note with this exact title is not reused over a current one that says the same.
+    const existing = (exact && ["verified", "inferred"].includes(exact.status) ? exact : null)
+      || this.#sameTitledNote(projectId, cleanTitle);
+    const target = existing || { category: cleanCategory, slug };
+    const explicit = safeFiles((Array.isArray(relatedFiles) ? relatedFiles : []).map(normalizeMapPath));
+    const files = safeFiles([...explicit, ...filesNamedIn(`${cleanTitle}\n${cleanBody}`, [...this.#fileCandidates(projectId), ...explicit])]);
     const id = this.#upsert({
-      projectId, category: cleanCategory, slug,
+      projectId, category: target.category, slug: target.slug,
       title: redact(cleanTitle), body: redact(cleanBody),
       status: "inferred",
       confidence: cleanConfidence,
       sourceTaskId: taskId, sourceEventId: eventId, sourceAuthor: author,
-      relatedFiles, createdAt: stamp,
+      relatedFiles: files, createdAt: stamp,
       provenance: { type: "agent.note", eventId: eventId ?? null, author, at: stamp },
     });
+    if (replaced && replaced.id !== id) {
+      this.retire(projectId, replaced.id, { reason: `Replaced by "${short(cleanTitle, 160)}".`, supersededBy: id });
+    }
     const note = this.db.prepare("SELECT * FROM knowledge_notes WHERE id = ?").get(id);
     // T3.2: does this disagree with something the project already believes? Detected on write, while
     // the agent that wrote it is still here and can say which is right — not months later when a
     // briefing quietly serves one of two contradictory "verified" facts.
     const conflicts = this.#conflictCandidates(projectId, {
-      category: cleanCategory, title: cleanTitle, body: cleanBody, relatedFiles,
+      category: target.category, title: cleanTitle, body: cleanBody, relatedFiles: files,
     }, id);
     return {
       written: true,
+      ...(existing ? { updatedExisting: true } : {}),
       note: {
-        id, category: cleanCategory, slug, title: note.title, status: note.status,
+        id, category: target.category, slug: target.slug, title: note.title, status: note.status,
         confidence: note.confidence, revision: note.revision,
-        link: `[[${cleanCategory}/${slug}]]`,
+        relatedFiles: parseJson(note.related_files, []),
+        link: `[[${target.category}/${target.slug}]]`,
       },
+      ...(replaced ? { replaced: { id: replaced.id, title: replaced.title } } : {}),
       links: this.outboundLinks(id),
       backlinks: this.backlinks(id),
       ...(conflicts.length ? {
         possibleConflicts: conflicts,
-        conflictNext: "These existing notes are about the same subject and say something different. If one is wrong, supersede it; if the team disagrees, raise it with devteam_propose — do not leave two contradictory facts standing.",
+        conflictNext: "These existing notes are about the same subject and say something different. If one of them is now wrong, retire it (devteam_memory action=retire) or write the correction with replaces=<its id> — do not leave two contradictory facts standing.",
       } : {}),
-      next: "Written as an inferred note. It becomes verified only when DevTeam observes it, not by asserting it.",
+      next: existing
+        ? "A current note already said this, so it was updated in place rather than written twice."
+        : "Written as an inferred note. It becomes verified only when DevTeam observes it, not by asserting it.",
     };
+  }
+
+  // Take a note out of circulation without deleting it. Briefs, searches and the map read only
+  // current notes, so a retired one leaves all three at once; its row stays, with the reason and
+  // whatever replaced it, so the page of the task that learned it still says what was believed and
+  // why it stopped being true.
+  retire(projectId, noteId, { reason, supersededBy = null } = {}) {
+    const note = this.#activeNote(projectId, noteId);
+    if (!note) throw new Error("That note is not one of this project's current notes.");
+    const cleanReason = short(reason, 500);
+    if (!cleanReason) throw new Error("Say why the note no longer holds. It stays on record with that reason.");
+    this.db.prepare(`
+      UPDATE knowledge_notes SET status = 'archived', stale_reason = ?, superseded_by = ?, status_changed_at = ? WHERE id = ?
+    `).run(cleanReason, supersededBy, new Date().toISOString(), note.id);
+    return { retired: true, note: { id: note.id, title: note.title, link: `[[${note.category}/${note.slug}]]` }, reason: cleanReason };
+  }
+
+  // A current note of this project, by id or by the `[[category/slug]]` link a brief shows beside it.
+  #activeNote(projectId, reference) {
+    const value = String(reference || "").trim();
+    const link = value.match(/^\[\[([^\]/|]+)\/([^\]|]+)(?:\|[^\]]*)?\]\]$/);
+    const id = link ? KnowledgeVault.noteId(projectId, link[1].trim(), link[2].trim()) : value;
+    return this.db.prepare(`
+      SELECT id, category, slug, title FROM knowledge_notes WHERE project_id = ? AND id = ? AND status IN ('verified', 'inferred')
+    `).get(projectId, id) || null;
+  }
+
+  // A current note that already states this fact under nearly the same title. Project memory keys are
+  // left out: their note is rewritten from the key whenever the key changes, so folding an agent's
+  // note into one would be undone by the next edit.
+  #sameTitledNote(projectId, title) {
+    return this.db.prepare(`
+      SELECT id, category, slug, title FROM knowledge_notes
+      WHERE project_id = ? AND status IN ('verified', 'inferred') AND slug NOT LIKE 'memory-%'
+      ORDER BY updated_at DESC
+    `).all(projectId).find((note) => sameTitle(note.title, title)) || null;
+  }
+
+  // Every file a note could name: what the code graph indexed, plus whatever a report in this project
+  // said it changed — which is how a file the graph does not parse (`installer.iss`,
+  // `THIRD_PARTY_LICENSES.txt`) can still be named. Hidden folders are left out, as the graph leaves
+  // them out: in one real note `run.on_event` is a variable, and `.devteam-smoke/run.py` is scratch.
+  #fileCandidates(projectId) {
+    let modules = [];
+    try {
+      modules = this.db.prepare("SELECT path FROM code_modules WHERE project_id = ?").all(projectId).map((row) => row.path);
+    } catch { /* a database the code graph has not created its tables in */ }
+    const reported = this.db.prepare(`
+      SELECT e.metadata FROM events e JOIN tasks t ON t.id = e.task_id
+      WHERE t.project_id = ? AND e.type IN ('assignment.completed', 'assignment.blocked')
+    `).all(projectId).flatMap((row) => {
+      const changed = parseJson(row.metadata, {})?.changedFiles;
+      return Array.isArray(changed) ? changed : [];
+    });
+    return [...new Set([...modules, ...reported].map(normalizeMapPath))].filter((file) => file && file.length <= 500
+      && !/[\s:]/.test(file) && !secretLike(file) && !file.split("/").some((part) => part.startsWith(".")));
+  }
+
+  // Notes written before a note named its own files carry the whole changed-file list of the report
+  // they rode in on: 73 of Stuff Downloader's 102, twenty files apiece. They are recognisable — their
+  // files are exactly the list some report in the same task named — and are re-pinned, once, to the
+  // files they name. Any other list was chosen by whoever wrote the note and is kept, with the files
+  // the note names added. Nothing else about a note changes: this is a repair, not a new statement.
+  repinNoteFilesOnce() {
+    if (this.db.prepare("SELECT value FROM metadata WHERE key = 'note_files_repinned'").get()) return;
+    const reports = this.db.prepare(`
+      SELECT metadata FROM events WHERE task_id = ? AND type IN ('assignment.completed', 'assignment.blocked')
+    `);
+    const asKey = (files) => JSON.stringify([...new Set(files)].sort());
+    const update = this.db.prepare("UPDATE knowledge_notes SET related_files = ? WHERE id = ?");
+    const candidates = new Map();
+    this.db.exec("BEGIN");
+    try {
+      for (const note of this.db.prepare("SELECT id, project_id, title, body, related_files, source_task_id FROM knowledge_notes").all()) {
+        const current = safeFiles(parseJson(note.related_files, []));
+        const own = asKey(current);
+        const dumped = current.length > 0 && Boolean(note.source_task_id) && reports.all(note.source_task_id).some((row) => {
+          const changed = parseJson(row.metadata, {})?.changedFiles;
+          return Array.isArray(changed) && changed.length > 0
+            && asKey(safeFiles(changed.map((file) => String(file).trim()).filter(Boolean).slice(0, 20))) === own;
+        });
+        if (!candidates.has(note.project_id)) candidates.set(note.project_id, this.#fileCandidates(note.project_id));
+        const named = filesNamedIn(`${note.title}\n${note.body}`, [...candidates.get(note.project_id), ...(dumped ? [] : current)]);
+        const files = safeFiles([...(dumped ? [] : current), ...named]);
+        if (asKey(files) === own) continue;
+        update.run(JSON.stringify(files), note.id);
+        this.#indexFts(note.id, note.title, note.body, JSON.stringify(files));
+      }
+      this.db.prepare("INSERT INTO metadata (key, value) VALUES ('note_files_repinned', ?)").run(new Date().toISOString());
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // Duplicates written before a same-titled write updated the note already there: in the live
+  // database, one pair — two agents recording the same Inno Setup pitfall a minute apart. Once, the
+  // note pinned to more files is kept (it reaches the file it is about), the older on a tie, and the
+  // other is retired pointing at it, its files carried over. Nothing is deleted.
+  mergeDuplicateNotesOnce() {
+    if (this.db.prepare("SELECT value FROM metadata WHERE key = 'note_duplicates_merged'").get()) return;
+    const notes = this.db.prepare(`
+      SELECT id, project_id, title, related_files FROM knowledge_notes
+      WHERE status IN ('verified', 'inferred') AND slug NOT LIKE 'memory-%' ORDER BY created_at ASC, id ASC
+    `).all().map((note) => ({ ...note, files: safeFiles(parseJson(note.related_files, [])) }));
+    const retired = new Set();
+    this.db.exec("BEGIN");
+    try {
+      for (const [index, first] of notes.entries()) {
+        for (const second of notes.slice(index + 1)) {
+          if (retired.has(first.id) || retired.has(second.id)) continue;
+          if (first.project_id !== second.project_id || !sameTitle(first.title, second.title)) continue;
+          const [kept, dropped] = second.files.length > first.files.length ? [second, first] : [first, second];
+          kept.files = safeFiles([...kept.files, ...dropped.files]);
+          this.db.prepare("UPDATE knowledge_notes SET related_files = ? WHERE id = ?").run(JSON.stringify(kept.files), kept.id);
+          this.retire(kept.project_id, dropped.id, { reason: `Duplicate of "${short(kept.title, 160)}".`, supersededBy: kept.id });
+          retired.add(dropped.id);
+        }
+      }
+      this.db.prepare("INSERT INTO metadata (key, value) VALUES ('note_duplicates_merged', ?)").run(new Date().toISOString());
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   // Only files this exporter would write are candidates, and only when they still carry its own

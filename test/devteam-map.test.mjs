@@ -12,7 +12,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DevTeamStore } from "../src/devteam/store.mjs";
-import { normalizeMapPath } from "../src/devteam/store-views.mjs";
+import { normalizeMapPath } from "../src/devteam/util.mjs";
 import { isTestPath, layoutCodeMap, mapGroupLabel, mapGroupOf, mapGrouping } from "../public/ui-utils.js";
 
 // The graph rows are written by hand here rather than indexed, so the fixtures stay small and say

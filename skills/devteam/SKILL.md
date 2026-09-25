@@ -30,7 +30,7 @@ The project files are the source of truth. DevTeam tells you what the team knows
 | `devteam_report` | finish the assignment you hold, with evidence and anything you `learned` |
 | `devteam_verdict` | approve, or send back, work you reviewed |
 | `devteam_stuck` | ask why work will not move, or stop the task for the human |
-| `devteam_memory` | search the vault, record a durable fact, or use the scratchpad |
+| `devteam_memory` | search the vault, record or retire a durable fact, or use the scratchpad |
 | `devteam_message` | talk to the room or one teammate |
 | `devteam_leave` | end the session |
 
@@ -137,12 +137,30 @@ notes that reach future briefs come only from agents. There are two ways in:
   convention the code keeps but never states, a trap in the build. Give it a `category`
   (architecture, decisions, components, conventions, pitfalls, workflows), a `title` that states the
   fact ("The billing API rate-limits at 30 requests/minute", not "Billing API") and a `body` someone
-  can act on. It is tied to the files you changed. An empty list is honest when nothing was learned;
-  a list of progress notes is not memory.
+  can act on. An empty list is honest when nothing was learned; a list of progress notes is not
+  memory.
 - `devteam_memory action=write` — for a fact you learn outside a report, for example while planning
-  or reviewing. Add `relatedFiles` so it goes stale when they change, and an honest `confidence`
-  (`low` is still worth recording; notes are ranked by it). Link related notes inline with
-  `[[category/slug]]`.
+  or reviewing. Give an honest `confidence` (`low` is still worth recording; notes are ranked by it).
+  Link related notes inline with `[[category/slug]]`.
+
+**A note is pinned to the files it names**, not to every file you changed. Name the file in the title
+or body the way you would to a colleague — `gui/pages.py`, `installer.iss`, `core.runner.env_for` —
+and it is pinned there: it shows on that file in the Map and reaches whoever works on it next. Use
+`relatedFiles` only for a file the note is about but does not name.
+
+**One fact, one note.** Writing a title that says what a current note already says updates that note
+instead of adding a second, so write the fact as it stands now.
+
+**Keep the vault true.** When your work fixes something a note warns about, or makes a note wrong, deal
+with that note in the same breath — a pitfall that no longer bites will mislead the next person:
+
+- It is simply no longer true: `devteam_memory action=retire` with its `noteId` (your brief shows each
+  note's id) and a `reason` ("Fixed in the retry rework: the client now backs off on 429").
+- Something true replaces it: write the correction with `replaces=<its id>`, on `devteam_memory
+  action=write` or on a `learned` item. The old note is retired and points at the new one.
+
+A retired note leaves briefs and the Map but stays on record with its reason. Never retire a note you
+merely disagree with; check the code first, and say what you checked in the reason.
 
 Before starting non-trivial work, read the vault notes in your brief and use `action=search` (words,
 a path, a component; narrow with `category`) when a headline looks relevant or the brief had none. `action=get` / `set` is a

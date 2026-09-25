@@ -322,11 +322,11 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_memory", {
     title: "Project memory",
-    description: "The project's memory. A note exists only because somebody wrote it — here with action=write, or in the learned field of devteam_report — and your brief already carries the most relevant notes as headlines. action=search fetches the full body of a note the brief only summarised, or finds notes by words, path or category — reach for it whenever a headline looks relevant. action=write records a fact the next person would otherwise rediscover: an API limit, why the obvious approach fails here, a convention the code follows but never states. Not a progress update and not a decision the team took — post those with devteam_message. action=get and action=set are a small versioned key/value scratchpad — scope=task for this job, scope=project to persist across the project's tasks; re-read and merge on a version conflict.",
+    description: "The project's memory. A note exists only because somebody wrote it — here with action=write, or in the learned field of devteam_report — and your brief already carries the most relevant notes as headlines, each with its id. action=search fetches the full body of a note the brief only summarised, or finds notes by words, path or category — reach for it whenever a headline looks relevant. action=write records a fact the next person would otherwise rediscover: an API limit, why the obvious approach fails here, a convention the code follows but never states. A title that says what a current note already says updates that note instead of adding a second. Not a progress update and not a decision the team took — post those with devteam_message. action=retire takes a note out of briefs and the map when it no longer holds — you fixed what it warned about, or the code moved on — and keeps it on record with your reason; to correct a note instead, write the new one with replaces=<its id>. action=get and action=set are a small versioned key/value scratchpad — scope=task for this job, scope=project to persist across the project's tasks; re-read and merge on a version conflict.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
-      action: z.enum(["search", "write", "get", "set"]).default("search"),
+      action: z.enum(["search", "write", "retire", "get", "set"]).default("search"),
       query: z.string().max(500).default("").describe("search: words, a file path, a component or a decision; empty returns the most relevant recent notes"),
       category: z.enum(["architecture", "decisions", "components", "conventions", "pitfalls", "workflows", "archive"]).optional()
         .describe("search: narrow to one kind. write: required — architecture (how it fits together), decisions (a choice and its reason), components (what one part does), conventions (a rule the project follows), pitfalls (what will bite the next person), workflows (how a recurring job is done)."),
@@ -334,7 +334,10 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       title: z.string().min(1).max(200).optional().describe("write: the fact as a statement, not a topic — 'The billing API rate-limits at 30 requests/minute', not 'Billing API'"),
       body: z.string().min(1).max(4000).optional().describe("write: the fact with enough context to act on. Link related notes inline with [[category/slug]] and they become navigable both ways."),
       confidence: z.enum(["low", "medium", "high"]).default("medium").describe("write: be honest — a low-confidence note is still worth recording and is ranked accordingly. Notes you write are recorded as 'inferred'; verified means DevTeam observed it."),
-      relatedFiles: z.array(z.string().max(500)).max(20).default([]).describe("write: project-relative files this fact concerns, so it goes stale when they change"),
+      relatedFiles: z.array(z.string().max(500)).max(20).default([]).describe("write: project-relative files this fact is about. Files you name in the title or body are pinned automatically; add only the ones you did not name. The note is pinned to them on the map and reaches whoever works on them."),
+      replaces: z.string().max(200).optional().describe("write: the id of a current note this one corrects. That note is retired, pointing at this one."),
+      noteId: z.string().max(200).optional().describe("retire: the note's id, as your brief or a search shows it"),
+      reason: z.string().max(500).optional().describe("retire: why it no longer holds, e.g. 'Fixed in the retry rework: the client now backs off on 429'"),
       scope: z.enum(["task", "project"]).default("task").describe("get/set only"),
       key: z.string().max(120).optional().describe("get/set: e.g. 'world', 'open-questions', 'ownership'. Omit on get to list the keys."),
       value: z.string().min(0).max(100000).optional().describe("set: the new content, plain text or a JSON string"),
@@ -349,8 +352,12 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       }
       return withInbox(agentId, store.knowledgeWrite({
         agentId, taskId, category: args.category, title: args.title, body: args.body,
-        confidence: args.confidence, relatedFiles: args.relatedFiles,
+        confidence: args.confidence, relatedFiles: args.relatedFiles, replaces: args.replaces ?? null,
       }));
+    }
+    if (action === "retire") {
+      if (!args.noteId || !args.reason) throw new Error("action=retire needs noteId and reason.");
+      return withInbox(agentId, store.knowledgeRetire({ agentId, taskId, noteId: args.noteId, reason: args.reason }));
     }
     if (action === "set") {
       if (!args.key || args.value === undefined) throw new Error("action=set needs key and value.");
@@ -396,6 +403,8 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
           .describe("architecture (how it fits together), decisions (a choice and its reason), components (what one part does), conventions (a rule the project follows), pitfalls (what will bite the next person), workflows (how a recurring job is done)"),
         title: z.string().min(1).max(200).describe("The fact as a statement, not a topic — 'The billing API rate-limits at 30 requests/minute', not 'Billing API'"),
         body: z.string().min(1).max(4000).describe("The fact with enough context for the next person to act on it"),
+        relatedFiles: z.array(z.string().max(500)).max(20).optional().describe("Files this fact is about that the title and body do not name. Files they name are pinned automatically; the rest of your changed files are not."),
+        replaces: z.string().max(200).optional().describe("The id of a current note this one corrects — for example a pitfall your change fixed. That note is retired."),
       })).max(3).default([]).describe("What this work taught you that the next person would otherwise rediscover: an API limit, why the obvious approach fails here, a convention the code follows but never states. Recorded as project memory and delivered in future briefs. Omit it when the work taught you nothing durable — most work does not, and an empty list is the honest answer."),
     },
   }, safe(async ({ disconnectAfter, ...args }) => {

@@ -163,6 +163,10 @@ export class DevTeamStore extends EventEmitter {
     this.knowledgeErrors = new Map();
     this.#rebuildVaultPagesOnce();
     this.codegraph = new CodeGraph(this.db, codegraph);
+    // After the code graph, whose indexed files are what a note can name; duplicates after the re-pin,
+    // because which copy to keep depends on the files each one names.
+    try { this.knowledge.repinNoteFilesOnce(); } catch { /* not marked done, so it is retried on the next start */ }
+    try { this.knowledge.mergeDuplicateNotesOnce(); } catch { /* likewise */ }
     this.codegraphErrors = new Map();
     this.briefHealth = new Map();
     this.token = this.#getOrCreateToken();
@@ -2122,17 +2126,25 @@ export class DevTeamStore extends EventEmitter {
     // Memory is written where the work ends, not in a tool somebody has to remember. DevTeam used to
     // mine the events for it instead and got 964 notes of transcript for 11 facts; asking for the
     // facts on the call every agent already has to make is the same question put where it can be
-    // answered. The files the report named come with it, so the note knows what it is about.
+    // answered. A lesson is pinned to the files it names and the files the agent gives it, not to
+    // everything the report changed: twenty files per lesson put a note about one API beside every
+    // page of the GUI.
     const recorded = [];
+    const notRecorded = [];
     for (const note of (Array.isArray(learned) ? learned : []).slice(0, 3)) {
       if (!note?.title || !note?.body || !note?.category) continue;
       try {
         const written = this.knowledgeWrite({
           agentId, taskId: assignment.task_id, category: note.category, title: note.title,
-          body: note.body, confidence: "high", relatedFiles: cleanChanged.slice(0, 20),
+          body: note.body, confidence: "high", relatedFiles: Array.isArray(note.relatedFiles) ? note.relatedFiles : [],
+          replaces: note.replaces || null,
         });
         if (written?.written !== false) recorded.push(String(note.title).slice(0, 200));
-      } catch { /* a malformed lesson must never cost the agent its finished report */ }
+      } catch (error) {
+        // A lesson the vault refuses must never cost the agent its finished report — but it is said,
+        // so the agent can record it with devteam_memory instead of believing it was kept.
+        notRecorded.push({ title: String(note.title).slice(0, 200), reason: String(error?.message || error).slice(0, 300) });
+      }
     }
     return {
       completed: true,
@@ -2141,6 +2153,7 @@ export class DevTeamStore extends EventEmitter {
       status,
       version,
       ...(recorded.length ? { learned: recorded } : {}),
+      ...(notRecorded.length ? { learnedNotRecorded: notRecorded } : {}),
       changedFiles: cleanChanged,
       checks: checkRecords,
       ...(regressions.length ? { regressions } : {}),

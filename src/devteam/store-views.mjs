@@ -9,7 +9,7 @@
 //
 // A mixin on DevTeamStore.prototype, for the reasons in store-checks.mjs.
 import path from "node:path";
-import { fromJson, now } from "./util.mjs";
+import { fromJson, normalizeMapPath, now } from "./util.mjs";
 import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
 import { checklistBrief, DEFAULT_CHECKLIST_DIRNAME } from "./checklists.mjs";
 // The board's step model is shared with the dashboard, so the text an agent reads and the flowchart
@@ -19,23 +19,6 @@ import { buildFlowModel, layoutFlowBoard } from "../../public/ui-utils.js";
 // Long enough for a real task brief — Stuff Downloader's run 2.5–3.5 KB — with room to spare, and
 // still a fraction of the 32 KB total the brief is held to.
 const TASK_DESCRIPTION_BRIEF_BYTES = 12_000;
-
-// File paths reach the map from two places that were never validated against the code graph: a
-// note's related files, and the changed files an agent reports. Both are written by hand, so they
-// arrive with backslashes, leading `./`, backticks, and trailing asides like "(NEW)" or
-// "(reviewed, not edited)". Repairing the obvious damage here is what lifts the match rate against
-// indexed modules from 65% to 87% on this project's own history; anything still unmatched is
-// dropped rather than guessed at, because a node in the wrong place is worse than a missing one.
-export function normalizeMapPath(value = "") {
-  return String(value ?? "")
-    .trim()
-    .replace(/^[`"']+|[`"']+$/g, "")
-    .replace(/\s*\([^()]*\)\s*$/, "")
-    .replace(/\\/g, "/")
-    .replace(/^\.\//, "")
-    .replace(/^\/+/, "")
-    .trim();
-}
 
 export const viewMethods = {
   // The domain checklist an assignment carries, read from the owner's Markdown under

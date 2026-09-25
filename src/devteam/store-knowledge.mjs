@@ -80,26 +80,47 @@ export const knowledgeMethods = {
   // An agent recording something it learned, as a first-class vault note rather than prose in a
   // report. Membership-scoped like every other task-shaped action, and written under the agent's own
   // name so the timeline and the note agree about who claimed it.
-  knowledgeWrite({ agentId = null, taskId, category, title, body, confidence = "medium", relatedFiles = [] }) {
+  knowledgeWrite({ agentId = null, taskId, category, title, body, confidence = "medium", relatedFiles = [], replaces = null }) {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     this.assertMembership(agentId, taskId);
     const agent = agentId ? this.getAgent(agentId) : null;
     const author = agent?.name || "the human";
-    const eventId = this._event(taskId, agentId, "agent.finding", `${author} recorded: ${String(title || "").trim()}`, {
-      category: String(category || "").trim().toLowerCase(),
-      confidence,
-      knowledgeNote: true,
-    });
-    const result = this.knowledge.write({
-      projectId: task.project_id, category, title, body, confidence,
-      relatedFiles, author, taskId, eventId,
+    // One transaction, so a write the vault refuses — an unknown category, a note to replace that is
+    // not there — leaves no "recorded" line on the timeline for a note that does not exist.
+    const result = this._transaction(() => {
+      const eventId = this._event(taskId, agentId, "agent.finding", `${author} recorded: ${String(title || "").trim()}`, {
+        category: String(category || "").trim().toLowerCase(),
+        confidence,
+        knowledgeNote: true,
+        ...(replaces ? { replaces: String(replaces).slice(0, 200) } : {}),
+      });
+      return this.knowledge.write({
+        projectId: task.project_id, category, title, body, confidence,
+        relatedFiles, replaces, author, taskId, eventId,
+      });
     });
     if (result.written) {
       try { this.knowledge.exportProject(task.project_id); } catch { /* the vault export is best-effort, as elsewhere */ }
     }
     this._changed("knowledge.written", taskId);
     return { ...result, vaultPath: path.join(task.project_root, "knowledge") };
+  },
+
+  // Say a note no longer holds — the bug it warned about is fixed, the API it described changed. The
+  // note leaves briefs and the map but stays on record, and the timeline says who retired it and why.
+  knowledgeRetire({ agentId = null, taskId, noteId, reason }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    this.assertMembership(agentId, taskId);
+    const agent = agentId ? this.getAgent(agentId) : null;
+    const result = this.knowledge.retire(task.project_id, noteId, { reason });
+    this._event(taskId, agentId, "agent.finding",
+      `${agent?.name || "The human"} retired a note: ${result.note.title} — ${result.reason}`,
+      { noteId: result.note.id, retired: true, reason: result.reason });
+    try { this.knowledge.exportProject(task.project_id); } catch { /* the vault export is best-effort, as elsewhere */ }
+    this._changed("knowledge.retired", taskId);
+    return { ...result, next: "Retired. It no longer reaches briefs or the map. If something true replaces it, write that with devteam_memory action=write." };
   },
 
   // What has not been confirmed in a long time, plus anything currently disputed. A maintainer agent

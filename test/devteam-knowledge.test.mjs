@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { KnowledgeVault, rankKnowledgeNotes } from "../src/devteam/knowledge.mjs";
+import { filesNamedIn, KnowledgeVault, rankKnowledgeNotes, sameTitle } from "../src/devteam/knowledge.mjs";
 import { DevTeamStore } from "../src/devteam/store.mjs";
 
 const base = {
@@ -301,10 +301,10 @@ test("a note that disagrees with what the project already believes says so on wr
     body: "We retry three times with exponential backoff.",
     relatedFiles: ["src/billing.mjs"],
   });
-  // Same subject, different claim.
+  // Same subject, different claim. (A title that only adds "revised" would be the same note, updated.)
   const second = store.knowledgeWrite({
     agentId: agent.id, taskId: task.id, category: "conventions",
-    title: "Retry policy for the billing client, revised",
+    title: "The billing client never retries",
     body: "We do not retry at all; the caller decides.",
     relatedFiles: ["src/billing.mjs"],
   });
@@ -539,4 +539,213 @@ test("a brief spends its knowledge budget on breadth, not on three long notes", 
   const withBodies = notes.filter((note) => note.body !== undefined);
   assert.ok(withBodies.length >= 1 && withBodies.length <= 4, "the few most relevant still arrive in full");
   assert.ok(notes.slice(withBodies.length).every((note) => note.body === undefined), "the tail pays nothing for a body");
+});
+
+// --- One fact, one note, pinned to what it names, retired when it stops being true ----------------
+
+const indexFile = (store, projectId, file) => store.db.prepare(`
+  INSERT INTO code_modules (id, project_id, path, language, hash, size, mtime_ms, exports, dependencies, loc, updated_at)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?)
+`).run(`${projectId}:${file}`, projectId, file, "python", "h", 10, 0, "[]", "[]", 10, new Date().toISOString());
+
+test("a note names a file by its path, the tail of its path, its file name, or its Python module", () => {
+  const files = [
+    "src/app/gui/pages.py", "src/app/gui/widgets.py", "src/app/core/runner.py", "src/app/core/cookies.py",
+    "src/worker/engines/__init__.py", "src/worker/engines/music.py", "packaging/installer.iss",
+    "src/app/__init__.py", "src/app/gui/__init__.py", "src/app/core/__init__.py", "src/worker/__init__.py",
+    "src/app/core/path.py",
+  ];
+  const named = (text) => filesNamedIn(text, files);
+  assert.deepEqual(named("See src/app/gui/pages.py:120 for the fallback."), ["src/app/gui/pages.py"]);
+  assert.deepEqual(named("The tail gui/pages.py is enough, and so is src\\app\\gui\\pages.py."), ["src/app/gui/pages.py"]);
+  assert.deepEqual(named("Brace comments in installer.iss end early."), ["packaging/installer.iss"]);
+  assert.deepEqual(named("core.runner.ENV_OF maps it; use widgets.plain_tooltip."), ["src/app/core/runner.py", "src/app/gui/widgets.py"]);
+  assert.deepEqual(named("worker.engines.* cannot import presets"), ["src/worker/engines/__init__.py"], "a package is its __init__.py");
+  assert.deepEqual(named("A user's cookies.txt gets rewritten."), [], "a text file is not the cookies module");
+  assert.deepEqual(named("Every __init__.py re-exports."), [], "a name that fits every package names none of them");
+  assert.deepEqual(named("patching Path.replace breaks restore"), [], "module names are matched in their own case");
+  assert.deepEqual(named("Deezer errors arrive as HTTP 200 with an error object."), [], "a note that names no file is pinned to none");
+  assert.deepEqual(filesNamedIn("pages.py", []), [], "only files the project has can be named");
+});
+
+test("two titles are the same note only when nearly all their significant words match", () => {
+  // The one real duplicate in the live database: two agents, one pitfall, a minute apart.
+  assert.equal(sameTitle(
+    "Inno Setup [Code] brace comments cannot contain {constants}: the first } ends the comment",
+    "Inno Setup [Code] brace comments cannot contain {constants}: the first closing brace ends the comment",
+  ), true);
+  assert.equal(sameTitle("The worker engines are isolated", "The worker engine is isolated"), true, "plurals fold");
+  // The closest pair of different notes in the same database scored 0.23.
+  assert.equal(sameTitle(
+    "Running `ruff format` over src/stuff_downloader_worker rewrites files that must stay byte-identical to core",
+    "Running `ruff format` rewrites untouched code in this repo; use only `ruff check`",
+  ), false);
+  assert.equal(sameTitle("Deezer playlists embed 50 tracks", "Deezer playlists embed 100 tracks"), false,
+    "a short title that changes its claim is a different note");
+});
+
+test("a retired note leaves briefs, search and the map, and stays on record with its reason", async (t) => {
+  const { store, project, task, agent, projectRoot } = await vaultFixture(t);
+  indexFile(store, project.id, "src/billing.py");
+  const pitfall = store.knowledgeWrite({
+    agentId: agent.id, taskId: task.id, category: "pitfalls",
+    title: "The billing client does not retry on 429", body: "billing.charge gives up at once; wrap it yourself.",
+  });
+  assert.deepEqual(pitfall.note.relatedFiles, ["src/billing.py"], "pinned to the module it names");
+  assert.deepEqual(store.projectMap(task.id).notes.map((note) => note.id), [pitfall.note.id]);
+
+  assert.throws(() => store.knowledgeRetire({ agentId: agent.id, taskId: task.id, noteId: pitfall.note.id, reason: "  " }), /why/i);
+  assert.throws(() => store.knowledgeRetire({ agentId: agent.id, taskId: task.id, noteId: "0".repeat(24), reason: "x" }), /current notes/);
+  // The brief shows the link beside the id, so either one names the note.
+  const retired = store.knowledgeRetire({ agentId: agent.id, taskId: task.id, noteId: pitfall.note.link, reason: "Fixed: the client now backs off on 429." });
+  assert.equal(retired.note.id, pitfall.note.id);
+
+  assert.equal(store.knowledgeSearch({ agentId: agent.id, taskId: task.id, query: "billing retry" }).notes.length, 0);
+  assert.equal(store.knowledge.relevant(project.id, task.id, 10, { taskTitle: "billing retry" }).length, 0);
+  assert.deepEqual(store.projectMap(task.id).notes, []);
+  const row = store.db.prepare("SELECT status, stale_reason FROM knowledge_notes WHERE id = ?").get(pitfall.note.id);
+  assert.deepEqual({ ...row }, { status: "archived", stale_reason: "Fixed: the client now backs off on 429." });
+  assert.throws(() => store.knowledgeRetire({ agentId: agent.id, taskId: task.id, noteId: pitfall.note.id, reason: "again" }), /current notes/);
+
+  // The timeline says who and why; the task page still lists it, marked; CURRENT.md does not.
+  const event = store.taskDetail(task.id).events.find((item) => item.metadata?.retired);
+  assert.match(event.message, /Scout retired a note: The billing client does not retry on 429 — Fixed/);
+  const sessions = await readdir(path.join(projectRoot, "knowledge", "sessions"));
+  const page = await readFile(path.join(projectRoot, "knowledge", "sessions", sessions[0]), "utf8");
+  assert.match(page, /does not retry on 429\*\* — .*\*\(retired: Fixed: the client now backs off on 429\.\)\*/);
+  const current = await readFile(path.join(projectRoot, "knowledge", "CURRENT.md"), "utf8");
+  assert.doesNotMatch(current, /does not retry on 429/);
+});
+
+test("a note written to replace another retires it and points at the correction", async (t) => {
+  const { store, task, agent } = await vaultFixture(t);
+  const old = store.knowledgeWrite({
+    agentId: agent.id, taskId: task.id, category: "pitfalls",
+    title: "Uploads over 10 MB time out", body: "The proxy cuts the connection at 30 seconds.",
+  });
+  const events = () => store.taskDetail(task.id).events.filter((event) => event.metadata?.knowledgeNote).length;
+  const before = events();
+  assert.throws(() => store.knowledgeWrite({
+    agentId: agent.id, taskId: task.id, category: "pitfalls", title: "x", body: "y", replaces: "no-such-note",
+  }), /not one of this project's current notes/);
+  assert.equal(events(), before, "a refused write leaves no 'recorded' line behind");
+
+  const fixed = store.knowledgeWrite({
+    agentId: agent.id, taskId: task.id, category: "workflows",
+    title: "Large uploads go through the chunked endpoint", body: "Since the upload rework, files over 10 MB are sent in 5 MB chunks.",
+    replaces: old.note.id,
+  });
+  assert.equal(fixed.replaced.id, old.note.id);
+  const row = store.db.prepare("SELECT status, superseded_by, stale_reason FROM knowledge_notes WHERE id = ?").get(old.note.id);
+  assert.equal(row.status, "archived");
+  assert.equal(row.superseded_by, fixed.note.id);
+  assert.match(row.stale_reason, /Replaced by "Large uploads go through the chunked endpoint"/);
+  const found = store.knowledgeSearch({ agentId: agent.id, taskId: task.id, query: "uploads" }).notes.map((note) => note.id);
+  assert.deepEqual(found, [fixed.note.id]);
+
+  // A correction under nearly the same title is the same note, rewritten, not a retire-and-add.
+  const reworded = store.knowledgeWrite({
+    agentId: agent.id, taskId: task.id, category: "workflows",
+    title: "Large uploads go through the chunked endpoints", body: "Files over 8 MB are chunked now.", replaces: fixed.note.id,
+  });
+  assert.equal(reworded.note.id, fixed.note.id);
+  assert.equal(reworded.updatedExisting, true);
+  assert.equal(store.db.prepare("SELECT status FROM knowledge_notes WHERE id = ?").get(fixed.note.id).status, "inferred");
+});
+
+test("writing what a current note already says updates that note instead of adding a second", async (t) => {
+  const { store, project, task, agent } = await vaultFixture(t);
+  indexFile(store, project.id, "packaging/installer.iss");
+  const first = store.knowledgeWrite({
+    agentId: agent.id, taskId: task.id, category: "pitfalls",
+    title: "Inno Setup [Code] brace comments cannot contain {constants}: the first } ends the comment",
+    body: "In installer.iss a { } comment containing {app} ends early.", relatedFiles: ["docs/installer.md"],
+  });
+  const second = store.knowledgeWrite({
+    agentId: agent.id, taskId: task.id, category: "conventions",
+    title: "Inno Setup [Code] brace comments cannot contain {constants}: the first closing brace ends the comment",
+    body: "Use // comments in [Code] whenever the text mentions an Inno constant.",
+  });
+  assert.equal(second.updatedExisting, true);
+  assert.equal(second.note.id, first.note.id, "same note, same id, so every link to it still holds");
+  assert.equal(second.note.category, "pitfalls", "it keeps the category it was filed under");
+  assert.match(second.note.title, /first closing brace/, "the later wording wins");
+  assert.deepEqual(second.note.relatedFiles.sort(), ["docs/installer.md", "packaging/installer.iss"]);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM knowledge_notes WHERE project_id = ?").get(project.id).count, 1);
+  assert.equal(second.possibleConflicts, undefined, "a note is not in conflict with itself");
+});
+
+test("a lesson on a report is pinned to the files it names, not to everything the report changed", async (t) => {
+  const { store, project, task, agent } = await vaultFixture(t);
+  const changed = ["src/app/gui/pages.py", "src/app/core/router.py", "src/worker/engines/music.py", "THIRD_PARTY_LICENSES.txt"];
+  for (const file of changed.slice(0, 3)) indexFile(store, project.id, file);
+  const card = store.claimNextAssignment(agent.id);
+  const result = await store.completeAssignment({
+    agentId: agent.id, assignmentId: card.id, claimToken: card.claimToken, message: "Added Deezer.", changedFiles: changed,
+    learned: [
+      { category: "pitfalls", title: "Deezer API errors arrive as HTTP 200", body: "Check data['error'] in music.parse_song." },
+      { category: "pitfalls", title: "Deezer playlists embed at most 50 tracks", body: "Page them yourself.", relatedFiles: ["src/worker/engines/music.py"] },
+      { category: "pitfalls", title: "Replacing a note that is not there", body: "x", replaces: "missing" },
+    ],
+  });
+  assert.equal(result.learned.length, 2);
+  assert.equal(result.learnedNotRecorded[0].title, "Replacing a note that is not there", "a refused lesson is said, not dropped");
+  const pins = Object.fromEntries(store.db.prepare("SELECT title, related_files FROM knowledge_notes WHERE project_id = ?").all(project.id)
+    .map((note) => [note.title, JSON.parse(note.related_files)]));
+  assert.deepEqual(pins["Deezer API errors arrive as HTTP 200"], ["src/worker/engines/music.py"]);
+  assert.deepEqual(pins["Deezer playlists embed at most 50 tracks"], ["src/worker/engines/music.py"]);
+  const onPages = store.projectMap(task.id).notes.filter((note) => note.files.includes("src/app/gui/pages.py"));
+  assert.deepEqual(onPages, [], "the GUI page the report also touched carries neither lesson");
+});
+
+test("notes that inherited a report's whole file list are re-pinned once, and chosen files are kept", async (t) => {
+  const { store, project, task, agent } = await vaultFixture(t);
+  const changed = ["src/app/gui/pages.py", "src/app/core/runner.py", "src/app/core/router.py"];
+  for (const file of changed) indexFile(store, project.id, file);
+  store._event(task.id, agent.id, "assignment.completed", "Done.", { changedFiles: changed });
+  const note = (slug, title, body, files) => store.db.prepare(`
+    INSERT INTO knowledge_notes (id, project_id, category, slug, title, body, status, confidence, source_task_id, related_files, provenance, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(slug, project.id, "pitfalls", slug, title, body, "inferred", "high", task.id,
+    JSON.stringify(files), "[]", new Date().toISOString(), new Date().toISOString());
+  note("dumped", "The runner picks the env", "See core.runner.env_for.", changed);
+  note("chosen", "The router is picked by hand", "See core.runner.env_for.", ["src/app/core/router.py"]);
+  note("unnamed", "Deezer says 200 for errors", "Check the error object.", changed.slice().reverse());
+  store.db.prepare("DELETE FROM metadata WHERE key = 'note_files_repinned'").run();
+
+  store.knowledge.repinNoteFilesOnce();
+  const files = (id) => JSON.parse(store.db.prepare("SELECT related_files FROM knowledge_notes WHERE id = ?").get(id).related_files);
+  assert.deepEqual(files("dumped"), ["src/app/core/runner.py"]);
+  assert.deepEqual(files("chosen"), ["src/app/core/router.py", "src/app/core/runner.py"], "a hand-picked file stays, and what it names joins it");
+  assert.deepEqual(files("unnamed"), [], "a note that names nothing is pinned to nothing");
+  assert.ok(store.db.prepare("SELECT value FROM metadata WHERE key = 'note_files_repinned'").get(), "done once");
+
+  store.db.prepare("UPDATE knowledge_notes SET related_files = ? WHERE id = 'unnamed'").run(JSON.stringify(changed));
+  store.knowledge.repinNoteFilesOnce();
+  assert.deepEqual(files("unnamed"), changed, "and never again");
+});
+
+test("duplicates written before a same title updated in place are merged once, keeping the pinned copy", async (t) => {
+  const { store, project } = await vaultFixture(t);
+  const note = (id, title, files, createdAt) => store.db.prepare(`
+    INSERT INTO knowledge_notes (id, project_id, category, slug, title, body, status, confidence, related_files, provenance, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(id, project.id, "pitfalls", id, title, "body", "inferred", "high", JSON.stringify(files), "[]", createdAt, createdAt);
+  note("claude", "Inno Setup [Code] brace comments cannot contain {constants}: the first } ends the comment", ["packaging/installer.iss"], "2026-09-22T12:47:20.000Z");
+  note("codex", "Inno Setup [Code] brace comments cannot contain {constants}: the first closing brace ends the comment", ["docs/setup.md"], "2026-09-22T12:47:50.000Z");
+  note("other", "Freshly built .exe folders are briefly locked on Windows", [], "2026-09-22T13:00:00.000Z");
+  store.db.prepare("DELETE FROM metadata WHERE key = 'note_duplicates_merged'").run();
+
+  store.knowledge.mergeDuplicateNotesOnce();
+  const row = (id) => store.db.prepare("SELECT status, superseded_by, stale_reason, related_files FROM knowledge_notes WHERE id = ?").get(id);
+  assert.equal(row("claude").status, "inferred", "on a tie the older copy is kept");
+  assert.deepEqual(JSON.parse(row("claude").related_files).sort(), ["docs/setup.md", "packaging/installer.iss"], "and takes the other's files");
+  assert.equal(row("codex").status, "archived", "the other is retired, not deleted");
+  assert.equal(row("codex").superseded_by, "claude");
+  assert.match(row("codex").stale_reason, /^Duplicate of "Inno Setup/);
+  assert.equal(row("other").status, "inferred");
+
+  store.db.prepare("UPDATE knowledge_notes SET status = 'inferred' WHERE id = 'codex'").run();
+  store.knowledge.mergeDuplicateNotesOnce();
+  assert.equal(row("codex").status, "inferred", "it runs once");
 });
