@@ -1,45 +1,222 @@
-# DevTeam
+<h1 align="center">
+  <img src="public/devteam-logo.jpg" width="96" alt=""><br>
+  DevTeam
+</h1>
 
-DevTeam is a personal agentic-development workspace: a local server and dashboard where one human coordinates Codex, Claude, and other MCP-compatible AI agents as a small software team. Think of it as **one shared whiteboard per project**: a planner pins cards to the board, agents claim them, do the work, and report back; someone other than the author reviews it; and the project remembers what it learned.
+<p align="center">
+  <b>A multi-agent coordination server for AI coding agents.</b><br>
+  Claude, Codex and any other MCP agent join one shared board. They plan, build and review each
+  other's work as a small software team, and a human stays in charge.
+</p>
 
-The dashboard and MCP server run only on `127.0.0.1` by default. DevTeam does not call model APIs itself and does not need your OpenAI or Anthropic keys — your desktop apps keep using their own accounts. It also **executes nothing**: it never edits your files, runs your tests, or touches git beyond reading `HEAD`. It coordinates the agents and records what they report.
+<p align="center">
+  <img alt="Node" src="https://img.shields.io/badge/node-%E2%89%A522.13-339933?logo=node.js&logoColor=white">
+  <img alt="MCP" src="https://img.shields.io/badge/protocol-MCP%20Streamable%20HTTP-6E56CF">
+  <img alt="Agents" src="https://img.shields.io/badge/agents-Claude%20%7C%20Codex%20%7C%20any%20MCP-D97757">
+  <img alt="Storage" src="https://img.shields.io/badge/storage-SQLite%20%2B%20FTS5-003B57?logo=sqlite&logoColor=white">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-308%20passing-brightgreen">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-green"></a>
+</p>
 
-## What DevTeam provides
+<p align="center">
+  <img src="docs/screenshots/workspace.png" width="900" alt="The DevTeam workspace: Claude and Codex share a task room, claim cards and report back, while the right panel shows project memory and the code graph">
+</p>
 
-- **Three roles, one direction** — plan → implement → review. The card says which role it is; agents do not appoint themselves. You decide which agent does which step for each project (for example *Codex plans and reviews, Claude builds*), and a review never goes back to the agent that wrote the work unless you turn on **Solo mode**.
-- **Safe parallel work** — bounded cards, real dependencies, one write claim per agent, fencing tokens, and path-scoped write leases, so two agents never silently overwrite each other.
-- **Evidence instead of vague status** — agents report the exact files they changed and the checks they ran. Changing files advances the task version and clears older approvals.
-- **A board you can read** — the work board is drawn as a top-down flowchart of how the work actually went: plan → build → review → sent back → fixed → approved. Dead and replaced cards are folded into a "set aside" drawer instead of cluttering the flow. A second **Map** view shows the project's files, what imports what, where this task changed things, and which notes are pinned to which files.
-- **Cards that can be fixed in place** — a card can be reopened, edited, or closed (optionally pointing at the card that replaces it), and several review rounds live on one card. Nobody has to create "(replacement)" copies.
-- **Project memory that stays small and true** — notes are written on purpose by agents, pinned to the files they name, kept to one note per fact, and retired when they stop being true. Each brief carries the most relevant ones.
-- **A code map** — a local, dependency-free index of the project's files and imports (JavaScript/TypeScript, Python including `src/` layouts and `from pkg import name`, Markdown, config), with a one-line purpose per file. It respects `.gitignore`.
-- **Recovery without chaos** — resumable sessions, message replay, assignment-level blockers, task-level stops, human Resume, and force-release keep interrupted work recoverable.
+---
 
-This repository is personal-tool-first: it is designed to help one developer build ambitious projects with AI while staying in control. Want to help? Read [CONTRIBUTING.md](CONTRIBUTING.md).
+## Contents
+
+- [What it is](#what-it-is)
+- [Screenshots](#screenshots)
+- [How it works](#how-it-works)
+- [Why it is an agentic system](#why-it-is-an-agentic-system)
+- [Features](#features)
+- [Tech stack](#tech-stack)
+- [Quick start](#quick-start)
+- [Connect Codex Desktop](#connect-codex-desktop)
+- [Connect Claude Desktop or Claude Code](#connect-claude-desktop-or-claude-code)
+- [The nine tools](#the-nine-tools)
+- [How a team run works](#how-a-team-run-works)
+- [Project memory](#project-memory)
+- [Safety](#safety)
+- [Project layout](#project-layout)
+- [Development](#development)
+
+## What it is
+
+A single AI coding agent works alone: it plans, writes and grades its own work, and it forgets
+everything when the chat ends. **DevTeam turns several agents into a team.**
+
+It is a local **MCP (Model Context Protocol) server** with a browser dashboard. Each agent (Claude
+Code, Codex Desktop, or any MCP client) connects to it and gets nine tools. With those tools the
+agents take cards from a shared board, report exactly what they changed and which checks they ran,
+and review each other's work. What they learn goes into a **project memory** that the next agent
+receives in its brief.
+
+- **Roles:** plan → build → review. The author of a piece of work never reviews it.
+- **Parallel work without collisions:** path-scoped write leases and fencing tokens.
+- **Memory that stays small and true:** facts pinned to the files they describe, retired when they stop being true.
+- **A human in charge:** you create tasks, assign roles, message the room, and accept or stop the work.
+
+DevTeam never calls a model API and needs no API keys. Each agent runs in its own app with its own
+account, and DevTeam only coordinates them. It **executes nothing** on your machine: it never edits
+files, runs tests or pushes to git. I use it every day to build my other projects (for example
+[Stuff Downloader](https://github.com/AlokaWarnakula/stuff-downloader)), and every screenshot below comes from that real work.
+
+## Screenshots
+
+**The work board** is a top-down flowchart of how the work went: each build card is followed by its
+review, and replaced or abandoned cards are folded away in a "set aside" drawer.
+
+<p align="center"><img src="docs/screenshots/work-board.png" width="900" alt="Work board flowchart: build and review cards for a release milestone, step by step, each marked done"></p>
+
+**The Map** shows the project's files and imports, grouped by folder. The files the current task
+touched are highlighted in green, and notes are pinned to the files they describe.
+
+<p align="center"><img src="docs/screenshots/code-map.png" width="900" alt="Code map: a graph of project modules and imports, with the files changed by the current task highlighted"></p>
+
+## How it works
+
+### Architecture: how agents connect
 
 ```mermaid
 flowchart LR
-    U["You in the browser"] --> D["DevTeam localhost server"]
-    C["Codex Desktop"] <-->|"MCP tools"| D
-    A["Claude Desktop / Code"] <-->|"MCP tools"| D
-    O["Other MCP agent"] <-->|"MCP tools"| D
-    D --> Q["SQLite: tasks, cards, events, notes, code map"]
-    D --> K["knowledge/: CURRENT.md, one page per task, graph/"]
-    C --> W["Shared project files"]
-    A --> W
-    O --> W
+    H(["You<br/>browser dashboard"])
+    subgraph Agents["AI agents, each in its own app and account"]
+        CL["Claude Code /<br/>Claude Desktop"]
+        CX["Codex Desktop"]
+        OT["Any MCP agent"]
+    end
+    subgraph DT["DevTeam server on 127.0.0.1:7331"]
+        MCP["/mcp endpoint<br/>9 devteam_* tools<br/>bearer token per agent"]
+        API["/api control plane<br/>dashboard + live updates"]
+        CORE["Scheduler<br/>roles, leases, reviews, consensus"]
+        BRIEF["Brief builder<br/>up to 32 KiB of context per card"]
+    end
+    subgraph Store["Local state"]
+        DB[("SQLite<br/>tasks, cards, events,<br/>notes with FTS5, code map")]
+        VAULT["knowledge/<br/>Markdown export"]
+    end
+    REPO[("Your project files")]
+
+    H <--> API
+    CL <-->|MCP over HTTP| MCP
+    CX <-->|MCP over HTTP| MCP
+    OT <-->|MCP over HTTP| MCP
+    MCP --> CORE
+    API --> CORE
+    CORE --> BRIEF
+    CORE <--> DB
+    BRIEF --> DB
+    DB --> VAULT
+    CL -. edit and test .-> REPO
+    CX -. edit and test .-> REPO
+    CORE -. read-only index .-> REPO
 ```
 
-## Start it
+Agents do the real work in the project folder with their own tools. DevTeam only reads the
+project to build its code map, and it keeps everything it knows in one SQLite file.
+
+### The agent loop and where the human steps in
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Human
+    participant DT as DevTeam
+    participant P as Planner (e.g. Codex)
+    participant B as Builder (e.g. Claude)
+    participant R as Reviewer (not the author)
+
+    Human->>DT: Create task, choose who plans, builds and reviews
+    P->>DT: devteam_join, then devteam_next
+    DT-->>P: Planning card + brief (task, notes, code context)
+    P->>DT: devteam_plan: cards with dependencies and write paths
+    B->>DT: devteam_next (long-poll, no tokens spent while waiting)
+    DT-->>B: Build card + brief + write lease on its paths
+    Note over B: Edits files and runs tests in its own environment
+    B->>DT: devteam_report: changed files, checks, learned notes
+    DT-->>R: Review card (never sent to the author)
+    alt Changes needed
+        R->>DT: devteam_verdict = changes, with findings
+        DT-->>B: Card reopened with the findings attached
+        B->>DT: devteam_report (next round)
+    end
+    R->>DT: devteam_verdict = approve
+    DT-->>Human: Consensus reached for version N
+    Human->>DT: Message the room, Stop, Resume or Accept task
+```
+
+Each agent runs the same loop: **observe** (`devteam_next` returns a card and its brief),
+**act** (edit and test the code in its own environment), **report** (`devteam_report` or
+`devteam_verdict`), then **observe** again. The scheduler decides who gets which card. The human
+can step in at any point, and a human decision is recorded as a human decision, never as agent consensus.
+
+### How memory works
+
+```mermaid
+flowchart TD
+    A["Agent finishes a card"] -->|"learned: one durable fact"| W{"Does a note already<br/>say the same thing?"}
+    W -->|yes| U["Update that note"]
+    W -->|no| N["New note, confidence 'inferred'"]
+    U --> PIN
+    N --> PIN["Pin the note to the files it names<br/>(paths, file names, module paths)"]
+    PIN --> DB[("SQLite + FTS5 search<br/>BM25 ranking, no embeddings")]
+    DB --> BR["Next brief: the most relevant notes,<br/>code context and how the last task ended"]
+    BR --> NEXT["The next agent, on any model,<br/>starts with what the team learned"]
+    FIX["An agent fixes what a note warned about"] -->|"retire, or replaces=id"| RET["Retired: removed from briefs and search,<br/>kept on record with a reason"]
+    DB --> VAULT["knowledge/ Markdown export<br/>CURRENT.md, one page per task, graph/"]
+    DB --> MAP["Map view: notes shown on their files"]
+```
+
+Memory is **not a chat transcript**. A note exists only because an agent wrote down a fact the
+next person would otherwise have to rediscover. Notes are searched locally, and every brief is
+capped at 32 KiB, so the context stays small however long the project runs.
+
+## Why it is an agentic system
+
+| Part of an agent system | Where it is in DevTeam |
+|---|---|
+| **LLMs** | Claude and Codex (or any MCP client) do the reasoning. DevTeam works with any model, so different models plan, build and review each other's work. |
+| **Tools** | Nine MCP tools (`devteam_join`, `next`, `plan`, `report`, `verdict`, `stuck`, `memory`, `message`, `leave`), each with a validated schema ([`src/devteam/mcp.mjs`](src/devteam/mcp.mjs)). |
+| **Agent loop** | `devteam_next` is a 45-second long-poll. Agents loop observe → act → report until the room is quiet, then leave on their own. |
+| **Instructions** | A skill file ([`skills/devteam/SKILL.md`](skills/devteam/SKILL.md)) teaches every agent the protocol. Each card carries a role, and reviewer cards carry the checklists you wrote. |
+| **Memory** | Notes with deduplication, file pinning and retirement, a versioned key/value scratchpad, and a code map. All of it feeds a size-capped brief for each card. |
+| **Multi-agent coordination** | A dependency-aware scheduler, role routing, write leases with fencing tokens, a rule that the author never reviews their own work, consensus per task version, and regression detection when one agent breaks another's checks. |
+| **Human in the loop** | A dashboard to create tasks, assign roles, message agents, stop, resume, force-release and accept. |
+
+## Features
+
+- **Three roles, one direction:** plan → implement → review. You choose which agent does which step for each project (for example *Codex plans and reviews, Claude builds*). A review never goes back to its author unless you turn on **Solo mode**.
+- **Safe parallel work:** bounded cards, real dependencies, one write claim per agent, fencing tokens and path-scoped write leases, so two agents never silently overwrite each other.
+- **Evidence instead of vague status:** agents report the exact files they changed and the checks they ran. Changing files advances the task version and clears older approvals.
+- **Regression detection:** when a check that used to pass now fails, DevTeam queues a fix card for the author of the change that broke it.
+- **Cards you can fix in place:** reopen, edit or close a card, and keep several review rounds on the same card.
+- **A code map with no dependencies:** indexes JavaScript/TypeScript, Python, Markdown and config imports, with a one-line purpose for each file. It respects `.gitignore`.
+- **Recovery:** resumable sessions, message replay, blockers on a single card, task-wide stops, human Resume and force-release.
+- **Token-cheap idling:** agents long-poll locally, so no model tokens are spent while they wait for work.
+
+## Tech stack
+
+- **Runtime:** Node.js 22 (ES modules), no build step
+- **Protocol:** [Model Context Protocol](https://modelcontextprotocol.io) over Streamable HTTP (`@modelcontextprotocol/sdk`), schemas in `zod`
+- **Server:** Express 5; loopback-only by default, bearer-token auth for agents, cookie auth for the dashboard
+- **Storage:** built-in `node:sqlite` with FTS5 full-text search; no external database and no vector store
+- **Dashboard:** plain HTML, CSS and JavaScript, with a custom flowchart board and a force-directed code map
+- **Quality:** 308 `node:test` tests, a randomised scheduler soak test, and a mutation tester that breaks one scheduling rule at a time (both run nightly in GitHub Actions)
+
+## Quick start
 
 Requirements: Node.js 22.13 or newer.
 
 ```powershell
+git clone https://github.com/AlokaWarnakula/DevTeam.git
+cd DevTeam
 npm install
 npm start
 ```
 
-Then open [http://127.0.0.1:7331](http://127.0.0.1:7331). On Windows, you can double-click `Start DevTeam.cmd` to start the server and open the dashboard.
+Then open [http://127.0.0.1:7331](http://127.0.0.1:7331). On Windows, you can also double-click `Start DevTeam.cmd`.
 
 To use a different project or port:
 
@@ -47,9 +224,9 @@ To use a different project or port:
 node bin/devteam.mjs start --workspace C:\Projects\my-app --port 7331 --open
 ```
 
-The database and a generated local bearer token are stored in `%LOCALAPPDATA%\DevTeam`. Run `node bin/devteam.mjs token` to print the token again.
-
-Every agent can share that one token, which is right for one person on one machine. When more than one party is involved, issue a token per agent instead — `devteam token --new "Codex desktop"` prints it once and stores only a hash, `--list` shows when each was last used, and `--revoke ID` cuts one off without re-keying anybody else.
+The database and a generated local bearer token are stored in `%LOCALAPPDATA%\DevTeam`. Run
+`node bin/devteam.mjs token` to print the token again. To give each agent its own revocable token,
+run `devteam token --new "Codex desktop"`, then manage them with `--list` and `--revoke ID`.
 
 ## Connect Codex Desktop
 
@@ -203,6 +380,25 @@ DevTeam keeps the room honest on its own. Idle agents whose heartbeat has expire
 - Push, merge, PR creation, deployment, publication, destructive operations, and security changes require explicit human approval.
 - Review improves coverage; it does not guarantee correctness. Inspect the final diff before shipping.
 
+## Project layout
+
+```text
+bin/devteam.mjs              CLI: start, token, doctor, sync-skill
+src/devteam/
+  server.mjs                 Express app: /mcp endpoint, /api control plane, auth
+  mcp.mjs                    the nine devteam_* MCP tools and their schemas
+  store*.mjs                 SQLite state: agents, board, checks, consensus, knowledge, views
+  brief.mjs                  builds the brief (up to 32 KiB) that each card carries
+  codegraph.mjs, parsers.mjs dependency-free code map (JS/TS, Python, Markdown, config)
+  knowledge.mjs              Markdown vault export
+  access.mjs, roles.mjs      auth and role routing
+  domains.mjs, checklists.mjs  review domains and owner-written checklists
+public/                      the dashboard (HTML, CSS, JS)
+skills/devteam/SKILL.md      the instructions every agent loads
+test/                        node:test suites, including scheduler property tests
+tools/                       scheduler soak and mutation testing
+```
+
 ## Development
 
 ```powershell
@@ -220,3 +416,7 @@ npm run mutation  # breaks one scheduling rule at a time; every behavioural muta
 ```
 
 Run both after any change to how work is claimed or routed. A soak failure names a seed: put that seed in `SEEDS` in `test/devteam-scheduler-properties.test.mjs` and it becomes a permanent regression test. Both run nightly in `.github/workflows/nightly.yml` alongside the suite.
+
+## License
+
+[MIT](LICENSE)
