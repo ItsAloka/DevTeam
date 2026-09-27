@@ -61,7 +61,7 @@ receives in its brief.
 DevTeam never calls a model API and needs no API keys. Each agent runs in its own app with its own
 account, and DevTeam only coordinates them. It **executes nothing** on your machine: it never edits
 files, runs tests or pushes to git. I use it every day to build my other projects (for example
-[Stuff Downloader](https://github.com/AlokaWarnakula/stuff-downloader)), and every screenshot below comes from that real work.
+[Stuff Downloader](https://github.com/ItsAloka/stuff-downloader)), and every screenshot below comes from that real work.
 
 ## Screenshots
 
@@ -80,7 +80,7 @@ touched are highlighted in green, and notes are pinned to the files they describ
 ### Architecture: how agents connect
 
 ```mermaid
-flowchart LR
+flowchart TB
     H(["You<br/>browser dashboard"])
     subgraph Agents["AI agents, each in its own app and account"]
         CL["Claude Code /<br/>Claude Desktop"]
@@ -210,7 +210,7 @@ capped at 32 KiB, so the context stays small however long the project runs.
 Requirements: Node.js 22.13 or newer.
 
 ```powershell
-git clone https://github.com/AlokaWarnakula/DevTeam.git
+git clone https://github.com/ItsAloka/DevTeam.git
 cd DevTeam
 npm install
 npm start
